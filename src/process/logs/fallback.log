@@ -1,0 +1,24 @@
+2025-08-15 10:58:21,917 [ERROR] - main - 无法加载日志配置，使用回退配置
+2025-08-15 10:58:21,918 [INFO] - main - 启动栅格数据处理管道
+2025-08-15 10:58:21,977 [INFO] - main.glsnow - 开始处理 GLSNOW 数据
+2025-08-15 10:58:21,978 [ERROR] - main.glsnow - GLSNOW 处理失败: 'module' object is not callable
+Traceback (most recent call last):
+  File "D:\pyworkspace\fusing xgb\src\process\main.py", line 83, in process_source
+    processor = create_processor(source, secure_processor, station_filter)
+  File "D:\pyworkspace\fusing xgb\src\process\main.py", line 70, in create_processor
+    return processors[source](
+TypeError: 'module' object is not callable
+2025-08-15 10:58:21,978 [WARNING] - main - 没有成功处理的数据源，跳过整合步骤
+2025-08-15 10:58:21,996 [INFO] - main - 处理完成，成功处理 0/1 个数据源
+2025-08-15 11:00:40,478 [ERROR] - main - 无法加载日志配置，使用回退配置
+2025-08-15 11:00:40,480 [INFO] - main - 启动栅格数据处理管道
+2025-08-15 11:00:40,529 [INFO] - main.glsnow - 开始处理 GLSNOW 数据
+2025-08-15 11:00:40,529 [ERROR] - main.glsnow - GLSNOW 处理失败: 'module' object is not callable
+Traceback (most recent call last):
+  File "D:\pyworkspace\fusing xgb\src\process\main.py", line 83, in process_source
+    processor = create_processor(source, secure_processor, station_filter)
+  File "D:\pyworkspace\fusing xgb\src\process\main.py", line 70, in create_processor
+    return processors[source](
+TypeError: 'module' object is not callable
+2025-08-15 11:00:40,530 [WARNING] - main - 没有成功处理的数据源，跳过整合步骤
+2025-08-15 11:00:40,538 [INFO] - main - 处理完成，成功处理 0/1 个数据源

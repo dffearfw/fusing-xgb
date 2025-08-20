@@ -1,0 +1,11 @@
+input_root:  "E:/data"
+
+log_config:  "D:/pyworkspace/fusing xgb/config/logging.conf"
+
+station_db:  "E:/data/gisws/stations.db"
+
+outputs:
+  glsnow:  "outputs/glsnow"
+  era5_swe:  "outputs/era5_swe"
+
+  combined:  "outputs/combined"

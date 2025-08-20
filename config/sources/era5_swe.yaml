@@ -1,0 +1,36 @@
+name:  "ERA5_SWE"
+
+data_dir:  "era5_swe"
+
+file_pattern:  "era5_swe_{year}{month}.tif"
+
+
+format:  "geotiff"
+variable:  "swe"
+
+lon_var:  "x"
+lat_var:  "y"
+
+chunk_regions:  true
+chunk_size:  1000
+
+buffer:  0.02
+
+date_range:
+  start:  2013-01-02
+  end:  2017-12-31
+
+fill_value:  -32768.0
+valid_min:  0.0        # 有效值最小值
+scale_factor:  1.0   # 单位转换系数
+units:  "m"
+output:
+  primary_format:  "parquet"  # 输出文件格式
+  always_generate_csv: true
+
+date_regex:  '\d{8}'
+
+crs:  "EPSG:4326"
+projection:  "WGS84"
+
+debug:  true

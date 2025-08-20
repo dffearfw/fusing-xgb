@@ -1,0 +1,39 @@
+name:  "GLSnow_SWE"
+
+data_dir:  "glsnow"
+
+file_pattern:  "{year}{month}{day}_northern_hemisphere_swe_0.25grid.nc"
+
+variable:  "swe"
+
+lon_var:  "x"
+lat_var:  "y"
+
+chunk_regions:  true
+
+buffer:  0.02
+
+date_range:
+  start:  2013-01-02
+  end:  2017-12-31
+
+fill_value:  -9999.0
+valid_min:  0        # 有效值最小值
+scale_factor:  1.0   # 单位转换系数
+output:
+  primary_format:  "parquet"  # 输出文件格式
+  always_generate_csv: true
+
+date_regex:  '\d{8}'
+
+crs:  "EPSG:4326"
+projection:
+  name:  "Lambert_Azimuthal_Equal_Area"
+  latitude_of_projection_origin:  90.0
+  longitude_of_projection_origin:  0.0
+  central_meridian:  0.0
+  false_easting:  0.0
+  false_northing:  0.0
+  earth_radius:  6371228.0
+
+debug:  true
