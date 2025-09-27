@@ -1,46 +1,58 @@
 import logging
 import sqlite3
-
-import numpy as np
 import pandas as pd
+import numpy as np
 from datetime import datetime
 from pathlib import Path
 import rasterio
 from rasterio.transform import rowcol
-from pyproj import Transformer
-
-from src.process.config import config
-from src.process.sub.baseor import BaseProcessor  # 假设有基础处理器
 
 logger = logging.getLogger("ERA5SWEProcessor")
 
 
-class ERA5SWEProcessor(BaseProcessor):
+class ERA5SWEProcessor:
     """ERA5 SWE 数据处理器"""
 
     def __init__(self, secure_processor=None, station_filter=None):
-        super().__init__()
+        """
+        初始化 ERA5 SWE 处理器
+
+        参数:
+            secure_processor: 安全处理器实例
+            station_filter: 站点过滤器
+        """
+        from src.process.config import config
+
         self.logger = logging.getLogger("ERA5SWEProcessor")
         self.conf = config.era5_swe
-        self.output_dir = Path(config.get_output_dir('era5_swe'))
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.secure_processor = secure_processor
         self.station_filter = station_filter
 
-        # 初始化数据库连接
+        # 输出目录
+        self.output_dir = Path(config.get_output_dir('era5_swe'))
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 数据库连接
         self.db_conn = self.connect_database()
 
-        # 初始化投影转换器（如果需要）
-        self.proj_transformer = None
+        self.logger.info("初始化 ERA5 SWE 处理器完成")
 
     def connect_database(self):
         """连接站点数据库"""
-        # 复用GLSnowProcessor的数据库连接逻辑
+        from src.process.config import config
+
         db_path = config.get_station_db_path()
         try:
             conn = sqlite3.connect(db_path)
             conn.enable_load_extension(True)
-            conn.load_extension("mod_spatialite")  # 加载空间扩展
+
+            # 尝试加载空间扩展
+            try:
+                conn.load_extension("mod_spatialite")
+                self.logger.debug("成功加载空间扩展")
+            except Exception as e:
+                self.logger.warning(f"加载空间扩展失败: {str(e)}")
+
             return conn
         except Exception as e:
             self.logger.error(f"数据库连接失败: {str(e)}")
@@ -52,16 +64,33 @@ class ERA5SWEProcessor(BaseProcessor):
             # 转换为数据库格式 (YYYYMMDD.0)
             db_date_format = float(target_date.strftime('%Y%m%d'))
 
-            # 使用参数化查询
+            # 基础查询
             query = "SELECT station_ID, Longitude, Latitude FROM stations WHERE time = ?"
-            df = pd.read_sql_query(query, self.db_conn, params=(db_date_format,))
+            params = [db_date_format]
+
+            # 添加站点过滤器
+            if self.station_filter:
+                if self.station_filter['type'] == 'bbox':
+                    minx, miny, maxx, maxy = self.station_filter['value']
+                    query += " AND Longitude BETWEEN ? AND ? AND Latitude BETWEEN ? AND ?"
+                    params.extend([minx, maxx, miny, maxy])
+                elif self.station_filter['type'] == 'ids':
+                    placeholders = ','.join(['?'] * len(self.station_filter['value']))
+                    query += f" AND station_ID IN ({placeholders})"
+                    params.extend(self.station_filter['value'])
+
+            # 执行查询
+            df = pd.read_sql_query(query, self.db_conn, params=params)
 
             if not df.empty:
                 # 确保数值类型
                 df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
                 df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
+
+                # 移除无效坐标
                 df = df.dropna(subset=['Latitude', 'Longitude'])
 
+                self.logger.debug(f"找到 {len(df)} 个有效站点")
                 return df.to_dict('records')
             else:
                 self.logger.warning(f"未找到时间 {db_date_format} 的站点记录")
@@ -173,54 +202,6 @@ class ERA5SWEProcessor(BaseProcessor):
             self.logger.exception(f"提取错误: {str(e)}")
             return pd.DataFrame()
 
-    def process_range(self, start_date, end_date):
-        """处理日期范围"""
-        self.logger.info(f"开始处理 {start_date} 至 {end_date} 的ERA5 SWE数据")
-
-        # 转换为日期范围
-        start_date = pd.to_datetime(start_date)
-        end_date = pd.to_datetime(end_date)
-        date_range = pd.date_range(start_date, end_date, freq='D')
-
-        all_results = []
-
-        for current_date in date_range:
-            try:
-                # 获取文件路径
-                file_path = self.get_file_path(current_date)
-                if not file_path or not file_path.exists():
-                    self.logger.warning(f"文件不存在: {file_path}")
-                    continue
-
-                # 提取数据
-                daily_df = self.extract_values(current_date, file_path)
-
-                # 记录数据量
-                self.logger.info(f"日期 {current_date}: 提取 {len(daily_df)} 条记录")
-
-                if not daily_df.empty:
-                    # 数据后处理
-                    processed_df = self.postprocess_data(daily_df, current_date)
-                    all_results.append(processed_df)
-
-            except Exception as e:
-                self.logger.error(f"{current_date} 处理失败: {str(e)}")
-                continue
-
-        # 合并结果
-        if all_results:
-            final_df = pd.concat(all_results, ignore_index=True)
-            output_path = self.save_results(final_df, start_date, end_date)
-
-            # 生成数据摘要
-            self.generate_data_summary(final_df, Path(output_path))
-
-            self.logger.info(f"处理完成! 结果保存至: {output_path}")
-            return output_path
-        else:
-            self.logger.warning("未生成有效结果")
-            return None
-
     def postprocess_data(self, df, date):
         """数据后处理"""
         if df.empty:
@@ -229,45 +210,62 @@ class ERA5SWEProcessor(BaseProcessor):
         # 创建副本
         result_df = df.copy()
 
-        # 应用任何必要的后处理
-        # 例如: 单位转换、质量控制等
+        # 过滤无效值
+        valid_min = self.conf.get('valid_min', 0)
+        fill_value = self.conf.get('fill_value', -9999)
+
+        # 使用 .loc 进行条件过滤
+        mask = (result_df['value'] >= valid_min) & (result_df['value'] != fill_value)
+        result_df = result_df.loc[mask].copy()
+
+        # 应用缩放因子
+        scale_factor = self.conf.get('scale_factor', 1.0)
+        if scale_factor != 1.0:
+            result_df.loc[:, 'value'] = result_df['value'] * scale_factor
 
         # 添加处理时间
         processing_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         result_df.loc[:, 'processing_time'] = processing_time
 
+        self.logger.debug(f"后处理完成: {len(result_df)} 条记录")
         return result_df
 
     def save_results(self, df, start_date, end_date):
         """保存结果"""
         try:
-            # 确定输出格式
-            output_format = self.conf.get('output_format', 'parquet').lower()
             base_filename = f"era5_swe_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
 
-            # 根据格式选择保存方法
+            # 总是保存 CSV 格式（用于查看）
+            csv_path = self.output_dir / f"{base_filename}.csv"
+            df.to_csv(csv_path, index=False)
+            self.logger.info(f"结果保存为 CSV (用于查看): {csv_path}")
+
+            # 根据配置保存其他格式
+            output_format = self.conf.get('output_format', 'parquet').lower()
+
             if output_format == 'parquet':
                 try:
-                    output_path = self.output_dir / f"{base_filename}.parquet"
-                    df.to_parquet(output_path, index=False)
-                    self.logger.info(f"结果保存为 Parquet: {output_path}")
-                    return str(output_path)
+                    parquet_path = self.output_dir / f"{base_filename}.parquet"
+                    df.to_parquet(parquet_path, index=False)
+                    self.logger.info(f"结果保存为 Parquet (用于处理): {parquet_path}")
+                    return str(parquet_path)
                 except ImportError:
-                    self.logger.warning("Parquet 支持不可用，回退到 CSV 格式")
-                    output_format = 'csv'
+                    self.logger.warning("Parquet 支持不可用，仅保存 CSV 格式")
+                    return str(csv_path)
 
-            if output_format == 'csv':
-                output_path = self.output_dir / f"{base_filename}.csv"
-                df.to_csv(output_path, index=False)
-                self.logger.info(f"结果保存为 CSV: {output_path}")
-                return str(output_path)
+            elif output_format == 'feather':
+                try:
+                    feather_path = self.output_dir / f"{base_filename}.feather"
+                    df.to_feather(feather_path)
+                    self.logger.info(f"结果保存为 Feather: {feather_path}")
+                    return str(feather_path)
+                except ImportError:
+                    self.logger.warning("Feather 支持不可用，仅保存 CSV 格式")
+                    return str(csv_path)
 
             else:
-                self.logger.warning(f"未知的输出格式: {output_format}，使用 CSV")
-                output_path = self.output_dir / f"{base_filename}.csv"
-                df.to_csv(output_path, index=False)
-                self.logger.info(f"结果保存为 CSV: {output_path}")
-                return str(output_path)
+                self.logger.warning(f"未知的输出格式: {output_format}，仅保存 CSV 格式")
+                return str(csv_path)
 
         except Exception as e:
             self.logger.exception(f"保存结果失败: {str(e)}")
@@ -298,3 +296,72 @@ class ERA5SWEProcessor(BaseProcessor):
 
         except Exception as e:
             self.logger.warning(f"生成数据摘要失败: {str(e)}")
+
+    def process_range(self, start_date, end_date):
+        """处理日期范围"""
+        self.logger.info(f"开始处理 {start_date} 至 {end_date} 的ERA5 SWE数据")
+
+        # 转换为日期范围
+        start_date = pd.to_datetime(start_date)
+        end_date = pd.to_datetime(end_date)
+        date_range = pd.date_range(start_date, end_date, freq='D')
+
+        all_results = []
+        processed_dates = 0
+        success_dates = 0
+
+        for current_date in date_range:
+            processed_dates += 1
+            try:
+                # 获取文件路径
+                file_path = self.get_file_path(current_date)
+                if not file_path or not file_path.exists():
+                    self.logger.warning(f"文件不存在: {file_path}")
+                    continue
+
+                # 提取数据
+                daily_df = self.extract_values(current_date, file_path)
+
+                # 记录数据量
+                self.logger.info(f"日期 {current_date}: 提取 {len(daily_df)} 条记录")
+
+                if not daily_df.empty:
+                    # 数据后处理
+                    processed_df = self.postprocess_data(daily_df, current_date)
+                    if not processed_df.empty:
+                        all_results.append(processed_df)
+                        success_dates += 1
+
+            except Exception as e:
+                self.logger.error(f"{current_date} 处理失败: {str(e)}")
+                continue
+
+        # 合并结果
+        if all_results:
+            final_df = pd.concat(all_results, ignore_index=True)
+            output_path = self.save_results(final_df, start_date, end_date)
+
+            # 生成数据摘要
+            self.generate_data_summary(final_df, Path(output_path))
+
+            self.logger.info(
+                f"处理完成! 成功处理 {success_dates}/{processed_dates} 天, "
+                f"总计 {len(final_df)} 条记录, 结果保存至: {output_path}"
+            )
+            return output_path
+        else:
+            self.logger.warning(f"未生成有效结果, 处理了 {processed_dates} 天")
+            return None
+
+    def close(self):
+        """关闭资源"""
+        try:
+            if self.db_conn:
+                self.db_conn.close()
+                self.logger.debug("数据库连接已关闭")
+        except Exception as e:
+            self.logger.warning(f"关闭数据库连接时出错: {str(e)}")
+
+    def __del__(self):
+        """析构函数，确保资源被释放"""
+        self.close()

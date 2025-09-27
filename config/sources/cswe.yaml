@@ -1,0 +1,40 @@
+name:  "cswe"
+
+data_dir:  "E:/data/CSWE_simp/CSS_SWE_Product_V1.2_Simplified_Version/CSS_SWE_product_V1.2"
+
+file_pattern:  "{satellite_sensor}_SWE_{date}_DAILY_025KM_V1.2.h5"
+
+
+satellite_sensor_combinations:
+  - "DMSP_SMMR"
+  - "F08_SSMI"
+  - "F13_SSMI"
+  - "F17_SSMIS"
+
+
+
+data_type:  "float32"
+format:  "hdf5"
+variable:  "SWE"
+subdataset_index:  2
+
+chunk_regions:  true
+chunk_size:  1000
+
+date_range:
+  start:  2013-01-02
+  end:  2017-12-31
+
+fill_value:  -9999.0
+valid_min:  0.0        # 有效值最小值
+scale_factor:  1.0   # 单位转换系数
+units:  "mm"
+output:
+  primary_format:  "parquet"  # 输出文件格式
+  always_generate_csv: true
+
+
+crs:  "EPSG:4326"
+projection:  "WGS84"
+
+debug:  true

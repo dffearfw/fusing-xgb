@@ -1,0 +1,46 @@
+name: "landcover"
+description: "Land Cover Classification Data"
+data_dir: "E:/data/clcd"
+
+path_template:  "E:/data/clcd/CLCD_v01_{year}_albert.tif"
+# 文件命名模式
+file_pattern: "CLCD_v01_{year}_albert.tif"
+
+# 数据格式信息
+format: "geotiff"
+variable: "landcover"
+data_type: "uint8"  # 地物分类通常是整型
+fill_value: 255
+valid_min: 1
+scale_factor: 1.0
+
+# 投影信息
+projection: "AIBERS_Conic_Equal_Area"
+crs: "EPSG:4524"  # ESRI代码表示AIBERS投影，可能需要调整
+wgs84_datum: true
+
+# 地物分类体系（示例，根据实际数据调整）
+landcover_classes:
+  1:  "Cropland"
+  2:  "Forest"
+  3:  "Shrub"
+  4:  "Grassland"
+  5:  "Water"
+  6:  "Sonw/Ice"
+  7:  "Barren"
+  8:  "Impervious"
+  9:  "Wetland"
+
+
+# 日期范围
+date_range:
+  start: 2013-01-01
+  end: 2017-12-31
+
+# 处理选项
+
+reproject_to_wgs84: true  # 是否重投影到WGS84
+
+output:
+  primary_format:  "parquet"  # 输出文件格式
+  always_generate_csv: true

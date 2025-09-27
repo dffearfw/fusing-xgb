@@ -1,3 +1,5 @@
+# TODO:修改加载cswe配置方法，添加新方法
+
 import yaml
 import logging
 from pathlib import Path
@@ -28,7 +30,13 @@ class ConfigLoader:
         )
         # self.gldas = self._load_config_file("sources/gldas.yaml")
         # self.modis = self._load_config_file("sources/modis.yaml")
-        # self.era5 = self._load_config_file("sources/era5.yaml")
+        self.era5_swe = self._load_config_file("sources/era5_swe.yaml")
+        self.cswe = self._load_config_file("sources/cswe.yaml")
+        self.landcover = self._load_config_file("sources/landcover.yaml")
+        self.snow_phenology = self._load_config_file("sources/scp.yaml")
+        self.terrain_features = self._load_config_file("sources/terrain_features.yaml")
+        self.snow_depth = self._load_config_file("sources/sd.yaml")
+        self.era5_temperature = self._load_config_file("sources/era5_temperature.yaml")
 
         # 日志配置
         self.log_config = self._get_log_config()

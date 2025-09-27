@@ -1,0 +1,40 @@
+# ERA5温度数据配置
+name: "ERA5温度"
+description: "ERA5再分析月平均温度数据"
+data_dir: "E:/data/era5_temerature"  # 相对于基础数据目录
+
+# 文件格式信息
+file_pattern: "era5_temperature_{year}{month}.tif"  # 年月格式
+file_format: "geotiff"
+
+# 数据信息
+data_type: "double64"
+fill_value: -32768.0
+scale_factor: 0.01  # 可能需要根据实际数据调整
+add_offset: 0.0
+unit: "K"  # 开尔文，可能需要转换为摄氏度
+
+# 空间参考信息
+projection: "WGS84"
+crs: "EPSG:4326"  # WGS84地理坐标系
+unit: "degrees"
+
+# 时间范围
+date_range:
+  start: "2013-01-01"
+  end: "2017-12-31"
+
+output:
+  primary_format:  "parquet"  # 输出文件格式
+  always_generate_csv: true
+
+time_var: "date"  # 时间变量名称
+value_var: "temperature"  # 值变量名称
+time_aggregation: "monthly"  # 月度数据
+
+# 变量信息
+variables:
+  t2m:
+    name: "2m_temperature"
+    long_name: "2 metre temperature"
+    units: "K"

@@ -358,42 +358,43 @@ class GLSnowProcessor:
         return result_df
 
     def save_results(self, df, start_date, end_date):
-        """保存结果为多种格式"""
+        """保存结果 - 修复日期格式问题"""
         try:
-            base_filename = f"glsnow_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}"
+            # 处理日期格式（支持字符串和datetime对象）
+            if isinstance(start_date, str):
+                # 如果是字符串，直接使用（如 "20130102"）
+                start_str = start_date
+            else:
+                # 如果是datetime对象，格式化
+                start_str = start_date.strftime('%Y%m%d')
 
-            # 总是保存 CSV 格式（用于查看）
+            if isinstance(end_date, str):
+                end_str = end_date
+            else:
+                end_str = end_date.strftime('%Y%m%d')
+
+            base_filename = f"glsnow_{start_str}_{end_str}"
+
+            # 总是保存 CSV 格式
             csv_path = self.output_dir / f"{base_filename}.csv"
             df.to_csv(csv_path, index=False)
-            self.logger.info(f"结果保存为 CSV (用于查看): {csv_path}")
+            self.logger.info(f"结果保存为 CSV: {csv_path}")
 
             # 根据配置保存其他格式
-            output_format = self.conf.get('output_format', 'parquet').lower()
+            output_format = self.conf.get('output', {}).get('primary_format', 'parquet').lower()
 
             if output_format == 'parquet':
                 try:
                     parquet_path = self.output_dir / f"{base_filename}.parquet"
                     df.to_parquet(parquet_path, index=False)
-                    self.logger.info(f"结果保存为 Parquet (用于处理): {parquet_path}")
-                    return str(parquet_path)  # 返回主要格式的路径
-                except ImportError:
-                    self.logger.warning("Parquet 支持不可用，仅保存 CSV 格式")
+                    self.logger.info(f"结果保存为 Parquet: {parquet_path}")
+                    return str(parquet_path)
+                except Exception as e:
+                    self.logger.error(f"保存Parquet失败: {e}")
                     return str(csv_path)
-
-            elif output_format == 'feather':
-                try:
-                    feather_path = self.output_dir / f"{base_filename}.feather"
-                    df.to_feather(feather_path)
-                    self.logger.info(f"结果保存为 Feather: {feather_path}")
-                    return str(feather_path)
-                except ImportError:
-                    self.logger.warning("Feather 支持不可用，仅保存 CSV 格式")
-                    return str(csv_path)
-
             else:
-                self.logger.warning(f"未知的输出格式: {output_format}，仅保存 CSV 格式")
                 return str(csv_path)
 
         except Exception as e:
-            self.logger.exception(f"保存结果失败: {str(e)}")
+            self.logger.exception(f"保存结果失败: {e}")
             return None

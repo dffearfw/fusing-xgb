@@ -1,0 +1,40 @@
+name: "terrain_features"
+description: "Terrain Features Data (DEM-derived characteristics)"
+base_data_dir: "E:/data/dem/GEE_DEM"
+
+# 地理特征类型定义
+feature_types:
+  aspect: "25_apsect"      # 坡向
+  slope: "25_slope"        # 坡度
+  eastness: "25_east"      # 东向度
+  tpi: "25_tpi"            # 地形位置指数
+  curvature1: "25_cur1"    # 曲率1
+  curvature2: "25_cur2"    # 曲率2
+  elevation: "25km_aggre"  # 高程
+  std_slope: "25std_slope"     # 坡度标准差
+  std_eastness: "25std_east"   # 东向度标准差
+  std_tpi: "25std_tpi"         # 地形位置指数标准差
+  std_curvature1: "25std_cur1" # 曲率1标准差
+  std_curvature2: "25std_cur2" # 曲率2标准差
+  std_high: "25std_high"       # 高程序列标准差
+  std_aspect: "25std_aspect"   # 坡向标准差
+
+# 文件格式信息
+format: "arcgrid"  # ArcGIS Grid格式
+data_type: "float32"
+fill_value: -9999.0
+scale_factor: 1.0
+
+# 投影信息
+projection: "CGCS2000_Albers"
+crs: "EPSG:4526"  # CGCS2000 / 3-degree Gauss-Kruger CM 120E
+
+# 空间分辨率
+resolution: 25000  # 25公里
+unit: "meters"
+
+output:
+  primary_format:  "parquet"  # 输出文件格式
+  always_generate_csv: true
+
+extract_all_features: true  # 是否提取所有特征

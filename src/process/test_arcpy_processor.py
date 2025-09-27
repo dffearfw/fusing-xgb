@@ -1,3 +1,4 @@
+# 测试arcpy文件
 
 # -*- coding: utf-8 -*-
 import sys
@@ -20,7 +21,5 @@ else:
 
 # 示例处理：创建缓冲区
 print("开始处理...")
-
-
 
 arcpy.CheckInExtension("Spatial")

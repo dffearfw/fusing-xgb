@@ -1,20 +1,16 @@
-name:  "ERA5_SWE"
+name:  "era5_swe"
 
 data_dir:  "era5_swe"
 
 file_pattern:  "era5_swe_{year}{month}.tif"
+path_template:  "E:/data/era5_swe/era5_swe_{year}{month}.tif"
 
-
+data_type:  "float32"
 format:  "geotiff"
 variable:  "swe"
 
-lon_var:  "x"
-lat_var:  "y"
-
 chunk_regions:  true
 chunk_size:  1000
-
-buffer:  0.02
 
 date_range:
   start:  2013-01-02
@@ -28,7 +24,8 @@ output:
   primary_format:  "parquet"  # 输出文件格式
   always_generate_csv: true
 
-date_regex:  '\d{8}'
+band_per_day:  true
+band_offset:  0
 
 crs:  "EPSG:4326"
 projection:  "WGS84"

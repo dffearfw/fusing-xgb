@@ -1,3 +1,5 @@
+# 旧版arcpy处理栅格文件
+
 import shutil
 import subprocess
 import os
@@ -6,22 +8,21 @@ import pandas as pd
 import tempfile
 from pathlib import Path
 
-
 # ===== 配置区域 =====
 ARCGIS_PYTHON = r"C:\Python27\ArcGIS10.8\python.exe"
 SCRIPT_NAME = "test_arcpy_processor.py"
 ARCGIS_BIN_PATH = r"C:\Program Files (x86)\ArcGIS\Desktop10.8\bin"
-excel_path= r"/src/process/samples.xlsx"
-raster_dir=r"E:\data\GLDAS_SWE"
-output_dir=r"E:\data\gisws"
+excel_path = r"/src/process/samples.xlsx"
+raster_dir = r"E:\data\GLDAS_SWE"
+output_dir = r"E:\data\gisws"
 
 
 # ====================
 def prepare_data():
-    df=pd.read_excel(excel_path)
-    df['date']=pd.to_datetime(df['time'],format='%Y%m%d')
-    df['year']=df['date'].dt.year
-    df['doy']=df['date'].dt.dayofyear
+    df = pd.read_excel(excel_path)
+    df['date'] = pd.to_datetime(df['time'], format='%Y%m%d')
+    df['year'] = df['date'].dt.year
+    df['doy'] = df['date'].dt.dayofyear
     return df
 
 
@@ -66,7 +67,7 @@ def generate_py27_code(year, temp_csv, output_dir, raster_dir):
         "arcpy.CheckOutExtension('Spatial')",
         "",
         "# 获取年份的天数",
-        "year_val="+str(year),
+        "year_val=" + str(year),
         "is_leap_year = (" + str(year) + " % 4 == 0 and " + str(year) + " % 100 != 0) or (" + str(
             year) + " % 400 == 0)",
         "days_in_year = 366 if is_leap_year else 365",

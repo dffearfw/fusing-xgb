@@ -6,7 +6,7 @@ Create on 2025/8/20
 import pandas as pd
 import pyarrow.parquet as pq
 
-df=pq.read_table('../../outputs/glsnow/glsnow_2013-01-02_2017-12-31.parquet')
+df=pq.read_table('../../outputs/snow_depth/snow_depth_20250909_120035.parquet')
 pf=df.to_pandas
 
 print(pf)

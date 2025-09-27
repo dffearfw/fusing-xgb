@@ -1,0 +1,47 @@
+name: "scp"
+description: "Snow Phenology Data (Start and End Dates)"
+base_data_dir: "E:/data/SCP"
+
+# 文件夹结构
+sub_directories:
+  start: "SCS"  # 积雪初日文件夹
+  end: "SCM"    # 积雪终日文件夹
+
+# 文件命名模式
+file_pattern: "NIEER_AVHRR_{dataset_type}_500m_{year}-{next_year}.tif"
+
+hydrological_year:
+  start_month:  9
+  start_day:  1
+  end_month:  8
+  end_day:  31
+
+# 数据格式信息
+format: "geotiff"
+variable: "snow_days"
+data_type: "int16"  # 16位有符号整型
+fill_value: -32768
+valid_min: 1
+valid_max: 366  # 一年中的第几天
+scale_factor: 1.0
+units: "day_of_year"
+
+# 坐标信息
+projection: "WGS84"
+crs: "EPSG:4326"
+
+# 数据集类型映射
+dataset_types:
+  SCS: "start"  # 积雪初日
+  SCM: "end"    # 积雪终日
+
+# 日期范围
+date_range:
+  start: "2012-09-01"
+  end: "2018-08-31"
+
+output:
+  primary_format:  "parquet"  # 输出文件格式
+  always_generate_csv: true
+
+process_both_datasets: true  # 是否同时处理初日和终日

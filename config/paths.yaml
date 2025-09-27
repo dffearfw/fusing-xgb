@@ -7,5 +7,10 @@ station_db:  "E:/data/gisws/stations.db"
 outputs:
   glsnow:  "outputs/glsnow"
   era5_swe:  "outputs/era5_swe"
-
+  cswe:  "outputs/cswe"
+  landcover:  "outputs/landcover"
+  snow_phenology:  "outputs/snow_phenology"
+  terrain_features:  "outputs/terrain_features"
+  snow_depth:  "outputs/snow_depth"
+  era5_temperature:  "outputs/era5_temperature"
   combined:  "outputs/combined"

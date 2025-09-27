@@ -1,0 +1,39 @@
+# 积雪深度数据配置
+name: "snow_depth"
+description: "中国每日积雪深度数据（文本格式）"
+data_dir: "E:/data/SD/snow depth/daily snow depth_amsr2_China_full（2012-2024-08）"  # 相对于基础数据目录
+
+# 文件格式信息
+file_pattern: "({year}{month}{day}).txt"  # 年+年积日
+file_format: "ascii_grid"
+
+# 数据头信息（固定）
+header_lines: 6
+ncols: 321
+nrows: 161
+xllcenter: 60
+yllcenter: 15
+cellsize: 0.25
+NODATA_value: -1
+
+# 空间参考信息（经纬度投影）
+projection: "WGS84"
+crs: "EPSG:4326"  # WGS84地理坐标系
+unit: "degrees"
+
+# 数据内容信息
+data_type: "float32"  # 雪深通常为整数
+scale_factor: 1.0    # 单位为厘米
+fill_value: -1
+
+# 时间范围
+date_range:
+  start: "2013-01-01"
+  end: "2017-12-31"
+
+output:
+  primary_format:  "parquet"  # 输出文件格式
+  always_generate_csv: true
+
+time_var: "date"  # 时间变量名称
+value_var: "snow_depth"  # 值变量名称
