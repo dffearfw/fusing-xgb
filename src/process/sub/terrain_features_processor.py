@@ -5,6 +5,8 @@ Create on 2025/9/7
 """
 import logging
 import sqlite3
+import traceback
+
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -172,7 +174,7 @@ class TerrainFeaturesProcessor:
             return None
 
     def extract_feature_values(self, feature_type, stations):
-        """提取特定地理特征的值（内存优化版）"""
+        """提取特定地理特征的值 - 确保返回正确的DataFrame结构"""
         try:
             # 查找特征目录
             feature_dir = self._find_arcgrid_directory(feature_type)
@@ -202,7 +204,7 @@ class TerrainFeaturesProcessor:
                     self.logger.error(f"创建投影转换器失败: {str(e)}")
                     return pd.DataFrame()
 
-                # 提取站点值（使用逐点读取，避免加载整个数组）
+                # 提取站点值
                 results = []
                 processed_count = 0
                 success_count = 0
@@ -226,28 +228,22 @@ class TerrainFeaturesProcessor:
 
                         # 检查行列号是否在有效范围内
                         if 0 <= row < src.height and 0 <= col < src.width:
-                            # 使用窗口读取单个像素值（内存高效）
+                            # 使用窗口读取单个像素值
                             try:
-                                # 创建1x1的窗口
                                 window = rasterio.windows.Window(col, row, 1, 1)
-
-                                # 只读取单个像素
                                 value_array = src.read(1, window=window, boundless=True,
                                                        fill_value=self.conf.get('fill_value', -9999.0))
                                 value = float(value_array[0, 0])
 
-                                # 检查填充值
                                 fill_value = self.conf.get('fill_value', -9999.0)
 
                                 if value != fill_value and not np.isnan(value):
                                     results.append({
                                         'station_id': station_id,
                                         'feature_type': feature_type,
-                                        'value': value,
+                                        'value': value,  # 确保有value列
                                         'longitude': lon,
-                                        'latitude': lat,
-                                        'projected_x': x,
-                                        'projected_y': y
+                                        'latitude': lat
                                     })
                                     success_count += 1
 
@@ -267,15 +263,26 @@ class TerrainFeaturesProcessor:
                         continue
 
                 self.logger.info(f"特征 {feature_type}: 处理 {processed_count} 站点, 成功提取 {success_count} 条记录")
-                return pd.DataFrame(results)
+
+                # 确保返回的DataFrame有value列
+                if results:
+                    df = pd.DataFrame(results)
+                    if 'value' not in df.columns and len(df.columns) > 0:
+                        # 如果没有value列，使用第一列数值列
+                        numeric_cols = df.select_dtypes(include=['number']).columns
+                        if numeric_cols:
+                            df = df.rename(columns={numeric_cols[0]: 'value'})
+                    return df
+                else:
+                    return pd.DataFrame()
 
         except Exception as e:
             self.logger.exception(f"提取特征 {feature_type} 错误: {str(e)}")
             return pd.DataFrame()
 
     def extract_all_features(self, stations):
-        """提取所有地理特征的值（修复版本）"""
-        all_results = []
+        """提取所有地理特征的值 - 彻底修复版本"""
+        all_results = {}
 
         # 获取要处理的特征类型
         feature_types = list(self.conf.get('feature_types', {}).keys())
@@ -288,6 +295,17 @@ class TerrainFeaturesProcessor:
 
         self.logger.info(f"开始提取 {len(feature_types)} 个地理特征: {feature_types}")
 
+        # 为每个站点创建基础记录
+        for station in stations:
+            station_id = station.get('station_ID')
+            if station_id not in all_results:
+                all_results[station_id] = {
+                    'station_id': station_id,
+                    'longitude': station.get('Longitude'),
+                    'latitude': station.get('Latitude')
+                }
+
+        # 提取每个特征
         for i, feature_type in enumerate(feature_types):
             try:
                 self.logger.info(f"正在处理特征 ({i + 1}/{len(feature_types)}): {feature_type}")
@@ -296,58 +314,56 @@ class TerrainFeaturesProcessor:
                 feature_df = self.extract_feature_values_batch(feature_type, stations, batch_size=500)
 
                 if not feature_df.empty:
-                    # 立即检查数据
-                    self.logger.info(
-                        f"特征 {feature_type}: 提取 {len(feature_df)} 条记录, 唯一站点: {feature_df['station_id'].nunique()}")
+                    # 调试：检查DataFrame结构
+                    self.logger.debug(f"特征 {feature_type} DataFrame形状: {feature_df.shape}")
+                    self.logger.debug(f"列名: {list(feature_df.columns)}")
 
-                    # 检查特征类型是否正确
-                    unique_features = feature_df['feature_type'].unique()
-                    self.logger.debug(f"DataFrame中的特征类型: {unique_features}")
+                    # 确保有value列
+                    if 'value' not in feature_df.columns:
+                        self.logger.error(f"特征 {feature_type} 的DataFrame缺少value列!")
+                        self.logger.debug(f"实际列: {list(feature_df.columns)}")
+                        continue
 
-                    # 确保feature_type列的值正确
-                    if len(unique_features) == 1 and unique_features[0] == feature_type:
-                        all_results.append(feature_df)
-                        self.logger.info(f"✓ 特征 {feature_type} 添加成功")
-                    else:
-                        self.logger.warning(f"特征类型不匹配! 期望: {feature_type}, 实际: {unique_features}")
-                        # 强制修正特征类型
-                        feature_df['feature_type'] = feature_type
-                        all_results.append(feature_df)
+                    # 将特征值添加到对应的站点记录中
+                    success_count = 0
+                    for _, row in feature_df.iterrows():
+                        station_id = row['station_id']
+                        value = row['value']
+
+                        if station_id in all_results and pd.notna(value):
+                            all_results[station_id][feature_type] = value
+                            success_count += 1
+
+                    self.logger.info(f"特征 {feature_type}: 成功添加 {success_count}/{len(feature_df)} 条记录")
                 else:
                     self.logger.warning(f"特征 {feature_type}: 未提取到数据")
 
             except Exception as e:
                 self.logger.error(f"提取特征 {feature_type} 失败: {str(e)}")
+                # 继续处理下一个特征
                 continue
 
-        # 合并所有结果
+        # 转换为DataFrame
         if all_results:
-            try:
-                # 检查每个DataFrame的特征类型
-                for i, df in enumerate(all_results):
-                    self.logger.debug(f"结果 {i}: 特征类型 = {df['feature_type'].unique()}, 记录数 = {len(df)}")
+            result_df = pd.DataFrame(list(all_results.values()))
 
-                final_df = pd.concat(all_results, ignore_index=True)
+            # 验证结果
+            feature_columns = [col for col in result_df.columns if col not in ['station_id', 'longitude', 'latitude']]
+            self.logger.info(f"最终宽表: {len(result_df)} 个站点, {len(feature_columns)} 个特征: {feature_columns}")
 
-                # 验证最终结果
-                unique_features_final = final_df['feature_type'].unique()
-                self.logger.info(f"最终合并结果: 总记录数 = {len(final_df)}, 特征类型 = {unique_features_final}, 每种特征记录数:")
+            # 统计每个特征的填充率
+            for feature in feature_columns:
+                fill_count = result_df[feature].notna().sum()
+                fill_rate = fill_count / len(result_df) * 100
+                self.logger.info(f"  {feature}: {fill_count}/{len(result_df)} 有值 ({fill_rate:.1f}%)")
 
-                feature_counts = final_df['feature_type'].value_counts()
-                for feature, count in feature_counts.items():
-                    self.logger.info(f"  {feature}: {count} 条记录")
-
-                return final_df
-
-            except Exception as e:
-                self.logger.error(f"合并结果失败: {str(e)}")
-                return pd.DataFrame()
+            return result_df
         else:
             self.logger.warning("未生成有效结果")
             return pd.DataFrame()
 
     def extract_feature_values_batch(self, feature_type, stations, batch_size=1000):
-        """批量提取特征值（进一步优化内存）"""
+        """批量提取特征值 - 修复版本"""
         try:
             # 查找特征目录和数据文件
             feature_dir = self._find_arcgrid_directory(feature_type)
@@ -373,61 +389,92 @@ class TerrainFeaturesProcessor:
 
                 self.logger.info(f"批次 {batch_idx + 1}/{total_batches} 完成: {len(batch_results)} 条记录")
 
-                # 手动垃圾回收
-                import gc
-                gc.collect()
+            # 确保返回的DataFrame有正确的结构
+            if results:
+                df = pd.DataFrame(results)
+                # 调试信息
+                self.logger.debug(f"特征 {feature_type} 返回DataFrame列: {list(df.columns)}")
 
-            return pd.DataFrame(results)
+                # 确保有value列
+                if 'value' not in df.columns:
+                    self.logger.warning(f"特征 {feature_type} 没有value列，检查数据结构")
+                    # 如果有数值列，使用第一个数值列作为value
+                    numeric_cols = df.select_dtypes(include=['number']).columns
+                    if numeric_cols:
+                        value_col = numeric_cols[0]
+                        df = df.rename(columns={value_col: 'value'})
+                        self.logger.info(f"使用列 '{value_col}' 作为value列")
+                    else:
+                        self.logger.error(f"特征 {feature_type} 没有数值列")
+                        return pd.DataFrame()
+
+                return df
+            else:
+                self.logger.warning(f"特征 {feature_type} 没有提取到任何数据")
+                return pd.DataFrame()
 
         except Exception as e:
             self.logger.exception(f"批量提取特征 {feature_type} 错误: {str(e)}")
             return pd.DataFrame()
 
     def _process_station_batch(self, feature_type, data_file, stations):
-        """处理单个站点批次"""
+        """处理单个站点批次 - 详细调试版本"""
         results = []
 
-        with rasterio.open(data_file) as src:
-            # 创建投影转换器
-            try:
-                from pyproj import Transformer
-                transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-            except Exception as e:
-                self.logger.error(f"创建投影转换器失败: {str(e)}")
-                return results
-
-            for station in stations:
+        try:
+            with rasterio.open(data_file) as src:
+                # 创建投影转换器
                 try:
-                    lon = float(station.get('Longitude'))
-                    lat = float(station.get('Latitude'))
-                    station_id = station.get('station_ID')
-
-                    # 坐标转换
-                    x, y = transformer.transform(lon, lat)
-                    row, col = rowcol(src.transform, x, y)
-                    row, col = int(row), int(col)
-
-                    if 0 <= row < src.height and 0 <= col < src.width:
-                        # 读取单个像素
-                        window = rasterio.windows.Window(col, row, 1, 1)
-                        value_array = src.read(1, window=window, boundless=True,
-                                               fill_value=self.conf.get('fill_value', -9999.0))
-                        value = float(value_array[0, 0])
-
-                        fill_value = self.conf.get('fill_value', -9999.0)
-                        if value != fill_value and not np.isnan(value):
-                            results.append({
-                                'station_id': station_id,
-                                'feature_type': feature_type,
-                                'value': value,
-                                'longitude': lon,
-                                'latitude': lat
-                            })
-
+                    from pyproj import Transformer
+                    transformer = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
                 except Exception as e:
-                    continue
+                    self.logger.error(f"创建投影转换器失败: {str(e)}")
+                    return results
 
-        return results
+                for station in stations:
+                    try:
+                        lon = float(station.get('Longitude'))
+                        lat = float(station.get('Latitude'))
+                        station_id = station.get('station_ID')
+
+                        # 坐标转换
+                        x, y = transformer.transform(lon, lat)
+                        row, col = rowcol(src.transform, x, y)
+                        row, col = int(row), int(col)
+
+                        if 0 <= row < src.height and 0 <= col < src.width:
+                            # 读取单个像素
+                            window = rasterio.windows.Window(col, row, 1, 1)
+                            value_array = src.read(1, window=window, boundless=True,
+                                                   fill_value=self.conf.get('fill_value', -9999.0))
+                            value = float(value_array[0, 0])
+
+                            fill_value = self.conf.get('fill_value', -9999.0)
+                            if value != fill_value and not np.isnan(value):
+                                results.append({
+                                    'station_id': station_id,
+                                    'feature_type': feature_type,
+                                    'value': value,  # 确保有value列
+                                    'longitude': lon,
+                                    'latitude': lat
+                                })
+
+                    except Exception as e:
+                        self.logger.debug(f"处理站点 {station.get('station_ID')} 失败: {str(e)}")
+                        continue
+
+            self.logger.debug(f"特征 {feature_type} 批次处理完成: 提取 {len(results)} 条记录")
+
+            # 调试：检查结果结构
+            if results:
+                sample_result = results[0]
+                self.logger.debug(f"单条结果结构: {sample_result}")
+
+            return results
+
+        except Exception as e:
+            self.logger.error(f"批次处理失败: {str(e)}")
+            return results
 
     def postprocess_data(self, df):
         """数据后处理"""
@@ -496,36 +543,50 @@ class TerrainFeaturesProcessor:
             self.logger.warning(f"保存临时结果失败: {str(e)}")
 
     def process(self):
-        """处理地理特征数据"""
+        """处理地理特征数据 - 增强错误处理"""
         self.logger.info("开始处理地理特征数据")
 
-        # 获取所有站点
-        stations = self.get_stations()
-        if not stations:
-            self.logger.error("没有有效站点，无法处理")
-            return None
+        try:
+            # 获取所有站点
+            stations = self.get_stations()
+            if not stations:
+                self.logger.error("没有有效站点，无法处理")
+                return None
 
-        self.logger.info(f"找到 {len(stations)} 个站点，开始提取地理特征")
+            self.logger.info(f"找到 {len(stations)} 个站点，开始提取地理特征")
 
-        # 提取所有特征
-        result_df = self.extract_all_features(stations)
+            # 提取所有特征
+            result_df = self.extract_all_features(stations)
 
-        if not result_df.empty:
+            if result_df is None:
+                self.logger.error("extract_all_features 返回 None")
+                return None
+
+            if result_df.empty:
+                self.logger.warning("未生成有效结果")
+                return None
+
             # 数据后处理
             processed_df = self.postprocess_data(result_df)
 
             # 保存结果
             output_path = self.save_results(processed_df)
 
-            # 生成数据摘要
-            self._generate_terrain_summary(processed_df, Path(output_path))
+            if output_path:
+                # 生成数据摘要
+                self._generate_terrain_summary(processed_df, Path(output_path))
 
-            self.logger.info(
-                f"处理完成! 总计 {len(processed_df)} 条记录, 结果保存至: {output_path}"
-            )
-            return output_path
-        else:
-            self.logger.warning("未生成有效结果")
+                self.logger.info(
+                    f"处理完成! 总计 {len(processed_df)} 条记录, 结果保存至: {output_path}"
+                )
+                return output_path
+            else:
+                self.logger.error("保存结果失败")
+                return None
+
+        except Exception as e:
+            self.logger.error(f"地形特征处理失败: {str(e)}")
+            self.logger.debug(f"详细错误信息:\n{traceback.format_exc()}")
             return None
 
     def _generate_terrain_summary(self, df, output_path):
