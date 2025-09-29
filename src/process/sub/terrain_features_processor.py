@@ -14,6 +14,7 @@ from pathlib import Path
 import rasterio
 from rasterio.transform import rowcol
 import re
+from src.process.config import config
 
 logger = logging.getLogger("TerrainFeaturesProcessor")
 
@@ -29,7 +30,6 @@ class TerrainFeaturesProcessor:
             secure_processor: 安全处理器实例
             station_filter: 站点过滤器
         """
-        from src.process.config import config
 
         self.logger = logging.getLogger("TerrainFeaturesProcessor")
         self.conf = config.terrain_features
@@ -58,7 +58,6 @@ class TerrainFeaturesProcessor:
 
     def connect_database(self):
         """连接站点数据库"""
-        from src.process.config import config
 
         db_path = config.get_station_db_path()
         try:
@@ -286,12 +285,20 @@ class TerrainFeaturesProcessor:
 
         # 获取要处理的特征类型
         feature_types = list(self.conf.get('feature_types', {}).keys())
-        process_all = self.conf.get('extract_all_features', True)
 
+        # 检查是否有调试特征配置
+        debug_features = self.conf.get('debug_features', [])
+        if debug_features:
+            feature_types = [ft for ft in feature_types if ft in debug_features]
+            self.logger.info(f"调试模式: 只处理 {len(feature_types)} 个特征: {feature_types}")
+
+        # 或者通过 extract_all_features 控制
+        process_all = self.conf.get('extract_all_features', True)
         if not process_all:
             # 只处理主要特征
             main_features = ['elevation', 'slope', 'aspect']
             feature_types = [ft for ft in feature_types if ft in main_features]
+            self.logger.info(f"精简模式: 只处理主要特征: {feature_types}")
 
         self.logger.info(f"开始提取 {len(feature_types)} 个地理特征: {feature_types}")
 
@@ -314,14 +321,9 @@ class TerrainFeaturesProcessor:
                 feature_df = self.extract_feature_values_batch(feature_type, stations, batch_size=500)
 
                 if not feature_df.empty:
-                    # 调试：检查DataFrame结构
-                    self.logger.debug(f"特征 {feature_type} DataFrame形状: {feature_df.shape}")
-                    self.logger.debug(f"列名: {list(feature_df.columns)}")
-
                     # 确保有value列
                     if 'value' not in feature_df.columns:
-                        self.logger.error(f"特征 {feature_type} 的DataFrame缺少value列!")
-                        self.logger.debug(f"实际列: {list(feature_df.columns)}")
+                        self.logger.warning(f"特征 {feature_type} 没有value列，跳过")
                         continue
 
                     # 将特征值添加到对应的站点记录中
@@ -340,7 +342,6 @@ class TerrainFeaturesProcessor:
 
             except Exception as e:
                 self.logger.error(f"提取特征 {feature_type} 失败: {str(e)}")
-                # 继续处理下一个特征
                 continue
 
         # 转换为DataFrame
@@ -350,12 +351,6 @@ class TerrainFeaturesProcessor:
             # 验证结果
             feature_columns = [col for col in result_df.columns if col not in ['station_id', 'longitude', 'latitude']]
             self.logger.info(f"最终宽表: {len(result_df)} 个站点, {len(feature_columns)} 个特征: {feature_columns}")
-
-            # 统计每个特征的填充率
-            for feature in feature_columns:
-                fill_count = result_df[feature].notna().sum()
-                fill_rate = fill_count / len(result_df) * 100
-                self.logger.info(f"  {feature}: {fill_count}/{len(result_df)} 有值 ({fill_rate:.1f}%)")
 
             return result_df
         else:

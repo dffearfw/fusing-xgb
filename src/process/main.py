@@ -1,15 +1,19 @@
 import sys
 import os
+
+# 添加当前目录到Python路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, current_dir)
 import argparse
 import logging
 import traceback
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
-from src.process.config import config
-from src.process.integration import DataIntegrator
-from src.process.utils.security import SecureProcessor
-from src.process.utils.logging_setup import setup_logging
+from config import config
+from integration import DataIntegrator
+from utils.security import SecureProcessor
+from utils.logging_setup import setup_logging
 
 
 def parse_arguments():
@@ -48,6 +52,15 @@ def parse_arguments():
 
     parser.add_argument('--dry-run', action='store_true',
                         help='干跑模式，只显示计划不实际执行')
+
+    parser.add_argument('--terrain-features', nargs='+',
+                        choices=['elevation', 'slope', 'aspect', 'eastness', 'tpi',
+                                 'curvature1', 'curvature2', 'std_slope', 'std_eastness',
+                                 'std_tpi', 'std_curvature1', 'std_curvature2', 'std_high', 'std_aspect'],
+                        help='选择要处理的地形特征')
+
+    parser.add_argument('--debug-terrain', action='store_true',
+                        help='调试模式：只处理elevation, slope, aspect三个主要特征')
 
     return parser.parse_args()
 
@@ -306,7 +319,8 @@ def main():
 
         # 确定要处理的数据源
         if 'all' in args.sources:
-            sources_to_process = ['terrain_features','glsnow']  # 默认处理所有源  ,'snow_depth','era5_temperature','era5_swe','cswe','landcover','snow_phenology',
+            sources_to_process = ['cswe','landcover'
+                , 'glsnow']  # 默认处理所有源  ,'snow_depth','era5_temperature','era5_swe','snow_phenology',
             logger.info("🌍 处理所有可用数据源")
         else:
             sources_to_process = args.sources
