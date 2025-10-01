@@ -16,6 +16,13 @@ class DataIntegrator:
         self.logger = logging.getLogger("DataIntegrator")
         self.source_data = {}
         self.db_conn = None
+        self.db_fields_config = {
+            'swe（mm）': 'swe',
+            'Altitude(m)': 'altitude',
+
+            # 'snowDepth(mm)': 'snow_depth',
+            # 'snowDensity(g/cm3)': 'snow_density'
+        }
 
     def connect_database(self):
         """连接站点数据库"""
@@ -200,6 +207,65 @@ class DataIntegrator:
 
         return found_columns
 
+    def get_database_data(self, station_ids, start_date, end_date):
+        """统一获取数据库中配置的所有字段"""
+        try:
+            if not self.db_conn:
+                if not self.connect_database():
+                    return pd.DataFrame()
+
+            if not self.db_fields_config:
+                self.logger.warning("没有配置数据库字段")
+                return pd.DataFrame()
+
+            # 构建查询
+            field_selects = []
+            for db_field in self.db_fields_config.keys():
+                field_selects.append(f'"{db_field}"')
+
+            query = f"""
+            SELECT station_ID, time, {', '.join(field_selects)}
+            FROM stations 
+            WHERE time BETWEEN ? AND ?
+            """
+
+            # 转换日期格式
+            start_db = int(start_date.strftime('%Y%m%d'))
+            end_db = int(end_date.strftime('%Y%m%d'))
+
+            df = pd.read_sql_query(query, self.db_conn, params=[start_db, end_db])
+
+            if not df.empty:
+                # 处理数据
+                df['date'] = df['time'].apply(
+                    lambda x: datetime.strptime(str(int(x)), '%Y%m%d').strftime('%Y-%m-%d')
+                )
+                df['station_id'] = df['station_ID'].astype(str)
+
+                # 重命名列
+                result_df = df[['station_id', 'date'] + list(self.db_fields_config.keys())]
+                result_df = result_df.rename(columns=self.db_fields_config)
+
+                # 过滤站点
+                if station_ids:
+                    result_df = result_df[result_df['station_id'].isin(station_ids)]
+
+                self.logger.info(f"✅ 从数据库获取 {len(self.db_fields_config)} 个字段: {list(self.db_fields_config.values())}")
+
+                # 统计每个字段的有效数据量
+                for field in self.db_fields_config.values():
+                    if field in result_df.columns:
+                        valid_count = result_df[field].notna().sum()
+                        self.logger.info(f"  {field}: {valid_count} 条有效记录")
+
+                return result_df
+            else:
+                self.logger.warning("数据库中未找到指定时间范围内的数据")
+                return pd.DataFrame()
+
+        except Exception as e:
+            self.logger.error(f"获取数据库数据失败: {str(e)}")
+            return pd.DataFrame()
 
     def _create_correct_wide_table(self):
         """创建正确的宽表 - 完整版本"""
