@@ -317,10 +317,24 @@ def main():
         integrator = DataIntegrator(output_dir=output_dir, secure_processor=secure_processor)
         logger.info(f"📂 输出目录: {output_dir}")
 
+        try:
+            gldas_file_path = 'D:/pyworkspace/fusing xgb/config/sources/results.xlsx'
+            if Path(gldas_file_path).exists():
+                success = integrator.add_source('gldas', gldas_file_path)
+                if success:
+                    logger.info(f"✅ 成功添加GLDAS数据: {gldas_file_path}")
+                else:
+                    logger.warning(f"⚠️ 添加GLDAS数据失败: {gldas_file_path}")
+            else:
+                logger.warning(f"⚠️ GLDAS文件不存在: {gldas_file_path}")
+        except Exception as e:
+            logger.error(f"❌ 添加GLDAS数据时出错: {str(e)}")
+
+
         # 确定要处理的数据源
         if 'all' in args.sources:
-            sources_to_process = ['cswe','landcover','snow_phenology'
-                , 'glsnow']  # 默认处理所有源  ,'snow_depth','era5_temperature','era5_swe',
+            sources_to_process = ['cswe','landcover','snow_phenology','snow_depth','era5_temperature','era5_swe'
+                , 'glsnow']  # 默认处理所有源
             logger.info("🌍 处理所有可用数据源")
         else:
             sources_to_process = args.sources
