@@ -460,7 +460,7 @@ class DataIntegrator:
 
                         self.logger.info(f"合并GLDAS数据: {before_count} -> {after_count} 行")
 
-            # 7. 处理积雪物候数据
+             # 7. 处理积雪物候数据
             if phenology_dfs:
                 for phenology_name, phenology_df in phenology_dfs:
                     self.logger.info(f"处理积雪物候数据 {phenology_name}: {len(phenology_df)} 行")
