@@ -268,7 +268,7 @@ class DataIntegrator:
             return pd.DataFrame()
 
     def _create_correct_wide_table(self):
-        """创建正确的宽表 - 完整版本"""
+        """创建正确的宽表 - 详细调试版本"""
         if not self.source_data:
             return pd.DataFrame()
 
@@ -326,49 +326,112 @@ class DataIntegrator:
                 if self._has_coordinate_info(source_df):
                     coordinate_dfs.append((source_name, source_df))
 
-            # 2. 从数据库获取SWE数据
+            self.logger.info(f"数据源分类结果:")
+            self.logger.info(f"  动态数据源: {len(dynamic_dfs)} 个")
+            self.logger.info(f"  静态数据源: {len(static_dfs)} 个")
+            self.logger.info(f"  年度数据源: {len(yearly_dfs)} 个")
+            self.logger.info(f"  总站点数: {len(all_station_ids)}")
+            self.logger.info(f"  总日期数: {len(all_dates)}")
+
+            # 2. 从数据库获取SWE数据和海拔数据
             swe_df = pd.DataFrame()
+            altitude_df = pd.DataFrame()
             if all_station_ids and all_dates:
                 start_date = min(all_dates) if all_dates else datetime(2013, 1, 1)
                 end_date = max(all_dates) if all_dates else datetime(2018, 12, 31)
+
+                self.logger.info(f"获取数据库数据: {len(all_station_ids)} 个站点, {len(all_dates)} 个日期")
                 swe_df = self.get_swe_from_database(list(all_station_ids),
                                                     pd.to_datetime(start_date),
                                                     pd.to_datetime(end_date))
 
+                # 获取海拔数据
+                altitude_df = self.get_altitude_from_database(list(all_station_ids))
+
+                self.logger.info(f"数据库数据获取结果:")
+                self.logger.info(f"  SWE数据: {len(swe_df)} 行")
+                self.logger.info(f"  海拔数据: {len(altitude_df)} 行")
+
             # 3. 创建基础框架
+            final_wide = pd.DataFrame()
+
             if dynamic_dfs:
                 first_dynamic_name, final_wide = dynamic_dfs[0]
                 self.logger.info(f"以动态数据源 {first_dynamic_name} 为基础框架: {len(final_wide)} 行")
-
-                # 添加坐标信息
-                final_wide = self._standardize_station_id_format(final_wide, "基础框架")
+                self.logger.info(f"基础框架列: {list(final_wide.columns)}")
 
                 # 合并其他动态数据源
                 for i in range(1, len(dynamic_dfs)):
                     name, next_df = dynamic_dfs[i]
                     before_count = len(final_wide)
                     next_df = self._standardize_station_id_format(next_df, name)
-
-                    # 检查数据类型是否一致
-                    final_wide_type = str(final_wide['station_id'].dtype)
-                    next_df_type = str(next_df['station_id'].dtype)
-                    self.logger.debug(f"合并前数据类型检查 - 基础框架: {final_wide_type}, {name}: {next_df_type}")
-
                     final_wide = final_wide.merge(next_df, on=['station_id', 'date'], how='left')
                     after_count = len(final_wide)
                     self.logger.info(f"合并动态数据源 {name}: {before_count} -> {after_count} 行")
             else:
+                self.logger.warning("没有动态数据源，使用静态数据处理")
                 return self._handle_static_only_case(static_dfs, yearly_dfs, phenology_dfs, gldas_dfs)
 
             # 4. 合并数据库SWE数据
             if not swe_df.empty:
+                self.logger.info(f"合并SWE数据前 - final_wide形状: {final_wide.shape}")
+                self.logger.info(f"SWE数据形状: {swe_df.shape}")
+
                 before_count = len(final_wide)
                 final_wide = final_wide.merge(swe_df, on=['station_id', 'date'], how='left')
                 after_count = len(final_wide)
                 swe_valid_count = final_wide['swe'].notna().sum()
                 self.logger.info(f"合并数据库SWE数据: {before_count} -> {after_count} 行, 有效值: {swe_valid_count}")
 
-            # 5. 处理GLDAS数据
+            # 5. 合并数据库海拔数据 - 使用suffixes参数
+            if not altitude_df.empty:
+                self.logger.info(f"合并海拔数据...")
+                self.logger.info(f"  合并前final_wide列: {list(final_wide.columns)}")
+                self.logger.info(f"  海拔数据列: {list(altitude_df.columns)}")
+
+                before_count = len(final_wide)
+
+                # 使用suffixes参数明确指定后缀
+                final_wide = final_wide.merge(
+                    altitude_df,
+                    on=['station_id'],
+                    how='left',
+                    suffixes=('', '_to_drop')  # 原表不加后缀，新表加_to_drop后缀
+                )
+
+                after_count = len(final_wide)
+
+                # 检查合并后的列
+                self.logger.info(f"  合并后final_wide列: {list(final_wide.columns)}")
+
+                # 处理带后缀的列 - 保留新合并的数据，删除旧数据
+                columns_to_drop = []
+                columns_to_rename = {}
+
+                for col in final_wide.columns:
+                    if col.endswith('_to_drop'):
+                        base_col = col[:-8]  # 去掉 '_to_drop' 后缀
+                        # 如果原表中有同名列，删除原表的列，重命名新列
+                        if base_col in final_wide.columns:
+                            columns_to_drop.append(base_col)  # 删除原表的列
+                            columns_to_rename[col] = base_col  # 重命名新列为原名
+                        else:
+                            columns_to_rename[col] = base_col  # 直接重命名
+
+                # 执行删除和重命名
+                if columns_to_drop:
+                    final_wide = final_wide.drop(columns=columns_to_drop)
+                    self.logger.info(f"  删除原列: {columns_to_drop}")
+
+                if columns_to_rename:
+                    final_wide = final_wide.rename(columns=columns_to_rename)
+                    self.logger.info(f"  重命名列: {columns_to_rename}")
+
+                altitude_valid_count = final_wide['altitude'].notna().sum() if 'altitude' in final_wide.columns else 0
+                self.logger.info(f"合并数据库海拔数据: {before_count} -> {after_count} 行, 有效值: {altitude_valid_count}")
+                self.logger.info(f"  最终列: {list(final_wide.columns)}")
+
+            # 6. 处理GLDAS数据
             if gldas_dfs:
                 for gldas_name, gldas_df in gldas_dfs:
                     self.logger.info(f"处理GLDAS数据 {gldas_name}: {len(gldas_df)} 行")
@@ -397,7 +460,7 @@ class DataIntegrator:
 
                         self.logger.info(f"合并GLDAS数据: {before_count} -> {after_count} 行")
 
-            # 6. 处理积雪物候数据
+            # 7. 处理积雪物候数据
             if phenology_dfs:
                 for phenology_name, phenology_df in phenology_dfs:
                     self.logger.info(f"处理积雪物候数据 {phenology_name}: {len(phenology_df)} 行")
@@ -444,7 +507,7 @@ class DataIntegrator:
                             # 移除临时列
                             final_wide = final_wide.drop('hydrological_year', axis=1)
 
-            # 7. 处理年度数据
+            # 8. 处理年度数据
             if yearly_dfs:
                 for yearly_name, yearly_df in yearly_dfs:
                     self.logger.info(f"处理年度数据 {yearly_name}")
@@ -482,36 +545,36 @@ class DataIntegrator:
 
                     final_wide = final_wide.drop('year', axis=1)
 
-                # 8. 合并所有静态数据源
-                if static_dfs:
-                    static_combined = static_dfs[0][1]
+            # 9. 合并所有静态数据源
+            if static_dfs:
+                static_combined = static_dfs[0][1]
 
-                    for i in range(1, len(static_dfs)):
-                        name, static_df = static_dfs[i]
-                        before_cols = len(static_combined.columns)
-                        static_combined = static_combined.merge(static_df, on='station_id', how='outer')
-                        after_cols = len(static_combined.columns)
-                        added_cols = after_cols - before_cols
-                        self.logger.info(f"合并静态数据源 {name}: 添加 {added_cols} 列")
+                for i in range(1, len(static_dfs)):
+                    name, static_df = static_dfs[i]
+                    before_cols = len(static_combined.columns)
+                    static_combined = static_combined.merge(static_df, on='station_id', how='outer')
+                    after_cols = len(static_combined.columns)
+                    added_cols = after_cols - before_cols
+                    self.logger.info(f"合并静态数据源 {name}: 添加 {added_cols} 列")
 
-                    before_count = len(final_wide)
-                    final_wide = final_wide.merge(static_combined, on='station_id', how='left')
-                    after_count = len(final_wide)
-                    self.logger.info(f"合并所有静态数据: {before_count} -> {after_count} 行")
+                before_count = len(final_wide)
+                final_wide = final_wide.merge(static_combined, on='station_id', how='left')
+                after_count = len(final_wide)
+                self.logger.info(f"合并所有静态数据: {before_count} -> {after_count} 行")
 
-                # 9. 确保坐标信息完整
-                final_wide = self._ensure_complete_coordinates(final_wide)
+            # 10. 确保坐标信息完整
+            final_wide = self._ensure_complete_coordinates(final_wide)
 
-                # 10. 排序和整理
-                final_wide = final_wide.sort_values(['station_id', 'date']).reset_index(drop=True)
+            # 11. 排序和整理
+            final_wide = final_wide.sort_values(['station_id', 'date']).reset_index(drop=True)
 
-                # 最终数据验证
-                self._validate_final_wide_table(final_wide)
+            # 最终数据验证
+            self._validate_final_wide_table(final_wide)
 
-                self.logger.info(f"✅ 宽表创建完成: {final_wide.shape}")
-                return final_wide
+            self.logger.info(f"✅ 宽表创建完成: {final_wide.shape}")
+            return final_wide
 
-        except Exception as  e:
+        except Exception as e:
             self.logger.error(f"创建宽表失败: {e}")
             import traceback
             self.logger.debug(f"详细错误: {traceback.format_exc()}")
@@ -806,7 +869,7 @@ class DataIntegrator:
             return pd.DataFrame()
 
     def _validate_final_wide_table(self, df):
-        """验证最终宽表数据"""
+        """验证最终宽表数据 - 包含海拔数据"""
         self.logger.info("=== 最终宽表验证 ===")
         self.logger.info(f"总行数: {len(df)}")
         self.logger.info(f"总列数: {len(df.columns)}")
@@ -823,6 +886,15 @@ class DataIntegrator:
             swe_percentage = (swe_count / len(df)) * 100
             self.logger.info(f"SWE数据完整性: {swe_count}/{len(df)} ({swe_percentage:.1f}%)")
 
+        # 检查海拔数据
+        if 'altitude' in df.columns:
+            altitude_count = df['altitude'].notna().sum()
+            altitude_percentage = (altitude_count / len(df)) * 100
+            altitude_stats = df['altitude'].describe()
+            self.logger.info(f"海拔数据完整性: {altitude_count}/{len(df)} ({altitude_percentage:.1f}%)")
+            self.logger.info(
+                f"海拔统计 - 均值: {altitude_stats['mean']:.2f}, 范围: {altitude_stats['min']:.2f}-{altitude_stats['max']:.2f}")
+
         # 显示前5行数据示例
         if len(df) > 0:
             self.logger.info("前5行数据示例:")
@@ -831,6 +903,8 @@ class DataIntegrator:
                 sample_cols.extend(['longitude', 'latitude'])
             if 'swe' in df.columns:
                 sample_cols.append('swe')
+            if 'altitude' in df.columns:
+                sample_cols.append('altitude')
 
             # 添加其他数据列
             other_cols = [col for col in df.columns if col not in sample_cols]
@@ -888,103 +962,169 @@ class DataIntegrator:
             self.logger.debug(f"详细错误: {traceback.format_exc()}")
             return None
 
-
     def get_swe_from_database(self, station_ids, start_date, end_date):
-        """从数据库获取SWE数据 - 详细调试站点匹配"""
+        """从数据库获取SWE数据和海拔高度 - 增强版本"""
         try:
             if not self.db_conn:
                 if not self.connect_database():
                     return pd.DataFrame()
 
+            # 根据实际数据库列名调整
             swe_column = 'swe（mm）'
-            self.logger.info(f"使用SWE列: '{swe_column}'")
+            station_id_column = 'station_ID'
+            time_column = 'time'
+            altitude_column = 'Altitude(m)'  # 新增海拔列
 
-            # 直接查询所有SWE数据，不限制站点
+            self.logger.info(f"获取数据库数据 - SWE列: '{swe_column}', 海拔列: '{altitude_column}'")
+
+            # 构建查询 - 同时获取SWE和海拔数据
             query = f"""
-            SELECT station_ID, time, "{swe_column}" 
+            SELECT {station_id_column}, {time_column}, "{swe_column}", "{altitude_column}"
             FROM stations 
             WHERE "{swe_column}" IS NOT NULL 
-                AND time BETWEEN ? AND ?
+                AND {time_column} BETWEEN ? AND ?
             """
 
-            start_db = float(start_date.strftime('%Y%m%d'))
-            end_db = float(end_date.strftime('%Y%m%d'))
+            # 转换日期格式为数据库中的格式 (YYYYMMDD)
+            start_db = int(start_date.strftime('%Y%m%d'))
+            end_db = int(end_date.strftime('%Y%m%d'))
 
             params = [start_db, end_db]
             df = pd.read_sql_query(query, self.db_conn, params=params)
 
             if not df.empty:
-                # 转换数据库格式的日期
-                df['date'] = df['time'].apply(
-                    lambda x: datetime.strptime(f"{int(x):08d}", '%Y%m%d').strftime('%Y-%m-%d'))
-                df['station_id'] = df['station_ID'].astype(str)
-                df = df[['station_id', 'date', swe_column]].rename(columns={swe_column: 'swe'})
+                # 转换数据库格式的日期 (YYYYMMDD -> YYYY-MM-DD)
+                df['date'] = df[time_column].apply(
+                    lambda x: datetime.strptime(str(int(x)), '%Y%m%d').strftime('%Y-%m-%d')
+                )
 
-                # 详细调试站点匹配
+                # 标准化站点ID列名
+                df['station_id'] = df[station_id_column].astype(str)
+
+                # 选择需要的列，包括海拔
+                result_df = df[['station_id', 'date', swe_column, altitude_column]].copy()
+                result_df = result_df.rename(columns={
+                    swe_column: 'swe',
+                    altitude_column: 'altitude'
+                })
+
+                # 站点匹配调试
                 needed_stations = set(station_ids)
-                available_stations = set(df['station_id'].unique())
+                available_stations = set(result_df['station_id'].unique())
                 matched_stations = needed_stations & available_stations
 
                 self.logger.info(f"站点匹配详情:")
                 self.logger.info(f"  所需站点数量: {len(needed_stations)}")
-                self.logger.info(f"  数据库有SWE的站点数量: {len(available_stations)}")
+                self.logger.info(f"  数据库有数据的站点数量: {len(available_stations)}")
                 self.logger.info(f"  匹配的站点数量: {len(matched_stations)}")
 
-                # 显示一些示例站点ID
-                if needed_stations:
-                    sample_needed = list(needed_stations)[:5]
-                    self.logger.info(f"  所需站点示例: {sample_needed}")
-
-                if available_stations:
-                    sample_available = list(available_stations)[:5]
-                    self.logger.info(f"  数据库站点示例: {sample_available}")
-
                 if matched_stations:
-                    sample_matched = list(matched_stations)[:5]
-                    self.logger.info(f"  匹配站点示例: {sample_matched}")
+                    result_df = result_df[result_df['station_id'].isin(matched_stations)]
 
-                if matched_stations:
-                    df = df[df['station_id'].isin(matched_stations)]
-                    self.logger.info(f"✅ 成功获取SWE数据: {len(df)} 条记录, 匹配 {len(matched_stations)} 个站点")
+                    # 数据统计
+                    swe_stats = result_df['swe'].describe()
+                    altitude_stats = result_df['altitude'].describe()
+                    unique_dates = result_df['date'].nunique()
 
-                    # 显示SWE数据统计
-                    swe_stats = df['swe'].describe()
-                    unique_dates = df['date'].nunique()
+                    self.logger.info(f"✅ 成功获取数据库数据: {len(result_df)} 条记录")
                     self.logger.info(f"  SWE数据覆盖 {unique_dates} 个日期")
                     self.logger.info(
                         f"  SWE统计 - 均值: {swe_stats['mean']:.2f}, 范围: {swe_stats['min']:.2f}-{swe_stats['max']:.2f}")
+                    self.logger.info(
+                        f"  海拔统计 - 均值: {altitude_stats['mean']:.2f}, 范围: {altitude_stats['min']:.2f}-{altitude_stats['max']:.2f}")
 
-                    return df
+                    return result_df
                 else:
-                    self.logger.warning("站点ID完全不匹配！")
-
-                    # 检查数据类型是否一致
-                    sample_needed_type = type(list(needed_stations)[0]) if needed_stations else "N/A"
-                    sample_available_type = type(list(available_stations)[0]) if available_stations else "N/A"
-                    self.logger.info(f"  所需站点数据类型: {sample_needed_type}")
-                    self.logger.info(f"  数据库站点数据类型: {sample_available_type}")
-
-                    # 尝试转换数据类型后重新匹配
-                    self.logger.info("尝试数据类型转换...")
-                    needed_stations_str = set(str(station) for station in needed_stations)
-                    available_stations_str = set(str(station) for station in available_stations)
-                    matched_stations_str = needed_stations_str & available_stations_str
-
-                    if matched_stations_str:
-                        self.logger.info(f"数据类型转换后匹配 {len(matched_stations_str)} 个站点")
-                        df['station_id'] = df['station_id'].astype(str)
-                        df = df[df['station_id'].isin(matched_stations_str)]
-                        return df
-                    else:
-                        self.logger.error("即使数据类型转换后仍然没有匹配的站点")
-                        return pd.DataFrame()
-
+                    self.logger.warning("没有匹配的站点ID")
+                    return pd.DataFrame()
             else:
-                self.logger.warning("数据库中未找到指定时间范围内的SWE数据")
+                self.logger.warning("数据库中未找到指定时间范围内的数据")
                 return pd.DataFrame()
 
         except Exception as e:
-            self.logger.error(f"获取数据库SWE数据失败: {str(e)}")
+            self.logger.error(f"获取数据库数据失败: {str(e)}")
+            return pd.DataFrame()
+
+    def get_static_altitude_data(self, station_ids):
+        """获取站点的静态海拔数据（每个站点一个海拔值）"""
+        try:
+            if not self.db_conn:
+                if not self.connect_database():
+                    return pd.DataFrame()
+
+            altitude_column = 'Altitude(m)'
+            station_id_column = 'station_ID'
+
+            # 获取每个站点的平均海拔（静态特征）
+            query = f"""
+            SELECT {station_id_column}, AVG("{altitude_column}") as altitude
+            FROM stations 
+            WHERE "{altitude_column}" IS NOT NULL
+            GROUP BY {station_id_column}
+            """
+
+            df = pd.read_sql_query(query, self.db_conn)
+
+            if not df.empty:
+                df['station_id'] = df[station_id_column].astype(str)
+                result_df = df[['station_id', 'altitude']].drop_duplicates('station_id')
+
+                # 过滤需要的站点
+                if station_ids:
+                    result_df = result_df[result_df['station_id'].isin(station_ids)]
+
+                self.logger.info(f"获取静态海拔数据: {len(result_df)} 个站点")
+                return result_df
+            else:
+                self.logger.warning("数据库中未找到海拔数据")
+                return pd.DataFrame()
+
+        except Exception as e:
+            self.logger.error(f"获取静态海拔数据失败: {str(e)}")
+            return pd.DataFrame()
+
+    def get_altitude_from_database(self, station_ids):
+        """从数据库获取海拔数据"""
+        try:
+            if not self.db_conn:
+                if not self.connect_database():
+                    return pd.DataFrame()
+
+            altitude_column = 'Altitude(m)'
+            self.logger.info(f"获取海拔数据，使用列: '{altitude_column}'")
+
+            # 获取每个站点的海拔数据（取平均值）
+            query = f"""
+            SELECT station_ID, AVG("{altitude_column}") as altitude
+            FROM stations 
+            WHERE "{altitude_column}" IS NOT NULL
+            GROUP BY station_ID
+            """
+
+            df = pd.read_sql_query(query, self.db_conn)
+
+            if not df.empty:
+                df['station_id'] = df['station_ID'].astype(str)
+                df = df[['station_id', 'altitude']]
+
+                # 过滤需要的站点
+                if station_ids:
+                    df = df[df['station_id'].isin(station_ids)]
+
+                self.logger.info(f"✅ 成功获取海拔数据: {len(df)} 个站点")
+
+                # 显示海拔统计
+                altitude_stats = df['altitude'].describe()
+                self.logger.info(
+                    f"  海拔统计 - 均值: {altitude_stats['mean']:.2f}, 范围: {altitude_stats['min']:.2f}-{altitude_stats['max']:.2f}")
+
+                return df
+            else:
+                self.logger.warning("数据库中未找到海拔数据")
+                return pd.DataFrame()
+
+        except Exception as e:
+            self.logger.error(f"获取海拔数据失败: {str(e)}")
             return pd.DataFrame()
 
     def _query_swe_batch(self, station_ids, swe_column, start_db, end_db):
@@ -1079,7 +1219,6 @@ class DataIntegrator:
                 self.logger.info(f"  站点 {row['station_id']}, 日期 {row['date']}")
 
         return df
-
 
     def generate_report(self):
         """生成数据整合报告"""
