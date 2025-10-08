@@ -22,7 +22,7 @@ SWE (Snow Water Equivalent) 模型训练模块
 from .swe_trainer import SWEXGBoostTrainer, train_swe_model
 
 __version__ = "1.0.0"
-__author__ = "SWE Modeling Team"
+__author__ = "wang"
 
 __all__ = [
     'SWEXGBoostTrainer',

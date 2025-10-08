@@ -96,6 +96,183 @@ class DataIntegrator:
             self.logger.error(f"添加 {name} 失败: {e}")
             return False
 
+    def get_station_statistics(self):
+        """统计数据库中的站点信息
+
+        Returns:
+            dict: 包含站点统计信息的字典
+        """
+        try:
+            if not self.db_conn:
+                if not self.connect_database():
+                    self.logger.error("无法连接数据库")
+                    return None
+
+            # 查询所有不重复的站点ID
+            query = "SELECT DISTINCT station_ID FROM stations"
+            df_stations = pd.read_sql_query(query, self.db_conn)
+
+            if df_stations.empty:
+                self.logger.warning("数据库中未找到站点数据")
+                return None
+
+            total_stations = len(df_stations)
+
+            # 查询每个站点的数据记录数
+            count_query = """
+            SELECT station_ID, COUNT(*) as record_count 
+            FROM stations 
+            GROUP BY station_ID
+            ORDER BY record_count DESC
+            """
+            df_counts = pd.read_sql_query(count_query, self.db_conn)
+
+            # 查询每个站点的SWE数据覆盖情况
+            swe_query = """
+            SELECT station_ID, 
+                   COUNT(*) as total_records,
+                   COUNT(swe（mm）) as swe_records,
+                   ROUND(COUNT(swe（mm）) * 100.0 / COUNT(*), 2) as swe_coverage_rate
+            FROM stations 
+            GROUP BY station_ID
+            ORDER BY swe_coverage_rate DESC
+            """
+            df_swe_coverage = pd.read_sql_query(swe_query, self.db_conn)
+
+            # 查询时间范围
+            time_query = """
+            SELECT MIN(time) as start_time, MAX(time) as end_time
+            FROM stations
+            """
+            df_time_range = pd.read_sql_query(time_query, self.db_conn)
+
+            # 构建统计结果
+            statistics = {
+                'total_stations': total_stations,
+                'station_ids': df_stations['station_ID'].tolist(),
+                'records_per_station': df_counts.set_index('station_ID')['record_count'].to_dict(),
+                'swe_coverage': df_swe_coverage.set_index('station_ID').to_dict('index'),
+                'time_range': {
+                    'start': df_time_range['start_time'].iloc[0],
+                    'end': df_time_range['end_time'].iloc[0]
+                },
+                'summary': {
+                    'avg_records_per_station': df_counts['record_count'].mean(),
+                    'max_records_per_station': df_counts['record_count'].max(),
+                    'min_records_per_station': df_counts['record_count'].min(),
+                    'avg_swe_coverage': df_swe_coverage['swe_coverage_rate'].mean(),
+                    'stations_with_swe': len(df_swe_coverage[df_swe_coverage['swe_coverage_rate'] > 0])
+                }
+            }
+
+            # 输出统计信息
+            self.logger.info("=" * 60)
+            self.logger.info("📊 数据库站点统计信息")
+            self.logger.info("=" * 60)
+            self.logger.info(f"总站点数量: {total_stations}")
+            self.logger.info(f"时间范围: {statistics['time_range']['start']} 到 {statistics['time_range']['end']}")
+            self.logger.info(f"平均每站记录数: {statistics['summary']['avg_records_per_station']:.1f}")
+            self.logger.info(f"最大记录数站点: {statistics['summary']['max_records_per_station']}")
+            self.logger.info(f"最小记录数站点: {statistics['summary']['min_records_per_station']}")
+            self.logger.info(f"有SWE数据的站点数: {statistics['summary']['stations_with_swe']}")
+            self.logger.info(f"平均SWE覆盖率: {statistics['summary']['avg_swe_coverage']:.1f}%")
+
+            # 显示前10个站点ID示例
+            sample_stations = statistics['station_ids'][:10]
+            self.logger.info(f"站点ID示例 (前10个): {sample_stations}")
+
+            return statistics
+
+        except Exception as e:
+            self.logger.error(f"统计站点信息失败: {str(e)}")
+            return None
+
+    def export_station_statistics(self, output_dir=None):
+        """导出站点统计信息到文件
+
+        Args:
+            output_dir (str, optional): 输出目录路径
+
+        Returns:
+            str: 输出文件路径
+        """
+        try:
+            statistics = self.get_station_statistics()
+            if statistics is None:
+                return None
+
+            if output_dir is None:
+                output_dir = self.output_dir
+
+            # 确保输出目录存在
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = Path(output_dir) / f"station_statistics_{timestamp}.xlsx"
+
+            # 创建Excel写入器
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # 1. 基本统计信息
+                summary_data = {
+                    '统计项': [
+                        '总站点数量',
+                        '时间范围开始',
+                        '时间范围结束',
+                        '平均每站记录数',
+                        '最大记录数',
+                        '最小记录数',
+                        '有SWE数据的站点数',
+                        '平均SWE覆盖率(%)'
+                    ],
+                    '数值': [
+                        statistics['total_stations'],
+                        statistics['time_range']['start'],
+                        statistics['time_range']['end'],
+                        f"{statistics['summary']['avg_records_per_station']:.1f}",
+                        statistics['summary']['max_records_per_station'],
+                        statistics['summary']['min_records_per_station'],
+                        statistics['summary']['stations_with_swe'],
+                        f"{statistics['summary']['avg_swe_coverage']:.1f}"
+                    ]
+                }
+                df_summary = pd.DataFrame(summary_data)
+                df_summary.to_excel(writer, sheet_name='基本统计', index=False)
+
+                # 2. 所有站点列表
+                df_stations = pd.DataFrame({
+                    'station_id': statistics['station_ids']
+                })
+                df_stations.to_excel(writer, sheet_name='所有站点', index=False)
+
+                # 3. 站点记录数统计
+                records_data = []
+                for station_id, count in statistics['records_per_station'].items():
+                    records_data.append({
+                        'station_id': station_id,
+                        'record_count': count
+                    })
+                df_records = pd.DataFrame(records_data).sort_values('record_count', ascending=False)
+                df_records.to_excel(writer, sheet_name='站点记录数', index=False)
+
+                # 4. SWE覆盖率统计
+                swe_data = []
+                for station_id, coverage in statistics['swe_coverage'].items():
+                    swe_data.append({
+                        'station_id': station_id,
+                        'total_records': coverage['total_records'],
+                        'swe_records': coverage['swe_records'],
+                        'swe_coverage_rate': coverage['swe_coverage_rate']
+                    })
+                df_swe = pd.DataFrame(swe_data).sort_values('swe_coverage_rate', ascending=False)
+                df_swe.to_excel(writer, sheet_name='SWE覆盖率', index=False)
+
+            self.logger.info(f"✅ 站点统计信息已导出: {output_path}")
+            return str(output_path)
+
+        except Exception as e:
+            self.logger.error(f"导出站点统计信息失败: {str(e)}")
+            return None
+
     def _standardize_date_format(self, df, source_name):
         """统一日期格式为字符串 YYYY-MM-DD"""
         try:
@@ -940,8 +1117,14 @@ class DataIntegrator:
                 self.logger.error("最终数据为空或为None")
                 return None
 
-            # 数据完整性验证
+            # 数据完整性验证（包含年份月份验证）
             final_df = self._validate_data_integrity(final_df)
+
+            # 额外的时间分布分析
+            if 'date' in final_df.columns:
+                time_analysis = self.analyze_time_distribution(final_df)
+                if time_analysis:
+                    self.logger.info("✅ 时间分布分析完成")
 
             if final_df.empty:
                 self.logger.error("验证后数据为空")
@@ -960,6 +1143,446 @@ class DataIntegrator:
         except Exception as e:
             self.logger.error(f"保存失败: {e}")
             self.logger.debug(f"详细错误: {traceback.format_exc()}")
+            return None
+
+    def extract_time_info(self, output_dir=None):
+        """提取每条记录的年月信息并统计
+
+        Args:
+            output_dir (str, optional): 输出目录路径
+
+        Returns:
+            dict: 包含时间统计信息的字典
+        """
+        try:
+            if not self.db_conn:
+                if not self.connect_database():
+                    self.logger.error("无法连接数据库")
+                    return None
+
+            # 查询所有记录的时间信息
+            query = """
+            SELECT station_ID, time, swe（mm）
+            FROM stations
+            ORDER BY station_ID, time
+            """
+            df = pd.read_sql_query(query, self.db_conn)
+
+            if df.empty:
+                self.logger.warning("数据库中未找到记录")
+                return None
+
+            # 转换时间格式并提取年月
+            df_processed = df.copy()
+
+            # 将时间列转换为datetime格式
+            df_processed['time'] = pd.to_datetime(df_processed['time'], format='%Y%m%d', errors='coerce')
+
+            # 提取年月信息
+            df_processed['year'] = df_processed['time'].dt.year
+            df_processed['month'] = df_processed['time'].dt.month
+            df_processed['year_month'] = df_processed['time'].dt.to_period('M')
+
+            # 统计信息
+            total_records = len(df_processed)
+            valid_time_records = df_processed['time'].notna().sum()
+
+            # 年份统计
+            year_stats = df_processed['year'].value_counts().sort_index()
+
+            # 月份统计
+            month_stats = df_processed['month'].value_counts().sort_index()
+
+            # 年月组合统计
+            year_month_stats = df_processed['year_month'].value_counts().sort_index()
+
+            # 各站点的时间覆盖统计
+            station_time_stats = df_processed.groupby('station_ID').agg({
+                'time': ['min', 'max', 'count'],
+                'year': ['min', 'max', 'nunique'],
+                'month': 'nunique'
+            }).round(2)
+
+            # 重命名列
+            station_time_stats.columns = [
+                'first_record', 'last_record', 'total_records',
+                'min_year', 'max_year', 'unique_years', 'unique_months'
+            ]
+
+            # SWE数据的时间分布
+            swe_time_stats = df_processed[df_processed['swe（mm）'].notna()].groupby('year_month').agg({
+                'station_ID': 'nunique',
+                'swe（mm）': 'count'
+            }).rename(columns={'station_ID': 'stations_with_swe', 'swe（mm）': 'swe_records'})
+
+            # 构建统计结果
+            time_statistics = {
+                'total_records': total_records,
+                'valid_time_records': valid_time_records,
+                'time_validity_rate': (valid_time_records / total_records) * 100,
+                'year_distribution': year_stats.to_dict(),
+                'month_distribution': month_stats.to_dict(),
+                'year_month_distribution': year_month_stats.to_dict(),
+                'station_time_coverage': station_time_stats.to_dict('index'),
+                'swe_time_distribution': swe_time_stats.to_dict('index'),
+                'time_range': {
+                    'overall_start': df_processed['time'].min(),
+                    'overall_end': df_processed['time'].max(),
+                    'overall_years': f"{df_processed['year'].min()} - {df_processed['year'].max()}",
+                    'total_months': df_processed['year_month'].nunique()
+                },
+                'data_samples': df_processed.head(1000).to_dict('records')  # 保存前1000条记录作为样本
+            }
+
+            # 输出统计信息
+            self.logger.info("=" * 60)
+            self.logger.info("📅 数据库时间信息统计")
+            self.logger.info("=" * 60)
+            self.logger.info(f"总记录数: {total_records}")
+            self.logger.info(f"有效时间记录: {valid_time_records} ({time_statistics['time_validity_rate']:.1f}%)")
+            self.logger.info(
+                f"时间范围: {time_statistics['time_range']['overall_start']} 到 {time_statistics['time_range']['overall_end']}")
+            self.logger.info(f"覆盖年份: {time_statistics['time_range']['overall_years']}")
+            self.logger.info(f"总月份数: {time_statistics['time_range']['total_months']}")
+
+            self.logger.info(f"\n年份分布:")
+            for year, count in year_stats.items():
+                self.logger.info(f"  {year}: {count} 条记录")
+
+            self.logger.info(f"\n月份分布:")
+            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            for month, count in month_stats.items():
+                month_name = month_names[month - 1] if 1 <= month <= 12 else f"Month{month}"
+                self.logger.info(f"  {month_name}: {count} 条记录")
+
+            # 导出到文件
+            if output_dir:
+                self._export_time_statistics(time_statistics, output_dir)
+
+            return time_statistics
+
+        except Exception as e:
+            self.logger.error(f"提取时间信息失败: {str(e)}")
+            return None
+
+    def _export_time_statistics(self, time_statistics, output_dir):
+        """导出时间统计信息到Excel文件
+
+        Args:
+            time_statistics (dict): 时间统计信息
+            output_dir (str): 输出目录路径
+        """
+        try:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_path = Path(output_dir) / f"time_statistics_{timestamp}.xlsx"
+
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                # 1. 基本统计信息
+                summary_data = {
+                    '统计项': [
+                        '总记录数',
+                        '有效时间记录数',
+                        '时间有效性率(%)',
+                        '时间范围开始',
+                        '时间范围结束',
+                        '覆盖年份范围',
+                        '总月份数'
+                    ],
+                    '数值': [
+                        time_statistics['total_records'],
+                        time_statistics['valid_time_records'],
+                        f"{time_statistics['time_validity_rate']:.2f}",
+                        time_statistics['time_range']['overall_start'],
+                        time_statistics['time_range']['overall_end'],
+                        time_statistics['time_range']['overall_years'],
+                        time_statistics['time_range']['total_months']
+                    ]
+                }
+                df_summary = pd.DataFrame(summary_data)
+                df_summary.to_excel(writer, sheet_name='基本统计', index=False)
+
+                # 2. 年份分布
+                df_years = pd.DataFrame({
+                    'year': list(time_statistics['year_distribution'].keys()),
+                    'record_count': list(time_statistics['year_distribution'].values())
+                })
+                df_years.to_excel(writer, sheet_name='年份分布', index=False)
+
+                # 3. 月份分布
+                month_names = ['一月', '二月', '三月', '四月', '五月', '六月',
+                               '七月', '八月', '九月', '十月', '十一月', '十二月']
+                df_months = pd.DataFrame({
+                    'month': list(time_statistics['month_distribution'].keys()),
+                    'month_name': [month_names[m - 1] if 1 <= m <= 12 else f"月份{m}"
+                                   for m in time_statistics['month_distribution'].keys()],
+                    'record_count': list(time_statistics['month_distribution'].values())
+                })
+                df_months.to_excel(writer, sheet_name='月份分布', index=False)
+
+                # 4. 年月组合分布
+                df_year_month = pd.DataFrame({
+                    'year_month': [str(ym) for ym in time_statistics['year_month_distribution'].keys()],
+                    'record_count': list(time_statistics['year_month_distribution'].values())
+                })
+                df_year_month.to_excel(writer, sheet_name='年月分布', index=False)
+
+                # 5. 站点时间覆盖统计
+                station_data = []
+                for station_id, stats in time_statistics['station_time_coverage'].items():
+                    station_data.append({
+                        'station_id': station_id,
+                        'first_record': stats['first_record'],
+                        'last_record': stats['last_record'],
+                        'total_records': stats['total_records'],
+                        'min_year': stats['min_year'],
+                        'max_year': stats['max_year'],
+                        'unique_years': stats['unique_years'],
+                        'unique_months': stats['unique_months']
+                    })
+                df_stations = pd.DataFrame(station_data)
+                df_stations.to_excel(writer, sheet_name='站点时间覆盖', index=False)
+
+                # 6. SWE数据时间分布
+                swe_data = []
+                for ym, stats in time_statistics['swe_time_distribution'].items():
+                    swe_data.append({
+                        'year_month': str(ym),
+                        'stations_with_swe': stats['stations_with_swe'],
+                        'swe_records': stats['swe_records']
+                    })
+                df_swe = pd.DataFrame(swe_data)
+                df_swe.to_excel(writer, sheet_name='SWE时间分布', index=False)
+
+                # 7. 数据样本（前1000条）
+                df_samples = pd.DataFrame(time_statistics['data_samples'])
+                df_samples.to_excel(writer, sheet_name='数据样本', index=False)
+
+            self.logger.info(f"✅ 时间统计信息已导出: {output_path}")
+            return str(output_path)
+
+        except Exception as e:
+            self.logger.error(f"导出时间统计信息失败: {str(e)}")
+            return None
+
+    def _validate_data_integrity(self, df):
+        """验证数据完整性，包括年份和月份信息
+
+        Args:
+            df: 要验证的DataFrame
+
+        Returns:
+            DataFrame: 验证后的数据
+        """
+        if df.empty:
+            return df
+
+        self.logger.info("=== 数据有效性验证 ===")
+
+        # 验证各个特征列
+        data_cols = [col for col in df.columns if col not in ['station_id', 'date', 'data_source']]
+
+        for col in data_cols:
+            valid_count = df[col].notna().sum()
+            total_count = len(df)
+            fill_rate = (valid_count / total_count) * 100 if total_count > 0 else 0
+            self.logger.info(f"{col}: {valid_count}/{total_count} 有效记录 ({fill_rate:.1f}%)")
+
+        # 验证日期相关列
+        if 'date' in df.columns:
+            # 验证日期格式
+            try:
+                df['date'] = pd.to_datetime(df['date'])
+                valid_dates = df['date'].notna().sum()
+                self.logger.info(f"date: {valid_dates}/{len(df)} 有效日期 ({valid_dates / len(df) * 100:.1f}%)")
+
+                # 提取并验证年份和月份
+                df['year'] = df['date'].dt.year
+                df['month'] = df['date'].dt.month
+
+                # 统计年份信息
+                year_stats = df['year'].value_counts().sort_index()
+                self.logger.info("年份分布:")
+                for year, count in year_stats.items():
+                    self.logger.info(f"  {year}: {count} 条记录")
+
+                # 统计月份信息
+                month_stats = df['month'].value_counts().sort_index()
+                month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+                self.logger.info("月份分布:")
+                for month, count in month_stats.items():
+                    month_name = month_names[month - 1] if 1 <= month <= 12 else f"Month{month}"
+                    self.logger.info(f"  {month_name}: {count} 条记录")
+
+                # 统计时间范围
+                start_date = df['date'].min()
+                end_date = df['date'].max()
+                total_years = df['year'].nunique()
+                total_months = df['month'].nunique()
+
+                self.logger.info(f"时间范围: {start_date} 到 {end_date}")
+                self.logger.info(f"覆盖年份数: {total_years}")
+                self.logger.info(f"覆盖月份数: {total_months}")
+
+            except Exception as e:
+                self.logger.warning(f"日期处理失败: {e}")
+
+        # 识别可能的问题记录
+        if data_cols:
+            empty_records = df[data_cols].isna().all(axis=1)
+            if empty_records.any():
+                empty_count = empty_records.sum()
+                self.logger.warning(f"发现 {empty_count} 条全空记录")
+
+        return df
+
+    def analyze_time_distribution(self, df):
+        """分析数据的时间分布（年份和月份）
+
+        Args:
+            df: 包含date列的数据框
+
+        Returns:
+            dict: 时间分布统计信息
+        """
+        try:
+            if 'date' not in df.columns:
+                self.logger.warning("数据框中没有date列")
+                return None
+
+            # 确保日期格式正确
+            df_analysis = df.copy()
+            df_analysis['date'] = pd.to_datetime(df_analysis['date'])
+
+            # 提取年月信息
+            df_analysis['year'] = df_analysis['date'].dt.year
+            df_analysis['month'] = df_analysis['date'].dt.month
+            df_analysis['year_month'] = df_analysis['date'].dt.to_period('M')
+
+            # 基本统计
+            total_records = len(df_analysis)
+            valid_dates = df_analysis['date'].notna().sum()
+
+            # 年份统计
+            year_stats = df_analysis['year'].value_counts().sort_index()
+
+            # 月份统计
+            month_stats = df_analysis['month'].value_counts().sort_index()
+
+            # 年月组合统计
+            year_month_stats = df_analysis['year_month'].value_counts().sort_index()
+
+            # 各站点的年份覆盖
+            station_year_stats = df_analysis.groupby('station_id')['year'].agg(['min', 'max', 'nunique']).round()
+            station_year_stats = station_year_stats.rename(columns={
+                'min': 'first_year',
+                'max': 'last_year',
+                'nunique': 'years_covered'
+            })
+
+            # 构建结果
+            time_analysis = {
+                'total_records': total_records,
+                'valid_dates': valid_dates,
+                'date_validity_rate': (valid_dates / total_records) * 100,
+                'year_distribution': year_stats.to_dict(),
+                'month_distribution': month_stats.to_dict(),
+                'year_month_distribution': year_month_stats.to_dict(),
+                'station_year_coverage': station_year_stats.to_dict('index'),
+                'time_range': {
+                    'start_date': df_analysis['date'].min(),
+                    'end_date': df_analysis['date'].max(),
+                    'total_years': df_analysis['year'].nunique(),
+                    'total_months': df_analysis['month'].nunique(),
+                    'year_range': f"{df_analysis['year'].min()} - {df_analysis['year'].max()}"
+                }
+            }
+
+            # 输出详细统计
+            self.logger.info("=" * 60)
+            self.logger.info("📅 数据时间分布分析")
+            self.logger.info("=" * 60)
+            self.logger.info(f"总记录数: {total_records}")
+            self.logger.info(f"有效日期记录: {valid_dates} ({time_analysis['date_validity_rate']:.1f}%)")
+            self.logger.info(
+                f"时间范围: {time_analysis['time_range']['start_date']} 到 {time_analysis['time_range']['end_date']}")
+            self.logger.info(f"覆盖年份: {time_analysis['time_range']['year_range']}")
+            self.logger.info(f"总年份数: {time_analysis['time_range']['total_years']}")
+            self.logger.info(f"总月份数: {time_analysis['time_range']['total_months']}")
+
+            self.logger.info(f"\n📈 年份分布:")
+            for year, count in year_stats.items():
+                percentage = (count / total_records) * 100
+                self.logger.info(f"  {year}: {count} 条记录 ({percentage:.1f}%)")
+
+            self.logger.info(f"\n📅 月份分布:")
+            month_names = ['一月', '二月', '三月', '四月', '五月', '六月',
+                           '七月', '八月', '九月', '十月', '十一月', '十二月']
+            for month, count in month_stats.items():
+                month_name = month_names[month - 1] if 1 <= month <= 12 else f"月份{month}"
+                percentage = (count / total_records) * 100
+                self.logger.info(f"  {month_name}: {count} 条记录 ({percentage:.1f}%)")
+
+            return time_analysis
+
+        except Exception as e:
+            self.logger.error(f"分析时间分布失败: {str(e)}")
+            return None
+
+    def get_comprehensive_statistics(self, output_dir=None):
+        """获取综合统计信息（站点+时间）
+
+        Args:
+            output_dir (str, optional): 输出目录路径
+
+        Returns:
+            dict: 综合统计信息
+        """
+        try:
+            self.logger.info("📊 开始综合统计分析...")
+
+            # 获取站点统计
+            station_stats = self.get_station_statistics()
+            # 获取时间统计
+            time_stats = self.extract_time_info()
+
+            if not station_stats or not time_stats:
+                self.logger.error("无法获取完整的统计信息")
+                return None
+
+            # 合并统计信息
+            comprehensive_stats = {
+                'station_statistics': station_stats,
+                'time_statistics': time_stats,
+                'summary': {
+                    'total_stations': station_stats['total_stations'],
+                    'total_records': time_stats['total_records'],
+                    'time_range': time_stats['time_range']['overall_years'],
+                    'avg_records_per_station': station_stats['summary']['avg_records_per_station'],
+                    'swe_coverage_rate': station_stats['summary']['avg_swe_coverage']
+                }
+            }
+
+            # 输出综合摘要
+            self.logger.info("=" * 60)
+            self.logger.info("📈 综合统计摘要")
+            self.logger.info("=" * 60)
+            self.logger.info(f"总站点数: {comprehensive_stats['summary']['total_stations']}")
+            self.logger.info(f"总记录数: {comprehensive_stats['summary']['total_records']}")
+            self.logger.info(f"时间范围: {comprehensive_stats['summary']['time_range']}")
+            self.logger.info(f"平均每站记录: {comprehensive_stats['summary']['avg_records_per_station']:.1f}")
+            self.logger.info(f"SWE覆盖率: {comprehensive_stats['summary']['swe_coverage_rate']:.1f}%")
+
+            # 导出综合统计
+            if output_dir:
+                self._export_comprehensive_statistics(comprehensive_stats, output_dir)
+
+            return comprehensive_stats
+
+        except Exception as e:
+            self.logger.error(f"获取综合统计信息失败: {str(e)}")
             return None
 
     def get_swe_from_database(self, station_ids, start_date, end_date):
@@ -1187,38 +1810,6 @@ class DataIntegrator:
 
         return pd.concat(dfs, ignore_index=True)
 
-    def _validate_data_integrity(self, df):
-        """验证数据完整性，确保没有虚假的站点-日期组合"""
-        if df.empty:
-            return df
-
-        # 获取数据列
-        data_cols = [col for col in df.columns if col not in ['station_id', 'date', 'data_source']]
-
-        if not data_cols:
-            return df
-
-        # 统计每个数据源的有效记录数
-        self.logger.info("=== 数据有效性验证 ===")
-        for col in data_cols:
-            valid_count = df[col].notna().sum()
-            total_count = len(df)
-            fill_rate = (valid_count / total_count) * 100 if total_count > 0 else 0
-            self.logger.info(f"{col}: {valid_count}/{total_count} 有效记录 ({fill_rate:.1f}%)")
-
-        # 识别可能的问题记录
-        empty_records = df[data_cols].isna().all(axis=1)
-        if empty_records.any():
-            empty_count = empty_records.sum()
-            self.logger.warning(f"发现 {empty_count} 条全空记录")
-
-            # 显示一些示例
-            empty_examples = df[empty_records][['station_id', 'date']].head(5)
-            self.logger.info("全空记录示例:")
-            for _, row in empty_examples.iterrows():
-                self.logger.info(f"  站点 {row['station_id']}, 日期 {row['date']}")
-
-        return df
 
     def generate_report(self):
         """生成数据整合报告"""

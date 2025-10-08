@@ -852,6 +852,217 @@ class SWEXGBoostTrainer:
         except Exception as e:
             self.logger.warning(f"生成合并散点图失败: {str(e)}")
 
+    def _create_feature_importance_plot(self, results, output_dir):
+        """创建特征重要性排序图（重要特征在上方）
+
+        Args:
+            results (dict): 分析结果
+            output_dir (str): 输出目录路径
+        """
+        try:
+            self.logger.info("📊 生成特征重要性排序图...")
+
+            # 设置图形样式
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'Arial']
+            plt.rcParams['axes.unicode_minus'] = False
+            sns.set_style("whitegrid")
+
+            if 'feature_importance' not in results:
+                self.logger.warning("没有特征重要性数据")
+                return
+
+            feature_importance_df = results['feature_importance']
+
+            # 选择前20个最重要的特征（如果特征很多的话）
+            top_n = min(20, len(feature_importance_df))
+            top_features = feature_importance_df.head(top_n)
+
+            # 反转顺序，让重要特征在上面
+            top_features = top_features.iloc[::-1]
+
+            # 创建水平条形图
+            fig, ax = plt.subplots(figsize=(12, 10))
+
+            # 创建颜色映射（从红色到蓝色，重要特征用暖色）
+            colors = plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(top_features)))
+
+            # 绘制水平条形图（重要特征在上面）
+            y_pos = np.arange(len(top_features))
+            bars = ax.barh(y_pos,
+                           top_features['importance'],
+                           color=colors,
+                           alpha=0.8,
+                           edgecolor='black',
+                           linewidth=0.5,
+                           height=0.7)  # 调整条形高度
+
+            # 设置y轴标签（重要特征在上面）
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(top_features['feature'], fontsize=10)
+
+            # 设置x轴
+            ax.set_xlabel('特征重要性', fontsize=12, fontweight='bold')
+            ax.set_title(f'XGBoost模型特征重要性排序 (Top {top_n})',
+                         fontsize=14, fontweight='bold', pad=20)
+
+            # 在条形末端添加数值标签
+            for i, (bar, importance) in enumerate(zip(bars, top_features['importance'])):
+                width = bar.get_width()
+                ax.text(width + 0.001, bar.get_y() + bar.get_height() / 2,
+                        f'{importance:.4f}',
+                        ha='left', va='center', fontsize=9, fontweight='bold')
+
+            # 添加网格线
+            ax.grid(True, alpha=0.3, axis='x')
+
+            # 设置x轴范围，留出一些空间给标签
+            x_max = top_features['importance'].max() * 1.15
+            ax.set_xlim(0, x_max)
+
+            # 调整布局
+            plt.tight_layout()
+
+            # 保存图片
+            importance_path = f'{output_dir}/feature_importance_plot.png'
+            plt.savefig(importance_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            self.logger.info(f"✅ 特征重要性排序图保存: {importance_path}")
+
+        except Exception as e:
+            self.logger.warning(f"生成特征重要性排序图失败: {str(e)}")
+
+    def _create_feature_importance_comprehensive(self, results, output_dir):
+        """创建更详细的特征重要性分析图（重要特征在上方）
+
+        Args:
+            results (dict): 分析结果
+            output_dir (str): 输出目录路径
+        """
+        try:
+            if 'feature_importance' not in results:
+                return
+
+            feature_importance_df = results['feature_importance']
+
+            # 创建包含多个子图的综合图表
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+            fig.suptitle('XGBoost模型特征重要性综合分析', fontsize=16, fontweight='bold')
+
+            # 1. 水平条形图（主要排序图）- 重要特征在上面
+            top_n = min(15, len(feature_importance_df))
+            top_features = feature_importance_df.head(top_n)
+            top_features = top_features.iloc[::-1]  # 反转顺序
+
+            colors1 = plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(top_features)))
+            y_pos = np.arange(len(top_features))
+            bars1 = ax1.barh(y_pos, top_features['importance'],
+                             color=colors1, alpha=0.8, edgecolor='grey', height=0.7)
+
+            ax1.set_yticks(y_pos)
+            ax1.set_yticklabels(top_features['feature'], fontsize=9)
+            ax1.set_xlabel('特征重要性')
+            ax1.set_title(f'Top {top_n} 特征重要性排序（重要特征在上方）')
+            ax1.grid(True, alpha=0.3, axis='x')
+
+            # 在条形上添加数值
+            for i, bar in enumerate(bars1):
+                width = bar.get_width()
+                ax1.text(width, bar.get_y() + bar.get_height() / 2,
+                         f'{width:.3f}', ha='left', va='center', fontsize=8, fontweight='bold')
+
+            # 设置x轴范围
+            x_max1 = top_features['importance'].max() * 1.15
+            ax1.set_xlim(0, x_max1)
+
+            # 2. 饼图（显示前10个特征的相对重要性）- 按重要性排序
+            top_10 = feature_importance_df.head(10)
+            # 计算其他特征的总和
+            others_sum = feature_importance_df['importance'].iloc[10:].sum()
+
+            if others_sum > 0:
+                pie_data = list(top_10['importance']) + [others_sum]
+                pie_labels = list(top_10['feature']) + ['其他特征']
+            else:
+                pie_data = list(top_10['importance'])
+                pie_labels = list(top_10['feature'])
+
+            colors2 = plt.cm.Set3(np.linspace(0, 1, len(pie_data)))
+            wedges, texts, autotexts = ax2.pie(pie_data, labels=pie_labels, autopct='%1.1f%%',
+                                               colors=colors2, startangle=90)
+            ax2.set_title('前10个特征重要性分布')
+
+            # 美化饼图文本
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontweight('bold')
+
+            # 3. 累积重要性图
+            cumulative_importance = feature_importance_df['importance'].cumsum()
+            features_count = range(1, len(cumulative_importance) + 1)
+
+            ax3.plot(features_count, cumulative_importance, 'o-', linewidth=2, markersize=4, color='#2E86AB')
+            ax3.fill_between(features_count, 0, cumulative_importance, alpha=0.3, color='#A5C8D9')
+            ax3.set_xlabel('特征数量')
+            ax3.set_ylabel('累积重要性')
+            ax3.set_title('特征累积重要性')
+            ax3.grid(True, alpha=0.3)
+
+            # 标记80%和90%重要性的点
+            idx_80 = (cumulative_importance >= 0.8).idxmax() if (cumulative_importance >= 0.8).any() else len(
+                cumulative_importance) - 1
+            idx_90 = (cumulative_importance >= 0.9).idxmax() if (cumulative_importance >= 0.9).any() else len(
+                cumulative_importance) - 1
+
+            ax3.axhline(y=0.8, color='red', linestyle='--', alpha=0.7, label='80%重要性')
+            ax3.axhline(y=0.9, color='orange', linestyle='--', alpha=0.7, label='90%重要性')
+            ax3.axvline(x=idx_80 + 1, color='red', linestyle='--', alpha=0.5)
+            ax3.axvline(x=idx_90 + 1, color='orange', linestyle='--', alpha=0.5)
+            ax3.legend()
+
+            # 4. 特征重要性统计
+            importance_stats = {
+                '总特征数': len(feature_importance_df),
+                '平均重要性': f"{feature_importance_df['importance'].mean():.4f}",
+                '最大重要性': f"{feature_importance_df['importance'].max():.4f}",
+                '最小重要性': f"{feature_importance_df['importance'].min():.4f}",
+                '重要性标准差': f"{feature_importance_df['importance'].std():.4f}",
+                f'前5个特征贡献度': f"{feature_importance_df['importance'].head(5).sum() * 100:.1f}%",
+                f'前10个特征贡献度': f"{feature_importance_df['importance'].head(10).sum() * 100:.1f}%",
+                f'最重要特征': feature_importance_df['feature'].iloc[0]
+            }
+
+            # 创建统计信息表格
+            ax4.axis('off')
+            table_data = [[k, v] for k, v in importance_stats.items()]
+            table = ax4.table(cellText=table_data,
+                              colLabels=['统计项', '数值'],
+                              cellLoc='left',
+                              loc='center',
+                              bbox=[0.1, 0.1, 0.8, 0.8])
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1, 1.5)
+
+            # 设置表格样式
+            for i in range(len(table_data) + 1):
+                table[(i, 0)].set_facecolor('#F0F0F0')
+                table[(i, 0)].set_text_props(weight='bold')
+
+            ax4.set_title('特征重要性统计信息')
+
+            plt.tight_layout()
+
+            # 保存综合图表
+            comprehensive_path = f'{output_dir}/feature_importance_comprehensive.png'
+            plt.savefig(comprehensive_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            self.logger.info(f"✅ 特征重要性综合分析图保存: {comprehensive_path}")
+
+        except Exception as e:
+            self.logger.warning(f"生成特征重要性综合分析图失败: {str(e)}")
+
     def _save_results(self, results, output_dir):
         """保存结果到文件
 
@@ -1002,6 +1213,12 @@ class SWEXGBoostTrainer:
             self.logger.info("🎨 生成可视化图表...")
             self._create_scatter_plots(results, output_dir)
             self._create_combined_scatter_plot(results, output_dir)
+
+            self.logger.info(f"📁 所有结果已保存到: {output_dir}")
+
+            # 10. 生成特征重要性图
+            self._create_feature_importance_plot(results, output_dir)
+            self._create_feature_importance_comprehensive(results, output_dir)
 
             self.logger.info(f"📁 所有结果已保存到: {output_dir}")
 

@@ -472,35 +472,44 @@ class TerrainFeaturesProcessor:
             return results
 
     def postprocess_data(self, df):
-        """数据后处理"""
+        """数据后处理 - 修复宽表版本"""
         if df.empty:
             return df
 
         # 创建副本
         result_df = df.copy()
 
-        # 过滤填充值
+        # 宽表格式没有 'value' 列，跳过填充值过滤
+        # 直接处理所有数值列
         fill_value = self.conf.get('fill_value', -9999.0)
-        mask = result_df['value'] != fill_value
-        result_df = result_df.loc[mask].copy()
+
+        # 过滤所有数值列中的填充值
+        numeric_cols = result_df.select_dtypes(include=['number']).columns
+        for col in numeric_cols:
+            if col not in ['station_id', 'longitude', 'latitude']:
+                # 将填充值替换为 NaN
+                result_df[col] = result_df[col].replace(fill_value, np.nan)
+
+        # 移除所有数值列都为 NaN 的行
+        result_df = result_df.dropna(subset=numeric_cols, how='all')
 
         # 添加处理时间
         processing_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         result_df.loc[:, 'processing_time'] = processing_time
 
-        self.logger.debug(f"后处理完成: {len(result_df)} 条记录")
+        self.logger.info(f"后处理完成: {len(result_df)} 条记录")
         return result_df
 
     def save_results(self, df):
-        """保存结果"""
+        """保存结果 - 宽表版本"""
         try:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            base_filename = f"terrain_features_{timestamp}"
+            base_filename = f"terrain_features_wide_{timestamp}"
 
             # 总是保存 CSV 格式（用于查看）
             csv_path = self.output_dir / f"{base_filename}.csv"
             df.to_csv(csv_path, index=False)
-            self.logger.info(f"结果保存为 CSV (用于查看): {csv_path}")
+            self.logger.info(f"宽表结果保存为 CSV: {csv_path}")
 
             # 根据配置保存其他格式
             output_format = self.conf.get('output_format', 'parquet').lower()
@@ -509,12 +518,11 @@ class TerrainFeaturesProcessor:
                 try:
                     parquet_path = self.output_dir / f"{base_filename}.parquet"
                     df.to_parquet(parquet_path, index=False)
-                    self.logger.info(f"结果保存为 Parquet (用于处理): {parquet_path}")
+                    self.logger.info(f"宽表结果保存为 Parquet: {parquet_path}")
                     return str(parquet_path)
                 except ImportError:
                     self.logger.warning("Parquet 支持不可用，仅保存 CSV 格式")
                     return str(csv_path)
-
             else:
                 self.logger.warning(f"未知的输出格式: {output_format}，仅保存 CSV 格式")
                 return str(csv_path)
@@ -585,29 +593,36 @@ class TerrainFeaturesProcessor:
             return None
 
     def _generate_terrain_summary(self, df, output_path):
-        """生成地理特征数据摘要"""
+        """生成地理特征数据摘要 - 宽表版本"""
         try:
             summary_path = output_path.with_suffix('.summary.txt')
 
             with open(summary_path, 'w', encoding='utf-8') as f:
-                f.write("=== 地理特征数据摘要 ===\n")
-                f.write(f"记录数: {len(df)}\n")
-                f.write(f"站点数: {df['station_id'].nunique()}\n")
-                f.write(f"特征类型数: {df['feature_type'].nunique()}\n")
+                f.write("=== 地理特征数据摘要 (宽表格式) ===\n")
+                f.write(f"站点数: {len(df)}\n")
+                f.write(f"特征数: {len(df.columns) - 3}\n")  # 减去 station_id, longitude, latitude
 
-                # 特征类型统计
-                f.write("\n=== 特征类型分布 ===\n")
-                feature_stats = df['feature_type'].value_counts()
-                f.write(feature_stats.to_string())
+                # 特征列统计
+                feature_columns = [col for col in df.columns if
+                                   col not in ['station_id', 'longitude', 'latitude', 'processing_time']]
+                f.write(f"\n=== 特征列 ===\n")
+                f.write(", ".join(feature_columns))
 
                 # 特征值统计
                 f.write("\n\n=== 特征值统计 ===\n")
-                value_stats = df.groupby('feature_type')['value'].agg(['count', 'min', 'max', 'mean', 'std']).round(3)
-                f.write(value_stats.to_string())
+                for col in feature_columns:
+                    if col in df.columns:
+                        stats = df[col].describe()
+                        f.write(f"\n{col}:\n")
+                        f.write(f"  数量: {stats['count']:.0f}\n")
+                        f.write(f"  均值: {stats['mean']:.3f}\n")
+                        f.write(f"  标准差: {stats['std']:.3f}\n")
+                        f.write(f"  最小值: {stats['min']:.3f}\n")
+                        f.write(f"  最大值: {stats['max']:.3f}\n")
 
-                # 前20条记录
-                f.write("\n\n=== 前20条记录 ===\n")
-                f.write(df.head(20).to_string())
+                # 前10条记录
+                f.write("\n\n=== 前10条记录 ===\n")
+                f.write(df.head(10).to_string())
 
             self.logger.info(f"数据摘要已生成: {summary_path}")
 

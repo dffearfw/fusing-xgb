@@ -80,6 +80,49 @@ def validate_date(date_input):
         raise argparse.ArgumentTypeError(f"无效的日期格式: {date_input}，请使用 YYYY-MM-DD")
 
 
+def show_time_statistics():
+    """显示数据库时间统计信息"""
+    try:
+        from src.process.integration import DataIntegrator
+
+        integrator = DataIntegrator('./output')
+        time_stats = integrator.extract_time_info()
+
+        if time_stats:
+            print("\n" + "=" * 60)
+            print("📅 数据库时间信息统计")
+            print("=" * 60)
+            print(f"总记录数: {time_stats['total_records']}")
+            print(f"有效时间记录: {time_stats['valid_time_records']} ({time_stats['time_validity_rate']:.1f}%)")
+            print(f"时间范围: {time_stats['time_range']['overall_start']} 到 {time_stats['time_range']['overall_end']}")
+            print(f"覆盖年份: {time_stats['time_range']['overall_years']}")
+            print(f"总月份数: {time_stats['time_range']['total_months']}")
+
+            # 显示年份分布
+            print(f"\n📈 年份分布 (前10年):")
+            year_items = list(time_stats['year_distribution'].items())[:10]
+            for year, count in year_items:
+                print(f"  {year}: {count} 条记录")
+
+            # 显示月份分布
+            print(f"\n📅 月份分布:")
+            month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                           'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+            for month, count in time_stats['month_distribution'].items():
+                month_name = month_names[month - 1] if 1 <= month <= 12 else f"Month{month}"
+                print(f"  {month_name}: {count} 条记录")
+
+            # 询问是否导出详细统计
+            export = input("\n是否导出详细时间统计信息到Excel文件? (y/n): ").strip().lower()
+            if export == 'y':
+                output_path = integrator._export_time_statistics(time_stats, './statistics')
+                if output_path:
+                    print(f"✅ 时间统计信息已导出: {output_path}")
+
+    except Exception as e:
+        print(f"❌ 统计时间信息失败: {e}")
+
+
 def get_station_filter(args):
     """解析站点筛选条件（增强错误处理）"""
     if args.stations == 'all':
@@ -330,11 +373,10 @@ def main():
         except Exception as e:
             logger.error(f"❌ 添加GLDAS数据时出错: {str(e)}")
 
-
         # 确定要处理的数据源
         if 'all' in args.sources:
-            sources_to_process = ['cswe','landcover','snow_phenology','snow_depth','era5_temperature','era5_swe'
-                , 'glsnow']  # 默认处理所有源
+            sources_to_process = ['cswe','landcover','snow_phenology','snow_depth','era5_temperature','era5_swe' , 'glsnow',
+                                  'terrain_features']  # 默认处理所有源
             logger.info("🌍 处理所有可用数据源")
         else:
             sources_to_process = args.sources
