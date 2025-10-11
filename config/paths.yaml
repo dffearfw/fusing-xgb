@@ -13,4 +13,5 @@ outputs:
   terrain_features:  "outputs/terrain_features"
   snow_depth:  "outputs/snow_depth"
   era5_temperature:  "outputs/era5_temperature"
+  landuse:  "outputs/landuse"
   combined:  "outputs/combined"

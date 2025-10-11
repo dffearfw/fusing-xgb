@@ -1,0 +1,46 @@
+name: "cnlucc"
+description: "China Land Use Classification 2015"
+data_dir: "E:/data/2015"
+
+# 数据文件路径
+path_template: "E:/data/2015/landuse_2015_30m.tif"
+
+# 数据格式信息
+format: "geotiff"
+variable: "landuse"
+data_type: "uint8"
+fill_value: 255
+valid_min: 11
+valid_max: 99  # 中国土地利用分类通常1-62
+scale_factor: 1.0
+
+# 投影信息
+projection: "Krasovsky_1940_Albers"
+crs: "EPSG:4524"  # China Albers Equal Area Conic
+datum: "D_Krasovsky_1940"
+wgs84_datum: false
+
+# 分类系统说明
+classification_system:
+  name: "中国土地利用分类系统"
+  version: "2015"
+  classes: 26
+
+# 处理选项
+reproject_to_wgs84: true  # 需要重投影到WGS84
+resample_method: "nearest"  # 分类数据使用最近邻重采样
+
+# 输出配置
+output:
+  primary_format: "parquet"
+  always_generate_csv: true
+  include_class_names: true  # 包含分类名称
+
+# 日期范围 - 添加这个部分
+date_range:
+  start:  2013-01-02
+  end:  2017-12-31
+
+# 标记为静态数据
+is_static: true
+static_year: 2015

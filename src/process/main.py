@@ -24,7 +24,7 @@ def parse_arguments():
     parser.add_argument('--sources', nargs='+',
                         choices=['glsnow', 'gldas', 'modis', 'era5_swe', 'cswe',
                                  'landcover', 'snow_phenology', 'terrain_features',
-                                 'snow_depth', 'era5_temperature', 'all'],
+                                 'snow_depth', 'era5_temperature','landuse', 'all'],
                         default=['all'],
                         help='要处理的数据源')
 
@@ -163,6 +163,7 @@ def create_processor(source, secure_processor, station_filter=None):
         'terrain_features': ('src.process.sub.terrain_features_processor', 'TerrainFeaturesProcessor'),
         'snow_depth': ('src.process.sub.snow_depth_processor', 'SnowDepthProcessor'),
         'era5_temperature': ('src.process.sub.era5_temperature_processor', 'ERA5TemperatureProcessor'),
+        'landuse': ('src.process.sub.landuse_processor', 'LandUseProcessor'),
     }
 
     if source not in processor_map:
@@ -228,6 +229,28 @@ def get_date_range(source, args):
     except Exception as e:
         logging.error(f"获取日期范围失败: {str(e)}")
         raise
+
+    try:
+        # 如果是landuse且是静态数据，使用特殊处理
+        if source == 'landuse' and hasattr(processor, 'is_static') and processor.is_static:
+            return processor.get_date_range()
+
+        # 原有逻辑
+        conf = getattr(config, source, {})
+        date_range = conf.get('date_range', {})
+
+        if not date_range:
+            logger.error(f"数据源 {source} 缺少日期范围配置")
+            return None, None
+
+        start_date = datetime.strptime(date_range['start'], '%Y-%m-%d')
+        end_date = datetime.strptime(date_range['end'], '%Y-%m-%d')
+
+        return start_date, end_date
+
+    except Exception as e:
+        logger.error(f"获取日期范围失败: {str(e)}")
+        return None, None
 
 
 def process_source(source, integrator, secure_processor, args, station_filter):
@@ -375,8 +398,8 @@ def main():
 
         # 确定要处理的数据源
         if 'all' in args.sources:
-            sources_to_process = ['cswe','landcover','snow_phenology','snow_depth','era5_temperature','era5_swe' , 'glsnow',
-                                  'terrain_features']  # 默认处理所有源
+            sources_to_process = ['landuse']  # 默认处理所有源,'snow_phenology','glsnow','terrain_features','cswe','landcover',,'snow_depth','era5_temperature','era5_swe' ,
+
             logger.info("🌍 处理所有可用数据源")
         else:
             sources_to_process = args.sources

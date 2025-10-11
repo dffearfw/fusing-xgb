@@ -37,6 +37,7 @@ class ConfigLoader:
         self.terrain_features = self._load_config_file("sources/terrain_features.yaml")
         self.snow_depth = self._load_config_file("sources/sd.yaml")
         self.era5_temperature = self._load_config_file("sources/era5_temperature.yaml")
+        self.landuse = self._load_config_file("sources/landuse.yaml")
 
         # 日志配置
         self.log_config = self._get_log_config()

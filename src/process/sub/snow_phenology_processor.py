@@ -169,7 +169,7 @@ class SnowPhenologyProcessor:
             return {'start': None, 'end': None}
 
     def _extract_from_file(self, file_path, dataset_type, stations, hydrological_year, target_date):
-        """从单个文件中提取数据（支持水文年）"""
+        """从单个文件中提取数据（支持水文年和水文年DOY）"""
         if not file_path or not file_path.exists():
             self.logger.warning(f"{dataset_type} 文件不存在: {file_path}")
             return pd.DataFrame()
@@ -215,6 +215,9 @@ class SnowPhenologyProcessor:
                             valid_max = self.conf.get('valid_max', 366)
 
                             if day_of_year != fill_value and valid_min <= day_of_year <= valid_max:
+                                # 计算水文年DOY
+                                hydrological_doy = self._calculate_hydrological_doy(day_of_year, dataset_type)
+
                                 # 转换为实际日期（考虑水文年）
                                 try:
                                     # 水文年开始日期（通常是9月1日）
@@ -242,6 +245,7 @@ class SnowPhenologyProcessor:
                                     'station_id': station_ids[i],
                                     'hydrological_year': hydrological_year,
                                     'day_of_year': day_of_year,
+                                    'hydrological_doy': hydrological_doy,  # 新增水文年DOY
                                     'date': date_str,
                                     'target_date': target_date.strftime('%Y-%m-%d'),
                                     'dataset_type': dataset_type,
@@ -298,32 +302,6 @@ class SnowPhenologyProcessor:
         except Exception as e:
             self.logger.exception(f"提取 {date} 数据错误: {str(e)}")
             return pd.DataFrame()
-
-    def postprocess_data(self, df, year):
-        """数据后处理"""
-        if df.empty:
-            return df
-
-        # 创建副本
-        result_df = df.copy()
-
-        # 过滤无效值
-        fill_value = self.conf.get('fill_value', -32768)
-        valid_min = self.conf.get('valid_min', 1)
-        valid_max = self.conf.get('valid_max', 366)
-
-        # 使用 .loc 进行条件过滤
-        mask = (result_df['day_of_year'] >= valid_min) & \
-               (result_df['day_of_year'] <= valid_max) & \
-               (result_df['day_of_year'] != fill_value)
-        result_df = result_df.loc[mask].copy()
-
-        # 添加处理时间
-        processing_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        result_df.loc[:, 'processing_time'] = processing_time
-
-        self.logger.debug(f"后处理完成: {len(result_df)} 条记录")
-        return result_df
 
     def save_results(self, df, start_date, end_date):
         """保存结果"""
@@ -464,6 +442,75 @@ class SnowPhenologyProcessor:
             self.logger.error(f"验证数据目录失败: {str(e)}")
             return False
 
+    def validate_hydrological_doy_calculation(self):
+        """验证水文年DOY计算是否正确"""
+        try:
+            # 测试用例：自然年DOY和水文年DOY的对应关系
+            test_cases = [
+                # (自然年DOY, 数据类型, 期望水文年DOY)
+                (244, 'start', 1),  # 9月1日初日 -> 水文年DOY 1
+                (244, 'end', 1),  # 9月1日终日 -> 水文年DOY 1
+                (365, 'start', 122),  # 12月31日初日 -> 水文年DOY 122
+                (365, 'end', 122),  # 12月31日终日 -> 水文年DOY 122
+                (1, 'start', 123),  # 1月1日初日 -> 水文年DOY 123
+                (1, 'end', 123),  # 1月1日终日 -> 水文年DOY 123
+                (243, 'start', 366),  # 8月31日初日 -> 水文年DOY 366
+                (243, 'end', 366),  # 8月31日终日 -> 水文年DOY 366
+            ]
+
+            self.logger.info("水文年DOY计算验证:")
+            for natural_doy, dataset_type, expected_hydro_doy in test_cases:
+                actual_hydro_doy = self._calculate_hydrological_doy(natural_doy, dataset_type)
+                status = "✅" if actual_hydro_doy == expected_hydro_doy else "❌"
+                self.logger.info(f"  {status} 自然年DOY {natural_doy} ({dataset_type}) -> "
+                                 f"期望: {expected_hydro_doy}, 实际: {actual_hydro_doy}")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"水文年DOY验证失败: {str(e)}")
+            return False
+
+    def postprocess_data(self, df, year):
+        """数据后处理 - 包含水文年DOY验证"""
+        if df.empty:
+            return df
+
+        # 创建副本
+        result_df = df.copy()
+
+        # 过滤无效值
+        fill_value = self.conf.get('fill_value', -32768)
+        valid_min = self.conf.get('valid_min', 1)
+        valid_max = self.conf.get('valid_max', 366)
+
+        # 使用 .loc 进行条件过滤
+        mask = (result_df['day_of_year'] >= valid_min) & \
+               (result_df['day_of_year'] <= valid_max) & \
+               (result_df['day_of_year'] != fill_value)
+        result_df = result_df.loc[mask].copy()
+
+        # 验证水文年DOY的范围
+        if 'hydrological_doy' in result_df.columns:
+            hydro_doy_valid = (result_df['hydrological_doy'] >= 1) & (result_df['hydrological_doy'] <= 366)
+            invalid_hydro_doy = (~hydro_doy_valid).sum()
+            if invalid_hydro_doy > 0:
+                self.logger.warning(f"发现 {invalid_hydro_doy} 条记录的水文年DOY超出有效范围")
+                result_df = result_df[hydro_doy_valid].copy()
+
+        # 添加处理时间
+        processing_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        result_df.loc[:, 'processing_time'] = processing_time
+
+        # 统计水文年DOY信息
+        if 'hydrological_doy' in result_df.columns:
+            hydro_doy_stats = result_df['hydrological_doy'].describe()
+            self.logger.info(f"水文年DOY统计: 均值={hydro_doy_stats['mean']:.1f}, "
+                             f"范围={hydro_doy_stats['min']:.0f}-{hydro_doy_stats['max']:.0f}")
+
+        self.logger.debug(f"后处理完成: {len(result_df)} 条记录")
+        return result_df
+
     def _get_hydrological_year(self, date):
         """根据日期获取对应的水文年"""
         try:
@@ -484,6 +531,60 @@ class SnowPhenologyProcessor:
         except Exception as e:
             self.logger.error(f"计算水文年失败: {str(e)}")
             return date.year  # 默认返回日历年
+
+    def _calculate_hydrological_doy(self, natural_doy, dataset_type):
+        """计算水文年DOY
+
+        水文年从9月1日开始：
+        - 初日数据：直接使用自然年DOY（因为初日通常在水文年内）
+        - 终日数据：需要调整（因为终日可能跨越水文年）
+
+        Args:
+            natural_doy: 自然年DOY
+            dataset_type: 数据类型（'start' 或 'end'）
+
+        Returns:
+            int: 水文年DOY
+        """
+        try:
+            # 获取水文年配置
+            hydro_config = self.conf.get('hydrological_year', {})
+            start_month = hydro_config.get('start_month', 9)
+            start_day = hydro_config.get('start_day', 1)
+
+            # 计算水文年开始的DOY（自然年）
+            hydro_start_doy = datetime(2000, start_month, start_day).timetuple().tm_yday
+
+            if dataset_type == 'start':
+                # 初日数据：通常在水文年内，直接使用
+                # 9月1日之后：DOY - hydro_start_doy + 1
+                # 9月1日之前：属于下一个水文年，但这种情况较少
+                if natural_doy >= hydro_start_doy:
+                    hydrological_doy = natural_doy - hydro_start_doy + 1
+                else:
+                    # 如果初日在9月1日之前，可能是下一个水文年的开始
+                    hydrological_doy = natural_doy + (365 - hydro_start_doy) + 1
+            else:
+                # 终日数据：需要特殊处理
+                # 终日可能在当前水文年或下一个水文年
+                if natural_doy >= hydro_start_doy:
+                    # 当前水文年的终日
+                    hydrological_doy = natural_doy - hydro_start_doy + 1
+                else:
+                    # 下一个水文年的终日（年初的终日）
+                    hydrological_doy = natural_doy + (365 - hydro_start_doy) + 1
+
+            # 确保DOY在有效范围内
+            if hydrological_doy < 1:
+                return 1
+            elif hydrological_doy > 366:
+                return 366
+            else:
+                return int(hydrological_doy)
+
+        except Exception as e:
+            self.logger.warning(f"计算水文年DOY失败: {str(e)}")
+            return natural_doy  # 返回原始DOY作为备用
 
     def _generate_phenology_summary(self, df, output_path):
         """生成积雪物候数据摘要"""
