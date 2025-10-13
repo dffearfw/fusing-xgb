@@ -12,7 +12,7 @@ from pathlib import Path
 ARCGIS_PYTHON = r"C:\Python27\ArcGIS10.8\python.exe"
 SCRIPT_NAME = "test_arcpy_processor.py"
 ARCGIS_BIN_PATH = r"C:\Program Files (x86)\ArcGIS\Desktop10.8\bin"
-excel_path = r"/src/process/samples.xlsx"
+excel_path = r"D:\pyworkspace\fusing xgb\config\sources\samples.xlsx"
 raster_dir = r"E:\data\GLDAS_SWE"
 output_dir = r"E:\data\gisws"
 

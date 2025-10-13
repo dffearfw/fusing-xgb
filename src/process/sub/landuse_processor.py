@@ -113,6 +113,101 @@ class LandUseProcessor:
             self.logger.debug(f"详细错误信息:\n{traceback.format_exc()}")
             return None
 
+    def get_all_stations(self):
+        """获取所有站点（不限制时间）- 彻底修复版本"""
+        try:
+            # 首先检查数据库中的总站点数
+            count_query = "SELECT COUNT(DISTINCT station_ID) as total_stations FROM stations"
+            count_df = pd.read_sql_query(count_query, self.db_conn)
+            total_stations = count_df['total_stations'].iloc[0]
+            self.logger.info(f"数据库中总唯一站点数: {total_stations}")
+
+            # 方法1: 获取所有不重复的站点及其坐标（使用最新记录）
+            query_v1 = """
+            SELECT s.station_ID, s.Longitude, s.Latitude
+            FROM (
+                SELECT station_ID, Longitude, Latitude,
+                       ROW_NUMBER() OVER (PARTITION BY station_ID ORDER BY time DESC) as rn
+                FROM stations 
+                WHERE Longitude IS NOT NULL AND Latitude IS NOT NULL
+            ) s
+            WHERE s.rn = 1
+            """
+
+            df_v1 = pd.read_sql_query(query_v1, self.db_conn)
+            self.logger.info(f"方法1获取的站点数: {len(df_v1)}")
+
+            # 如果方法1获取的站点数不足，使用方法2
+            if len(df_v1) < total_stations:
+                self.logger.warning(f"方法1只获取了 {len(df_v1)}/{total_stations} 个站点，尝试方法2")
+
+                # 方法2: 获取所有有坐标的站点（不去重时间）
+                query_v2 = """
+                SELECT DISTINCT station_ID, Longitude, Latitude
+                FROM stations 
+                WHERE Longitude IS NOT NULL AND Latitude IS NOT NULL
+                """
+                df_v2 = pd.read_sql_query(query_v2, self.db_conn)
+                self.logger.info(f"方法2获取的站点数: {len(df_v2)}")
+
+                # 使用方法2的结果，但需要去重（取每个站点的第一条记录）
+                df = df_v2.drop_duplicates(subset=['station_ID'])
+                self.logger.info(f"方法2去重后站点数: {len(df)}")
+            else:
+                df = df_v1
+
+            if not df.empty:
+                # 确保数值类型
+                df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
+                df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
+
+                # 移除无效坐标
+                before_clean = len(df)
+                df = df.dropna(subset=['Latitude', 'Longitude'])
+                after_clean = len(df)
+
+                if before_clean != after_clean:
+                    self.logger.info(f"清理无效坐标: {before_clean} -> {after_clean}")
+
+                self.logger.info(f"最终获取 {len(df)} 个有效站点")
+
+                # 记录坐标范围用于调试
+                lon_range = (df['Longitude'].min(), df['Longitude'].max())
+                lat_range = (df['Latitude'].min(), df['Latitude'].max())
+                self.logger.info(
+                    f"站点坐标范围: 经度({lon_range[0]:.2f} to {lon_range[1]:.2f}), 纬度({lat_range[0]:.2f} to {lat_range[1]:.2f})")
+
+                # 检查是否在土地利用图像范围内
+                self._check_station_coverage(df)
+
+                # 如果仍然缺少站点，记录警告
+                if len(df) < total_stations:
+                    missing_count = total_stations - len(df)
+                    self.logger.warning(f"仍然缺少 {missing_count} 个站点的坐标数据")
+
+                    # 获取缺失的站点ID
+                    missing_query = """
+                    SELECT station_ID 
+                    FROM stations 
+                    WHERE station_ID NOT IN (
+                        SELECT DISTINCT station_ID 
+                        FROM stations 
+                        WHERE Longitude IS NOT NULL AND Latitude IS NOT NULL
+                    )
+                    """
+                    missing_df = pd.read_sql_query(missing_query, self.db_conn)
+                    if not missing_df.empty:
+                        self.logger.warning(f"缺失坐标的站点示例: {missing_df['station_ID'].head(10).tolist()}")
+
+                return df.to_dict('records')
+            else:
+                self.logger.error("未找到任何有效站点记录")
+                return []
+
+        except Exception as e:
+            self.logger.exception(f"获取站点失败: {str(e)}")
+            return []
+
     def connect_database(self):
         """连接站点数据库"""
         db_path = config.get_station_db_path()
@@ -131,48 +226,8 @@ class LandUseProcessor:
             self.logger.error(f"数据库连接失败: {str(e)}")
             raise
 
-    def get_all_stations(self):
-        """获取所有站点（不限制时间）"""
-        try:
-            # 获取数据库中所有不重复的站点及其坐标
-            query = """
-            SELECT DISTINCT station_ID, Longitude, Latitude 
-            FROM stations 
-            WHERE Longitude IS NOT NULL AND Latitude IS NOT NULL
-            """
-
-            df = pd.read_sql_query(query, self.db_conn)
-
-            if not df.empty:
-                # 确保数值类型
-                df['Latitude'] = pd.to_numeric(df['Latitude'], errors='coerce')
-                df['Longitude'] = pd.to_numeric(df['Longitude'], errors='coerce')
-
-                # 移除无效坐标
-                df = df.dropna(subset=['Latitude', 'Longitude'])
-
-                self.logger.info(f"找到 {len(df)} 个有效站点（所有时间点）")
-
-                # 记录坐标范围用于调试
-                lon_range = (df['Longitude'].min(), df['Longitude'].max())
-                lat_range = (df['Latitude'].min(), df['Latitude'].max())
-                self.logger.info(
-                    f"站点坐标范围: 经度({lon_range[0]:.2f} to {lon_range[1]:.2f}), 纬度({lat_range[0]:.2f} to {lat_range[1]:.2f})")
-
-                # 检查是否在土地利用图像范围内
-                self._check_station_coverage(df)
-
-                return df.to_dict('records')
-            else:
-                self.logger.warning("未找到有效站点记录")
-                return []
-
-        except Exception as e:
-            self.logger.exception(f"获取站点失败: {str(e)}")
-            return []
-
     def extract_landuse_values(self, stations):
-        """提取土地利用分类值 - 修复版本：只返回站点ID和土地利用信息，不包含日期"""
+        """提取土地利用分类值 - 确保处理所有站点"""
         try:
             data_file = Path(self.conf['path_template'])
 
@@ -190,6 +245,7 @@ class LandUseProcessor:
             results = []
             processed_count = 0
             success_count = 0
+            failed_count = 0
 
             try:
                 with rasterio.open(data_file) as src:
@@ -202,7 +258,7 @@ class LandUseProcessor:
                         always_xy=True
                     )
 
-                    # 批量处理站点
+                    # 批量处理所有站点
                     for station in stations:
                         try:
                             lon = float(station.get('Longitude'))
@@ -233,50 +289,64 @@ class LandUseProcessor:
                                     # 获取分类名称
                                     class_name = self.class_mapping.get(value, f"未知类型_{value}")
 
-                                    # 关键修复：只包含站点ID和土地利用信息，不包含日期！
                                     results.append({
                                         'station_id': station_id,
                                         'landuse_code': value,
                                         'landuse_class': class_name,
-                                        'longitude': lon,  # 保留坐标用于调试
-                                        'latitude': lat,
-                                        # 不包含任何日期字段！
-                                        'source_file': data_file.name
+                                        'longitude': lon,
+                                        'latitude': lat
                                     })
                                     success_count += 1
+                                else:
+                                    # 记录无效值
+                                    self.logger.debug(f"站点 {station_id} 值无效: {value} (有效范围: {valid_min}-{valid_max})")
+                                    failed_count += 1
                             else:
-                                self.logger.debug(f"站点 {station_id} 坐标超出图像范围: 行{row}, 列{col}")
+                                self.logger.warning(
+                                    f"站点 {station_id} 坐标超出图像范围: 行{row}, 列{col} (图像范围: {src.height}x{src.width})")
+                                failed_count += 1
 
                             processed_count += 1
 
-                            # 每处理200个站点记录一次进度
-                            if processed_count % 200 == 0:
-                                self.logger.info(f"处理进度: {processed_count}/{len(stations)} 站点, 成功: {success_count}")
+                            # 每处理100个站点记录一次进度
+                            if processed_count % 100 == 0:
+                                self.logger.info(
+                                    f"处理进度: {processed_count}/{len(stations)} 站点, 成功: {success_count}, 失败: {failed_count}")
 
                         except Exception as e:
-                            self.logger.debug(f"处理站点 {station.get('station_ID')} 失败: {str(e)}")
+                            self.logger.error(f"处理站点 {station.get('station_ID')} 失败: {str(e)}")
+                            failed_count += 1
+                            processed_count += 1
                             continue
 
             finally:
                 os.environ['CHECK_DISK_FREE_SPACE'] = original_check
 
-            self.logger.info(f"土地利用提取完成: 处理 {processed_count} 站点, 成功提取 {success_count} 条记录")
+            self.logger.info(f"土地利用提取完成: 处理 {processed_count} 站点, 成功 {success_count}, 失败 {failed_count}")
 
             if results:
                 df = pd.DataFrame(results)
 
                 # 确保没有日期列
-                date_columns = ['date', 'year', 'month', 'data_year', 'processing_year']
+                date_columns = ['date', 'year', 'month', 'data_year', 'processing_year', 'processing_time',
+                                'data_version']
                 for col in date_columns:
                     if col in df.columns:
                         df = df.drop(col, axis=1)
-                        self.logger.info(f"移除意外的日期列: {col}")
+
+                # 去重，确保每个站点只有一条记录
+                before_dedup = len(df)
+                df = df.drop_duplicates(subset=['station_id'])
+                after_dedup = len(df)
+                if before_dedup != after_dedup:
+                    self.logger.info(f"土地利用数据去重: {before_dedup} -> {after_dedup}")
 
                 # 统计分类分布
                 self._log_class_distribution(df)
 
                 return df
             else:
+                self.logger.error("没有提取到任何有效的土地利用数据")
                 return pd.DataFrame()
 
         except Exception as e:

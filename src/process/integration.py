@@ -452,6 +452,20 @@ class DataIntegrator:
         self.logger.info("创建正确宽表...")
 
         try:
+            # 详细记录每个数据源的信息
+            self.logger.info("=== 数据源详细信息 ===")
+            for source_name, source_df in self.source_data.items():
+                record_count = len(source_df)
+                station_count = source_df['station_id'].nunique() if 'station_id' in source_df.columns else 0
+                date_count = source_df['date'].nunique() if 'date' in source_df.columns else "N/A"
+                self.logger.info(f"{source_name}: {record_count} 记录, {station_count} 站点, {date_count} 日期")
+
+                # 显示前几个站点ID用于调试
+                if 'station_id' in source_df.columns:
+                    sample_stations = source_df['station_id'].unique()[:5]
+                    self.logger.info(f"  {source_name} 站点示例: {sample_stations.tolist()}")
+
+
             # 1. 分离不同类型的数据源
             static_dfs = []
             yearly_dfs = []
@@ -533,14 +547,28 @@ class DataIntegrator:
                 self.logger.info(f"  海拔数据: {len(altitude_df)} 行")
 
             # 3. 创建基础框架
-            final_wide = pd.DataFrame()
+            final_wide = pd.DataFrame()  # 在if块外先定义
 
             if dynamic_dfs:
                 first_dynamic_name, final_wide = dynamic_dfs[0]
                 self.logger.info(f"以动态数据源 {first_dynamic_name} 为基础框架: {len(final_wide)} 行")
-                self.logger.info(f"基础框架列: {list(final_wide.columns)}")
 
-                # 合并其他动态数据源
+                # 关键修复：在合并其他动态数据之前，先合并静态数据
+                if static_dfs:
+                    self.logger.info("=== 立即合并静态数据到基础框架 ===")
+                    static_combined = self._combine_all_static_data(static_dfs)
+
+                    # 合并静态数据到基础框架
+                    before_static_merge = len(final_wide)
+                    final_wide = final_wide.merge(static_combined, on='station_id', how='left')
+                    after_static_merge = len(final_wide)
+
+                    self.logger.info(f"静态数据合并: {before_static_merge} -> {after_static_merge} 行")
+
+                    # 验证静态数据合并
+                    self._validate_static_merge(final_wide, static_combined)
+
+                # 然后继续合并其他动态数据源
                 for i in range(1, len(dynamic_dfs)):
                     name, next_df = dynamic_dfs[i]
                     before_count = len(final_wide)
@@ -553,7 +581,7 @@ class DataIntegrator:
                 return self._handle_static_only_case(static_dfs, yearly_dfs, phenology_dfs, gldas_dfs)
 
             # 4. 合并数据库SWE数据
-            if not swe_df.empty:
+            if not swe_df.empty and not final_wide.empty:  # 添加空检查
                 self.logger.info(f"合并SWE数据前 - final_wide形状: {final_wide.shape}")
                 self.logger.info(f"SWE数据形状: {swe_df.shape}")
 
@@ -564,7 +592,7 @@ class DataIntegrator:
                 self.logger.info(f"合并数据库SWE数据: {before_count} -> {after_count} 行, 有效值: {swe_valid_count}")
 
             # 5. 合并数据库海拔数据
-            if not altitude_df.empty:
+            if not altitude_df.empty and not final_wide.empty:  # 添加空检查
                 self.logger.info(f"合并海拔数据...")
                 before_count = len(final_wide)
 
@@ -596,7 +624,7 @@ class DataIntegrator:
                     self.logger.info(f"处理年度数据 {yearly_name}")
                     # ... 原有的年度数据处理逻辑
 
-            # 9. 合并所有静态数据源 - 彻底修复版本
+            # 9. 合并所有静态数据源 - 确保静态数据复制到所有时间点
             if static_dfs:
                 self.logger.info("=== 开始合并静态数据源 ===")
 
@@ -608,7 +636,7 @@ class DataIntegrator:
                     # 标准化静态数据 - 彻底清理时间相关列
                     static_df_clean = static_df.copy()
 
-                    # 彻底移除所有时间相关列，确保静态数据纯净
+                    # 彻底移除所有时间相关列
                     time_columns = ['date', 'year', 'month', 'processing_year', 'data_year',
                                     'processing_time', 'data_version', 'source_file']
                     columns_removed = []
@@ -647,6 +675,10 @@ class DataIntegrator:
                         added_cols = after_cols - before_cols
                         self.logger.info(f"合并静态数据源 {name}: 添加 {added_cols} 列")
 
+                # 关键调试：检查静态数据
+                self.logger.info(f"静态数据合并后: {len(static_combined)} 条记录")
+                self.logger.info(f"静态数据列: {list(static_combined.columns)}")
+
                 # 分析站点匹配情况
                 dynamic_stations = set(final_wide['station_id'].unique())
                 static_stations = set(static_combined['station_id'].unique())
@@ -655,11 +687,14 @@ class DataIntegrator:
                 self.logger.info(f"  动态数据站点数: {len(dynamic_stations)}")
                 self.logger.info(f"  静态数据站点数: {len(static_stations)}")
                 self.logger.info(f"  共同站点数: {len(dynamic_stations & static_stations)}")
+                self.logger.info(f"  仅动态数据站点: {len(dynamic_stations - static_stations)}")
+                self.logger.info(f"  仅静态数据站点: {len(static_stations - dynamic_stations)}")
 
                 # 处理站点不匹配问题
                 missing_dynamic_stations = dynamic_stations - static_stations
                 if missing_dynamic_stations:
-                    self.logger.warning(f"静态数据缺少 {len(missing_dynamic_stations)} 个动态数据站点的数据")
+                    self.logger.warning(
+                        f"静态数据缺少 {len(missing_dynamic_stations)} 个动态数据站点的数据: {list(missing_dynamic_stations)[:5]}")
 
                     # 为缺失的站点创建空记录
                     missing_records = []
@@ -682,14 +717,13 @@ class DataIntegrator:
 
                     # 记录合并前的状态
                     before_count = len(final_wide)
-                    before_columns = set(final_wide.columns)
-                    static_features = [col for col in static_combined.columns if col != 'station_id']
+                    before_static_features = [col for col in static_combined.columns if col != 'station_id']
 
-                    self.logger.info(f"合并前 - 动态数据列: {sorted(before_columns)}")
-                    self.logger.info(f"要合并的静态特征: {static_features}")
+                    self.logger.info(f"合并前 - 动态数据记录数: {before_count}")
+                    self.logger.info(f"要合并的静态特征: {before_static_features}")
 
-                    # 关键修复：使用左连接，确保所有动态数据记录都获得静态数据
-                    # 静态数据会根据station_id自动复制到所有时间点的记录
+                    # 关键修复：使用左连接，确保静态数据复制到所有时间点
+                    # 这会根据station_id将静态数据复制到该站点的所有时间记录
                     final_wide = final_wide.merge(
                         static_combined,
                         on='station_id',
@@ -697,19 +731,27 @@ class DataIntegrator:
                     )
 
                     after_count = len(final_wide)
-                    after_columns = set(final_wide.columns)
-                    added_columns = after_columns - before_columns
-
-                    self.logger.info(f"合并后 - 新增列: {sorted(added_columns)}")
 
                     # 统计静态数据的填充情况
-                    for feature in static_features:
+                    for feature in before_static_features:
                         if feature in final_wide.columns:
                             filled_count = final_wide[feature].notna().sum()
                             fill_rate = (filled_count / len(final_wide)) * 100
                             unique_stations_with_data = final_wide[final_wide[feature].notna()]['station_id'].nunique()
                             self.logger.info(
                                 f"静态特征 {feature}: {filled_count}/{len(final_wide)} 记录有值 ({fill_rate:.1f}%), 涉及 {unique_stations_with_data} 个站点")
+
+                            # 检查是否每个时间点都有数据
+                            if 'date' in final_wide.columns:
+                                # 检查每个站点的所有时间点是否都有数据
+                                station_coverage = final_wide.groupby('station_id').apply(
+                                    lambda x: x[feature].notna().all()
+                                )
+                                fully_covered_stations = station_coverage[station_coverage].index.tolist()
+                                partially_covered_stations = station_coverage[~station_coverage].index.tolist()
+
+                                self.logger.info(f"  完全覆盖的站点: {len(fully_covered_stations)}")
+                                self.logger.info(f"  部分覆盖的站点: {len(partially_covered_stations)}")
 
                     self.logger.info(f"合并所有静态数据: {before_count} -> {after_count} 行")
 
@@ -730,6 +772,43 @@ class DataIntegrator:
             import traceback
             self.logger.debug(f"详细错误: {traceback.format_exc()}")
             return pd.DataFrame()
+
+    def validate_static_data_merge(self, final_wide, static_source_name):
+        """验证静态数据是否正确合并到所有时间点"""
+        self.logger.info(f"=== 验证静态数据 {static_source_name} 合并 ===")
+
+        # 检查静态特征列
+        static_features = [col for col in final_wide.columns if
+                           static_source_name in col.lower() or 'landuse' in col.lower()]
+
+        if not static_features:
+            self.logger.warning(f"没有找到 {static_source_name} 相关的特征列")
+            return
+
+        for feature in static_features:
+            # 检查每个站点的该特征在所有时间点是否一致
+            station_consistency = final_wide.groupby('station_id')[feature].apply(
+                lambda x: x.nunique() == 1 if x.notna().any() else True
+            )
+
+            inconsistent_stations = station_consistency[~station_consistency].index.tolist()
+
+            if inconsistent_stations:
+                self.logger.error(f"特征 {feature} 在以下站点的不同时间点值不一致: {inconsistent_stations[:5]}")
+            else:
+                self.logger.info(f"特征 {feature} 在所有站点的所有时间点值一致")
+
+            # 检查填充率
+            filled_count = final_wide[feature].notna().sum()
+            total_count = len(final_wide)
+            fill_rate = (filled_count / total_count) * 100
+
+            self.logger.info(f"特征 {feature} 填充率: {filled_count}/{total_count} ({fill_rate:.1f}%)")
+
+            # 如果填充率低，显示一些缺失的站点
+            if fill_rate < 90:
+                missing_stations = final_wide[final_wide[feature].isna()]['station_id'].unique()
+                self.logger.warning(f"特征 {feature} 缺失的站点示例: {missing_stations[:10]}")
 
     def _standardize_station_id_format(self, df, source_name):
         """统一station_id为字符串格式"""
@@ -1333,6 +1412,8 @@ class DataIntegrator:
             if final_df is None or final_df.empty:
                 self.logger.error("最终数据为空或为None")
                 return None
+
+
 
             # 确保包含水文年信息（如果还没有的话）
             if 'date' in final_df.columns and 'doy' in final_df.columns:
@@ -1946,6 +2027,93 @@ class DataIntegrator:
             self.logger.error(f"获取静态海拔数据失败: {str(e)}")
             return pd.DataFrame()
 
+    def _combine_all_static_data(self, static_dfs):
+        """合并所有静态数据源"""
+        self.logger.info("=== 合并所有静态数据源 ===")
+
+        static_combined = None
+        for name, static_df in static_dfs:
+            self.logger.info(f"处理静态数据源: {name}, 记录数: {len(static_df)}")
+
+            # 清理静态数据
+            static_df_clean = self._clean_static_data(static_df, name)
+
+            if static_combined is None:
+                static_combined = static_df_clean
+            else:
+                before_cols = len(static_combined.columns)
+                static_combined = static_combined.merge(
+                    static_df_clean,
+                    on='station_id',
+                    how='outer'
+                )
+                after_cols = len(static_combined.columns)
+                self.logger.info(f"合并静态数据源 {name}: 添加 {after_cols - before_cols} 列")
+
+        self.logger.info(f"静态数据合并完成: {len(static_combined)} 条记录")
+        self.logger.info(f"静态数据列: {list(static_combined.columns)}")
+
+        return static_combined
+
+    def _clean_static_data(self, static_df, source_name):
+        """清理静态数据，确保没有时间列"""
+        static_df_clean = static_df.copy()
+
+        # 彻底移除所有时间相关列
+        time_columns = ['date', 'year', 'month', 'processing_year', 'data_year',
+                        'processing_time', 'data_version', 'source_file']
+        columns_removed = []
+        for col in time_columns:
+            if col in static_df_clean.columns:
+                static_df_clean = static_df_clean.drop(col, axis=1)
+                columns_removed.append(col)
+
+        if columns_removed:
+            self.logger.info(f"从 {source_name} 移除时间列: {columns_removed}")
+
+        # 去重，确保每个站点只有一条记录
+        before_dedup = len(static_df_clean)
+        static_df_clean = static_df_clean.drop_duplicates(subset=['station_id'])
+        after_dedup = len(static_df_clean)
+        if before_dedup != after_dedup:
+            self.logger.info(f"{source_name} 去重: {before_dedup} -> {after_dedup}")
+
+        # 只保留必要的列
+        keep_columns = ['station_id']
+        feature_columns = [col for col in static_df_clean.columns
+                           if col not in ['station_id', 'longitude', 'latitude', 'Longitude', 'Latitude']]
+        keep_columns.extend(feature_columns)
+
+        return static_df_clean[keep_columns]
+
+    def _validate_static_merge(self, final_wide, static_combined):
+        """验证静态数据合并结果"""
+        self.logger.info("=== 验证静态数据合并 ===")
+
+        static_features = [col for col in static_combined.columns if col != 'station_id']
+
+        for feature in static_features:
+            if feature in final_wide.columns:
+                # 检查填充率
+                filled_count = final_wide[feature].notna().sum()
+                total_count = len(final_wide)
+                fill_rate = (filled_count / total_count) * 100
+
+                # 检查每个站点的所有时间点是否都有数据
+                if 'date' in final_wide.columns:
+                    station_coverage = final_wide.groupby('station_id').apply(
+                        lambda x: x[feature].notna().all()
+                    )
+                    fully_covered = station_coverage.sum()
+                    total_stations = len(station_coverage)
+
+                    self.logger.info(f"{feature}: {filled_count}/{total_count} 记录有值 ({fill_rate:.1f}%)")
+                    self.logger.info(f"  {fully_covered}/{total_stations} 个站点的所有时间点都有数据")
+
+                    if fill_rate < 95:
+                        missing_stations = final_wide[final_wide[feature].isna()]['station_id'].unique()
+                        self.logger.warning(f"  缺失数据的站点示例: {missing_stations[:5]}")
+
     def get_altitude_from_database(self, station_ids):
         """从数据库获取海拔数据"""
         try:
@@ -2049,6 +2217,38 @@ class DataIntegrator:
             dfs.append(df_copy)
 
         return pd.concat(dfs, ignore_index=True)
+
+    def force_fix_static_data(self, final_wide, static_dfs):
+        """强制修复静态数据合并问题"""
+        self.logger.info("=== 强制修复静态数据合并 ===")
+
+        # 合并所有静态数据
+        static_combined = self._combine_all_static_data(static_dfs)
+
+        # 获取动态数据中的所有站点
+        dynamic_stations = set(final_wide['station_id'].unique())
+        static_stations = set(static_combined['station_id'].unique())
+
+        self.logger.info(f"动态数据站点: {len(dynamic_stations)}")
+        self.logger.info(f"静态数据站点: {len(static_stations)}")
+
+        # 为每个动态数据站点确保有静态数据
+        for station_id in dynamic_stations:
+            if station_id not in static_stations:
+                self.logger.warning(f"站点 {station_id} 缺少静态数据，创建空记录")
+                # 创建空记录
+                empty_record = {'station_id': station_id}
+                for col in static_combined.columns:
+                    if col != 'station_id':
+                        empty_record[col] = np.nan
+                # 添加到静态数据
+                static_combined = pd.concat([static_combined, pd.DataFrame([empty_record])], ignore_index=True)
+
+        # 重新合并
+        final_fixed = final_wide.merge(static_combined, on='station_id', how='left')
+
+        self.logger.info(f"强制修复完成: {len(final_wide)} -> {len(final_fixed)} 行")
+        return final_fixed
 
     def analyze_station_matching(self, final_wide, static_combined):
         """分析站点匹配情况"""

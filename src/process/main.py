@@ -398,8 +398,8 @@ def main():
 
         # 确定要处理的数据源
         if 'all' in args.sources:
-            sources_to_process = ['landuse']  # 默认处理所有源,'snow_phenology','glsnow','terrain_features','cswe','landcover',,'snow_depth','era5_temperature','era5_swe' ,
-
+            sources_to_process = ['landuse'
+                                    ]  # 默认处理所有源,'terrain_features',,'snow_phenology','glsnow','cswe','landcover','snow_depth','era5_temperature','era5_swe' ,
             logger.info("🌍 处理所有可用数据源")
         else:
             sources_to_process = args.sources
