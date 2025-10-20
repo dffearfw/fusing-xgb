@@ -1,0 +1,15 @@
+environment: development
+logging:
+  level: DEBUG
+  file: ./logs/app.log
+paths:
+  data: ./data
+  outputs: ./outputs
+  logs: ./logs
+processing:
+  batch_size: 100
+  max_workers: 2
+api:
+  host: localhost
+  port: 8000
+  debug: true

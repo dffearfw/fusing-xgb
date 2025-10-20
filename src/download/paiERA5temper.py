@@ -47,7 +47,7 @@ def download_era(stat_dat,end_dat):
     export_params={
         'image':daily_img,
         'description':task_desc,
-        'folder':'GLDAS daily swe',
+        'folder':'era5 temperature',
         'scale':11132,
         'region':china_region,
         'maxPixels':1e10,

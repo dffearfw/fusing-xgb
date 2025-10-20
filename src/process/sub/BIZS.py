@@ -1,5 +1,3 @@
-# 旧版arcpy处理栅格文件
-
 import shutil
 import subprocess
 import os
@@ -27,22 +25,18 @@ def prepare_data():
 
 
 # ====================
-def generate_py27_code(year, temp_csv, output_dir, raster_dir):
-    """生成Python 2.7处理代码，使用直接拼接避免格式化问题"""
+def generate_py27_code_fixed(year, temp_csv, output_dir, raster_dir):
+    """修复波段引用问题的Python 2.7代码"""
     raster_filename = "GLDAS_SWE_China_{}.tif".format(year)
 
-    # 使用直接拼接构建代码字符串
     code_lines = [
         "# -*- coding: utf-8 -*-",
         "import arcpy",
         "import csv",
         "import os",
         "import sys",
-        "import tempfile",
-        "import datetime",
         "from collections import defaultdict",
         "",
-        "# 设置UTF-8编码环境",
         "reload(sys)",
         "sys.setdefaultencoding('utf-8')",
         "",
@@ -51,30 +45,21 @@ def generate_py27_code(year, temp_csv, output_dir, raster_dir):
         "    os.makedirs(gis_workspace)",
         "arcpy.env.workspace = gis_workspace",
         "arcpy.env.scratchWorkspace = gis_workspace",
-        "# 配置路径",
+        "",
         "temp_csv = r'" + temp_csv + "'",
         "raster_path = os.path.join(r'" + raster_dir + "', r'" + raster_filename + "')",
         "output_csv = r'" + os.path.join(output_dir, "results_{}.csv".format(year)) + "'",
         "",
-        "# 打印路径用于调试",
-        "print('加载栅格: %s' % raster_path)",
+        "print('处理栅格: %s' % raster_path)",
         "if not os.path.exists(raster_path):",
-        "    print('错误: 栅格文件不存在 - %s' % raster_path)",
+        "    print('错误: 栅格文件不存在')",
         "    sys.exit(1)",
         "",
-        "# 设置环境",
         "arcpy.env.overwriteOutput = True",
         "arcpy.CheckOutExtension('Spatial')",
         "",
-        "# 获取年份的天数",
-        "year_val=" + str(year),
-        "is_leap_year = (" + str(year) + " % 4 == 0 and " + str(year) + " % 100 != 0) or (" + str(
-            year) + " % 400 == 0)",
-        "days_in_year = 366 if is_leap_year else 365",
-        "print('%s年有%s天，%s' % (" + str(year) + ", days_in_year, '闰年' if is_leap_year else '平年'))",
-        "",
         "# 创建临时工作空间",
-        "temp_gdb = os.path.join(gis_workspace, 'temp_{}.gdb'.format(year_val))",
+        "temp_gdb = os.path.join(gis_workspace, 'temp_" + str(year) + ".gdb')",
         "if arcpy.Exists(temp_gdb):",
         "    arcpy.Delete_management(temp_gdb)",
         "arcpy.CreateFileGDB_management(os.path.dirname(temp_gdb), os.path.basename(temp_gdb))",
@@ -88,107 +73,131 @@ def generate_py27_code(year, temp_csv, output_dir, raster_dir):
         "    spatial_reference=arcpy.SpatialReference(4490)",
         ")",
         "",
-        "# 添加字段 - 使用新字段名",
+        "# 添加字段",
         "arcpy.AddField_management(points_fc, 'station_ID', 'TEXT', field_length=20)",
         "arcpy.AddField_management(points_fc, 'doy', 'SHORT')",
         "",
         "# 插入点数据",
         "with open(temp_csv, 'rb') as f:",
         "    reader = csv.DictReader(f)",
-        "    # 调试：打印CSV列名",
-        "    print('CSV列名: %s' % reader.fieldnames)",
-        "    ",
         "    with arcpy.da.InsertCursor(points_fc, ['SHAPE@XY', 'station_ID', 'doy']) as cursor:",
-        "        for idx, row in enumerate(reader):",
+        "        for row in reader:",
         "            try:",
-        "                # 调试：打印前3行数据",
-        "                if idx < 3:",
-        "                    print('行 %d: station ID=%s, Longitude=%s, Latitude=%s, doy=%s' % (",
-        "                        idx + 1, row.get('station_ID'), row.get('Longitude'),",
-        "                        row.get('Latitude'), row.get('doy')))",
-        "                ",
         "                Longitude = float(row['Longitude'])",
         "                Latitude = float(row['Latitude'])",
         "                station_ID = row['station_ID']",
         "                doy = int(row['doy'])",
         "                cursor.insertRow([(Longitude, Latitude), station_ID, doy])",
         "            except Exception as e:",
-        "                print('行 %d 插入错误: %s' % (idx + 1, str(e)))",
-        "                print('问题行: %s' % row)",
+        "                print('插入错误: %s' % str(e))",
         "",
-
-        "# 验证要素类中的站点ID",
-        "station_IDs = set()",
-        "with arcpy.da.SearchCursor(points_fc, ['station_ID']) as cursor:",
-        "    for row in cursor:",
-        "        station_IDs.add(row[0])",
-        "print('要素类中唯一站点ID数量: %d' % len(station_IDs))",
-        "if len(station_IDs) < 10:",
-        "    print('前10个站点ID: %s' % list(station_IDs)[:10])",
-        "else:",
-        "    print('示例站点ID: %s' % list(station_IDs)[:5])",
-        "",
-
-        # ... [其他代码] ...
-        "# 获取实际波段数量",
+        "# 获取波段信息 - 使用正确的方法",
+        "print('检查栅格波段...')",
         "raster = arcpy.Raster(raster_path)",
-        "actual_band_count = raster.bandCount",
-        "print('栅格波段数量: %d' % actual_band_count)",
+        "band_count = raster.bandCount",
+        "print('波段数量: %d' % band_count)",
         "",
-        "# 准备波段列表 - 根据实际名称和数量",
+        "# 方法1: 直接使用栅格对象创建波段引用",
         "band_list = []",
-        "for band_index in range(0, actual_band_count):",
-        "    band_name = '%d_SWE_inst' % band_index",
-        "    field_name = 'b%d' % band_index",
-        "    band_list.append([raster_path + '\\\\' + band_name, field_name])",
+        "for i in range(1, band_count + 1):",
+        "    try:",
+        "        # 方法1: 使用Raster对象创建波段",
+        "        band_raster = arcpy.Raster(raster_path + '\\Band_' + str(i))",
+        "        field_name = 'band_' + str(i)",
+        "        band_list.append([band_raster, field_name])",
+        "        print('成功添加波段 %d' % i)",
+        "    except Exception as e:",
+        "        print('方法1失败: %s' % str(e))",
+        "        try:",
+        "            # 方法2: 使用MakeRasterLayer",
+        "            band_layer = 'band_' + str(i)",
+        "            arcpy.MakeRasterLayer_management(raster_path, band_layer, band_index=i)",
+        "            field_name = 'band_' + str(i)",
+        "            band_list.append([band_layer, field_name])",
+        "            print('方法2成功添加波段 %d' % i)",
+        "        except Exception as e2:",
+        "            print('方法2也失败: %s' % str(e2))",
         "",
-        "# 提取栅格值到点",
-        "arcpy.sa.ExtractMultiValuesToPoints(points_fc, band_list)",
-        "",
-        "# 创建结果字典",
-        "results = defaultdict(dict)",
-        "",
-        "# 读取提取结果",
-        "fields = ['station_ID', 'doy'] + ['b%d' % i for i in range(0, actual_band_count)]",
-        "with arcpy.da.SearchCursor(points_fc, fields) as cursor:",
-        "    for row in cursor:",
-        "        station_ID = row[0]  # station ID",
-        "        doy = row[1]        # doy",
-        "        ",
-        "        # 计算波段索引: doy=1 -> 波段0, doy=2 -> 波段1",
-        "        band_index = doy - 1",
-        "        ",
-        "        # 确保索引在有效范围内",
-        "        if 0 <= band_index < actual_band_count:",
-        "            band_value = row[2 + band_index]  # 前两个字段后开始是波段值",
-        "            results[station_ID][doy] = band_value",
-        "        else:",
-        "            print('警告: 站点%s的DOY%d超出范围(1-%d)' % (station_ID, doy, actual_band_count))",
-        "",
-        "# 写入结果CSV",
-        "record_count = 0",
-        "with open(output_csv, 'wb') as f:",
-        "    writer = csv.writer(f)",
-        "    writer.writerow(['station_ID', 'doy', 'value'])",
-        "    for station_ID, doy_values in results.iteritems():",
-        "        # 调试：验证站点ID",
-        "        if station_ID is None or station_ID == '':",
-        "            print('警告: 发现空站点ID')",
-        "            continue",
+        "# 如果上述方法都失败，尝试单波段提取",
+        "if not band_list:",
+        "    print('尝试单波段逐个提取...')",
+        "    results = defaultdict(dict)",
+        "    ",
+        "    for doy in range(1, band_count + 1):",
+        "        try:",
+        "            # 为每个波段创建临时要素类",
+        "            temp_points = os.path.join(temp_gdb, 'points_band_' + str(doy))",
+        "            arcpy.CopyFeatures_management(points_fc, temp_points)",
         "            ",
-        "        for doy, value in doy_values.iteritems():",
-        "            writer.writerow([station_ID, doy, value])",
-        "            record_count += 1",
+        "            # 提取单个波段",
+        "            band_raster = arcpy.Raster(raster_path + '\\Band_' + str(doy))",
+        "            arcpy.sa.ExtractValuesToPoints(temp_points, band_raster, temp_points + '_extracted')",
         "            ",
-        "            # 调试：打印前3条记录",
-        "            if record_count <= 3:",
-        "                print('结果记录: station_ID=%s, doy=%d, value=%s' % (station_ID, doy, value))",
+        "            # 读取结果",
+        "            with arcpy.da.SearchCursor(temp_points + '_extracted', ['station_ID', 'doy', 'RASTERVALU']) as cursor:",
+        "                for row in cursor:",
+        "                    station_ID = row[0]",
+        "                    target_doy = row[1]",
+        "                    if target_doy == doy:  # 只匹配对应的DOY",
+        "                        results[station_ID][doy] = row[2]",
+        "            ",
+        "            print('完成波段 %d 提取' % doy)",
+        "            ",
+        "        except Exception as e:",
+        "            print('波段 %d 提取失败: %s' % (doy, str(e)))",
         "",
-        "print('写入 %d 条结果记录' % record_count)",
-
-        "# 清理临时数据",
-        "arcpy.Delete_management(temp_gdb)",
-        "print('完成 %d 年处理' % " + str(year) + ")",
+        "    # 写入结果",
+        "    with open(output_csv, 'wb') as f:",
+        "        writer = csv.writer(f)",
+        "        writer.writerow(['station_ID', 'doy', 'value'])",
+        "        for station_ID, doy_values in results.iteritems():",
+        "            for doy, value in doy_values.iteritems():",
+        "                writer.writerow([station_ID, doy, value])",
+        "",
+        "    print('单波段提取完成，写入 %d 条记录' % sum(len(v) for v in results.values()))",
+        "",
+        "else:",
+        "    # 使用多波段提取",
+        "    print('使用多波段提取方法...')",
+        "    try:",
+        "        arcpy.sa.ExtractMultiValuesToPoints(points_fc, band_list)",
+        "        print('多波段提取成功')",
+        "",
+        "        # 读取结果",
+        "        results = defaultdict(dict)",
+        "        fields = ['station_ID', 'doy'] + ['band_' + str(i) for i in range(1, band_count + 1)]",
+        "",
+        "        with arcpy.da.SearchCursor(points_fc, fields) as cursor:",
+        "            for row in cursor:",
+        "                station_ID = row[0]",
+        "                doy = row[1]",
+        "                ",
+        "                # 波段索引从1开始，DOY从1开始，直接对应",
+        "                if 1 <= doy <= band_count:",
+        "                    band_value = row[1 + doy]  # 前两个字段后是波段值",
+        "                    results[station_ID][doy] = band_value",
+        "",
+        "        # 写入CSV",
+        "        with open(output_csv, 'wb') as f:",
+        "            writer = csv.writer(f)",
+        "            writer.writerow(['station_ID', 'doy', 'value'])",
+        "            for station_ID, doy_values in results.iteritems():",
+        "                for doy, value in doy_values.iteritems():",
+        "                    writer.writerow([station_ID, doy, value])",
+        "",
+        "        print('多波段提取完成，写入 %d 条记录' % sum(len(v) for v in results.values()))",
+        "",
+        "    except Exception as e:",
+        "        print('多波段提取失败: %s' % str(e))",
+        "",
+        "# 清理",
+        "try:",
+        "    arcpy.Delete_management(temp_gdb)",
+        "    print('清理临时数据完成')",
+        "except:",
+        "    print('清理临时数据失败')",
+        "",
+        "print('完成 " + str(year) + " 年处理')",
         "sys.stdout.flush()"
     ]
 
@@ -197,7 +206,6 @@ def generate_py27_code(year, temp_csv, output_dir, raster_dir):
 
 def process_single_year(year, year_df, output_dir, raster_dir):
     """处理单个年份数据"""
-    # 调试：打印年度数据摘要
     print(f"\n{year}年数据摘要:")
     print(f"站点数量: {year_df['station_ID'].nunique()}")
     print(f"记录数量: {len(year_df)}")
@@ -213,7 +221,7 @@ def process_single_year(year, year_df, output_dir, raster_dir):
 
         # 生成并保存Python 2.7脚本
         py27_script = Path(temp_dir) / f"extract_{year}.py"
-        py27_code = generate_py27_code(year, str(temp_csv), output_dir, raster_dir)
+        py27_code = generate_py27_code_fixed(year, str(temp_csv), output_dir, raster_dir)
 
         with open(py27_script, "w", encoding="utf-8") as f:
             f.write(py27_code)
@@ -252,7 +260,7 @@ def process_single_year(year, year_df, output_dir, raster_dir):
 def merge_results(output_dir, df):
     """合并所有年度结果并关联原始属性"""
     all_dfs = []
-    for year in range(2013, 2018):  # 2013到2018年
+    for year in range(2013, 2018):
         result_file = Path(output_dir) / f"results_{year}.csv"
         if result_file.exists():
             try:
@@ -279,26 +287,19 @@ def merge_results(output_dir, df):
     # 删除无效日期
     result_df = result_df.dropna(subset=['date'])
 
-    # 关联原始属性 - 使用新字段名
+    # 关联原始属性
     final_df = pd.merge(
         df,
         result_df[['station_ID', 'date', 'value']],
         on=['station_ID', 'date'],
         how='left'
     )
+
     # 验证结果
     print("\n最终结果验证:")
     print(f"总记录数: {len(final_df)}")
     print(f"唯一站点ID数量: {final_df['station_ID'].nunique()}")
     print(f"空值比例: {final_df['value'].isna().mean():.2%}")
-
-    # 检查站点ID分布
-    if final_df['station_ID'].nunique() < 10:
-        print("\n所有站点ID:")
-        print(final_df['station_ID'].unique())
-    else:
-        print("\n前10个站点ID:")
-        print(final_df['station_ID'].unique()[:10])
 
     return final_df
 
@@ -327,11 +328,8 @@ def main():
     final_df = merge_results(output_dir, df)
     if final_df is not None:
         final_output = Path(output_dir) / "final_results.csv"
-
-        # 保存时包含所有原始属性
         final_df.to_csv(final_output, index=False)
 
-        # 结果验证
         valid_count = final_df['value'].count()
         total_count = len(final_df)
         print(f"处理完成! 结果保存至: {final_output}")

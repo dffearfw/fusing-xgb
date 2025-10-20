@@ -384,7 +384,7 @@ def main():
         logger.info(f"📂 输出目录: {output_dir}")
 
         try:
-            gldas_file_path = 'D:/pyworkspace/fusing xgb/config/sources/results.xlsx'
+            gldas_file_path = 'E:/data/gisws/final_results.csv'
             if Path(gldas_file_path).exists():
                 success = integrator.add_source('gldas', gldas_file_path)
                 if success:
@@ -398,8 +398,8 @@ def main():
 
         # 确定要处理的数据源
         if 'all' in args.sources:
-            sources_to_process = ['landuse'
-                                    ]  # 默认处理所有源,'terrain_features',,'snow_phenology','glsnow','cswe','landcover','snow_depth','era5_temperature','era5_swe' ,
+            sources_to_process = ['terrain_features','snow_phenology','glsnow','cswe','snow_depth','era5_temperature','era5_swe'
+                                    ]  # 默认处理所有源,'landcover',
             logger.info("🌍 处理所有可用数据源")
         else:
             sources_to_process = args.sources
