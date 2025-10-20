@@ -445,65 +445,78 @@ class DataIntegrator:
             return pd.DataFrame()
 
     def _create_correct_wide_table(self):
-        """创建正确的宽表 - 增强静态数据支持"""
+        """创建正确的宽表 - 保留并集主索引，增强静态数据支持与兼容处理"""
         if not self.source_data:
             return pd.DataFrame()
 
         self.logger.info("创建正确宽表...")
 
         try:
-            # 详细记录每个数据源的信息
+            # 1. 记录并标准化每个源的station_id格式（不修改原始存储）
             self.logger.info("=== 数据源详细信息 ===")
             for source_name, source_df in self.source_data.items():
-                record_count = len(source_df)
-                station_count = source_df['station_id'].nunique() if 'station_id' in source_df.columns else 0
-                date_count = source_df['date'].nunique() if 'date' in source_df.columns else "N/A"
+                if source_df is None:
+                    continue
+                try:
+                    self.source_data[source_name] = self._standardize_station_id_format(source_df, source_name)
+                except Exception:
+                    # 若失败，继续但记录
+                    self.logger.warning(f"{source_name}: station_id 标准化失败，继续处理")
+
+                record_count = len(self.source_data[source_name])
+                station_count = self.source_data[source_name]['station_id'].nunique() if 'station_id' in \
+                                                                                         self.source_data[
+                                                                                             source_name].columns else 0
+                date_count = self.source_data[source_name]['date'].nunique() if 'date' in self.source_data[
+                    source_name].columns else "N/A"
                 self.logger.info(f"{source_name}: {record_count} 记录, {station_count} 站点, {date_count} 日期")
 
-                # 显示前几个站点ID用于调试
-                if 'station_id' in source_df.columns:
-                    sample_stations = source_df['station_id'].unique()[:5]
+                if 'station_id' in self.source_data[source_name].columns:
+                    sample_stations = self.source_data[source_name]['station_id'].unique()[:5]
                     self.logger.info(f"  {source_name} 站点示例: {sample_stations.tolist()}")
 
-
-            # 1. 分离不同类型的数据源
+            # 2. 分类数据源（保持你原有分类逻辑，但保留原始 df 以便后续复杂处理）
             static_dfs = []
             yearly_dfs = []
-            dynamic_dfs = []
+            dynamic_dfs = []  # 格式: (source_name, df_wide) 其中 df_wide 已经是 (station_id, date, value)
+            dynamic_raw = []  # 原始动态 DataFrame（供GLDAS/物候等特殊处理）
             phenology_dfs = []
             gldas_dfs = []
             coordinate_dfs = []
 
-            # 收集所有站点和日期范围
             all_station_ids = set()
             all_dates = set()
 
             for source_name, source_df in self.source_data.items():
-                source_df = self._standardize_station_id_format(source_df, source_name)
+                if source_df is None:
+                    continue
 
-            # 首先分类数据源
-            for source_name, source_df in self.source_data.items():
-                # 收集站点ID
+                # 收集站点与日期用于后续数据库请求
                 if 'station_id' in source_df.columns:
-                    all_station_ids.update(source_df['station_id'].unique())
-
-                # 收集日期
+                    all_station_ids.update(source_df['station_id'].astype(str).unique())
                 if 'date' in source_df.columns:
-                    all_dates.update(source_df['date'].unique())
+                    # 统一日期为字符串，避免类型不一致导致 min/max 出错
+                    try:
+                        dates = pd.to_datetime(source_df['date'], errors='coerce').dropna().dt.strftime(
+                            '%Y-%m-%d').unique()
+                        all_dates.update(dates)
+                    except Exception:
+                        pass
 
-                # 分类数据源
+                # 分类
                 if self._is_gldas_data(source_name, source_df):
                     gldas_dfs.append((source_name, source_df))
+                    dynamic_raw.append((source_name, source_df))
                 elif self._is_snow_phenology_data(source_name, source_df):
                     phenology_dfs.append((source_name, source_df))
+                    dynamic_raw.append((source_name, source_df))
                 elif self._is_terrain_features(source_name, source_df) or source_name == 'landuse':
-                    # 特别标记土地利用为静态数据
                     static_dfs.append((source_name, source_df))
                     self.logger.info(f"识别为静态数据源: {source_name}")
                 elif self._is_yearly_data(source_name, source_df):
                     yearly_dfs.append((source_name, source_df))
                 elif 'date' in source_df.columns and 'station_id' in source_df.columns:
-                    # 动态数据源
+                    # 动态数据源：选第一个数值列作为代表值并做宽表列
                     numeric_cols = source_df.select_dtypes(include=['number']).columns
                     value_cols = [col for col in numeric_cols if
                                   col not in ['station_id', 'date', 'year', 'month', 'day', 'dataset_type']]
@@ -512,265 +525,222 @@ class DataIntegrator:
                         source_wide = source_df[['station_id', 'date', value_col]].copy()
                         source_wide = source_wide.rename(columns={value_col: source_name})
                         source_wide = source_wide.drop_duplicates(['station_id', 'date'])
+                        # 规范化日期格式
+                        source_wide['date'] = pd.to_datetime(source_wide['date'], errors='coerce').dt.strftime(
+                            '%Y-%m-%d')
+                        source_wide['station_id'] = source_wide['station_id'].astype(str)
                         dynamic_dfs.append((source_name, source_wide))
+                        dynamic_raw.append((source_name, source_df))
                 elif 'station_id' in source_df.columns:
                     static_dfs.append((source_name, source_df))
 
-                # 记录坐标信息
+                # 坐标记录
                 if self._has_coordinate_info(source_df):
                     coordinate_dfs.append((source_name, source_df))
 
-            self.logger.info(f"数据源分类结果:")
-            self.logger.info(f"  动态数据源: {len(dynamic_dfs)} 个")
-            self.logger.info(f"  静态数据源: {len(static_dfs)} 个")
-            self.logger.info(f"  年度数据源: {len(yearly_dfs)} 个")
-            self.logger.info(f"  总站点数: {len(all_station_ids)}")
-            self.logger.info(f"  总日期数: {len(all_dates)}")
+            self.logger.info(
+                f"数据源分类结果: 动态={len(dynamic_dfs)} 静态={len(static_dfs)} 年度={len(yearly_dfs)} GLDAS={len(gldas_dfs)} 物候={len(phenology_dfs)}")
 
-            # 2. 从数据库获取SWE数据和海拔数据
+            # 3. 从数据库获取 SWE 和 海拔（当存在站点/日期集合时）
             swe_df = pd.DataFrame()
             altitude_df = pd.DataFrame()
             if all_station_ids and all_dates:
-                start_date = min(all_dates) if all_dates else datetime(2013, 1, 1)
-                end_date = max(all_dates) if all_dates else datetime(2018, 12, 31)
+                start_date = min(all_dates) if all_dates else None
+                end_date = max(all_dates) if all_dates else None
 
-                self.logger.info(f"获取数据库数据: {len(all_station_ids)} 个站点, {len(all_dates)} 个日期")
-                swe_df = self.get_swe_from_database(list(all_station_ids),
-                                                    pd.to_datetime(start_date),
-                                                    pd.to_datetime(end_date))
+                try:
+                    start_dt = pd.to_datetime(start_date)
+                    end_dt = pd.to_datetime(end_date)
+                except Exception:
+                    start_dt = None
+                    end_dt = None
 
-                # 获取海拔数据
-                altitude_df = self.get_altitude_from_database(list(all_station_ids))
+                if start_dt is not None and end_dt is not None:
+                    self.logger.info(f"获取数据库数据: {len(all_station_ids)} 个站点, {len(all_dates)} 个日期")
+                    swe_df = self.get_swe_from_database(list(all_station_ids), start_dt, end_dt)
+                    altitude_df = self.get_altitude_from_database(list(all_station_ids))
 
-                self.logger.info(f"数据库数据获取结果:")
-                self.logger.info(f"  SWE数据: {len(swe_df)} 行")
-                self.logger.info(f"  海拔数据: {len(altitude_df)} 行")
+                    # 规范化返回表
+                    if not swe_df.empty:
+                        swe_df['date'] = pd.to_datetime(swe_df['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                        swe_df['station_id'] = swe_df['station_id'].astype(str)
+                    if not altitude_df.empty:
+                        altitude_df['station_id'] = altitude_df['station_id'].astype(str)
 
-            # 3. 创建基础框架
-            final_wide = pd.DataFrame()  # 在if块外先定义
+                    self.logger.info(f"数据库数据获取结果: SWE {len(swe_df)} 行, 海拔 {len(altitude_df)} 行")
+                else:
+                    self.logger.warning("无法确定日期范围，跳过数据库 SWE/海拔获取")
 
-            if dynamic_dfs:
-                first_dynamic_name, final_wide = dynamic_dfs[0]
-                self.logger.info(f"以动态数据源 {first_dynamic_name} 为基础框架: {len(final_wide)} 行")
+            # 4. 构建 master index：动态数据集的 (station_id,date) 并集 + SWE 的 (station_id,date)
+            pairs = []
+            for name, df in dynamic_dfs:
+                if {'station_id', 'date'}.issubset(df.columns):
+                    tmp = df[['station_id', 'date']].drop_duplicates()
+                    pairs.append(tmp)
+            if not swe_df.empty and {'station_id', 'date'}.issubset(swe_df.columns):
+                pairs.append(swe_df[['station_id', 'date']].drop_duplicates())
 
-                # 关键修复：在合并其他动态数据之前，先合并静态数据
-                if static_dfs:
-                    self.logger.info("=== 立即合并静态数据到基础框架 ===")
-                    static_combined = self._combine_all_static_data(static_dfs)
-
-                    # 合并静态数据到基础框架
-                    before_static_merge = len(final_wide)
-                    final_wide = final_wide.merge(static_combined, on='station_id', how='left')
-                    after_static_merge = len(final_wide)
-
-                    self.logger.info(f"静态数据合并: {before_static_merge} -> {after_static_merge} 行")
-
-                    # 验证静态数据合并
-                    self._validate_static_merge(final_wide, static_combined)
-
-                # 然后继续合并其他动态数据源
-                for i in range(1, len(dynamic_dfs)):
-                    name, next_df = dynamic_dfs[i]
-                    before_count = len(final_wide)
-                    next_df = self._standardize_station_id_format(next_df, name)
-                    final_wide = final_wide.merge(next_df, on=['station_id', 'date'], how='left')
-                    after_count = len(final_wide)
-                    self.logger.info(f"合并动态数据源 {name}: {before_count} -> {after_count} 行")
-            else:
-                self.logger.warning("没有动态数据源，使用静态数据处理")
+            if not pairs:
+                # 如果没有任何动态对，退回处理纯静态情况
+                self.logger.warning("没有动态数据对 (station_id,date)。使用纯静态流程")
                 return self._handle_static_only_case(static_dfs, yearly_dfs, phenology_dfs, gldas_dfs)
 
-            # 4. 合并数据库SWE数据
-            if not swe_df.empty and not final_wide.empty:  # 添加空检查
-                self.logger.info(f"合并SWE数据前 - final_wide形状: {final_wide.shape}")
-                self.logger.info(f"SWE数据形状: {swe_df.shape}")
+            master_index = pd.concat(pairs, ignore_index=True).drop_duplicates().reset_index(drop=True)
+            master_index['station_id'] = master_index['station_id'].astype(str)
+            master_index['date'] = pd.to_datetime(master_index['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+            self.logger.info(f"主索引构建完成 (并集): {len(master_index)} 行")
 
-                before_count = len(final_wide)
-                final_wide = final_wide.merge(swe_df, on=['station_id', 'date'], how='left')
-                after_count = len(final_wide)
-                swe_valid_count = final_wide['swe'].notna().sum()
-                self.logger.info(f"合并数据库SWE数据: {before_count} -> {after_count} 行, 有效值: {swe_valid_count}")
-
-            # 5. 合并数据库海拔数据
-            if not altitude_df.empty and not final_wide.empty:  # 添加空检查
-                self.logger.info(f"合并海拔数据...")
-                before_count = len(final_wide)
-
-                # 使用左连接合并海拔数据（静态数据）
-                final_wide = final_wide.merge(
-                    altitude_df,
-                    on=['station_id'],
-                    how='left'
-                )
-                after_count = len(final_wide)
-                altitude_valid_count = final_wide['altitude'].notna().sum() if 'altitude' in final_wide.columns else 0
-                self.logger.info(f"合并数据库海拔数据: {before_count} -> {after_count} 行, 有效值: {altitude_valid_count}")
-
-            # 6. 处理GLDAS数据（动态数据）
-            if gldas_dfs:
-                for gldas_name, gldas_df in gldas_dfs:
-                    self.logger.info(f"处理GLDAS数据 {gldas_name}: {len(gldas_df)} 行")
-                    # ... 原有的GLDAS处理逻辑
-
-            # 7. 处理积雪物候数据（动态数据）
-            if phenology_dfs:
-                for phenology_name, phenology_df in phenology_dfs:
-                    self.logger.info(f"处理积雪物候数据 {phenology_name}: {len(phenology_df)} 行")
-                    # ... 原有的物候数据处理逻辑
-
-            # 8. 处理年度数据
-            if yearly_dfs:
-                for yearly_name, yearly_df in yearly_dfs:
-                    self.logger.info(f"处理年度数据 {yearly_name}")
-                    # ... 原有的年度数据处理逻辑
-
-            # 9. 合并所有静态数据源 - 确保静态数据复制到所有时间点
+            # 5. 将静态数据合并为 single static_combined（保留所有特征列）
+            static_combined = None
             if static_dfs:
-                self.logger.info("=== 开始合并静态数据源 ===")
+                static_combined = self._combine_all_static_data(static_dfs)  # 你已有函数，会做清理
+                if 'station_id' in static_combined.columns:
+                    static_combined['station_id'] = static_combined['station_id'].astype(str)
+                else:
+                    # 防御：若静态表缺 station_id，则丢弃静态合并
+                    self.logger.warning("静态合并结果缺少 station_id 列，跳过静态合并")
+                    static_combined = None
 
-                # 首先合并所有静态数据
-                static_combined = None
-                for name, static_df in static_dfs:
-                    self.logger.info(f"处理静态数据源: {name}, 记录数: {len(static_df)}")
+            # 6. 以 master_index 为基础，把静态表按 station_id 左连接（这样静态列会被复制到每个时间点）
+            final_wide = master_index.copy()
+            if static_combined is not None and not static_combined.empty:
+                before_static_merge = len(final_wide)
+                final_wide = final_wide.merge(static_combined, on='station_id', how='left')
+                self.logger.info(f"静态数据合并到主索引: {before_static_merge} -> {len(final_wide)} 行")
 
-                    # 标准化静态数据 - 彻底清理时间相关列
-                    static_df_clean = static_df.copy()
-
-                    # 彻底移除所有时间相关列
-                    time_columns = ['date', 'year', 'month', 'processing_year', 'data_year',
-                                    'processing_time', 'data_version', 'source_file']
-                    columns_removed = []
-                    for col in time_columns:
-                        if col in static_df_clean.columns:
-                            static_df_clean = static_df_clean.drop(col, axis=1)
-                            columns_removed.append(col)
-
-                    if columns_removed:
-                        self.logger.info(f"从静态数据 {name} 移除时间列: {columns_removed}")
-
-                    # 去重，确保每个站点只有一条记录
-                    before_dedup = len(static_df_clean)
-                    static_df_clean = static_df_clean.drop_duplicates(subset=['station_id'])
-                    after_dedup = len(static_df_clean)
-                    if before_dedup != after_dedup:
-                        self.logger.info(f"静态数据去重: {before_dedup} -> {after_dedup}")
-
-                    # 获取特征列（排除ID和坐标列）
-                    exclude_cols = ['station_id', 'longitude', 'latitude', 'Longitude', 'Latitude']
-                    feature_cols = [col for col in static_df_clean.columns if col not in exclude_cols]
-
-                    self.logger.info(f"静态数据 {name} 特征列: {feature_cols}")
-
-                    if static_combined is None:
-                        static_combined = static_df_clean
+            # 7️⃣ 合并各动态数据源（按 station_id + date 左连接）
+            for name, df in dynamic_dfs:
+                # 🟢 特殊情况：只要 gldas 的 value 列
+                if name.lower() == "gldas":
+                    if "value" in df.columns:
+                        df = df[["station_id", "date", "value"]].rename(columns={"value": "gldas_value"})
+                        final_wide = final_wide.merge(df, on=["station_id", "date"], how="left")
+                        self.logger.info(f"已合并动态源 [{name}]（仅 value 列），当前行数: {len(final_wide)}")
                     else:
-                        # 合并静态数据
-                        before_cols = len(static_combined.columns)
-                        static_combined = static_combined.merge(
-                            static_df_clean[['station_id'] + feature_cols],
-                            on='station_id',
-                            how='outer'
-                        )
-                        after_cols = len(static_combined.columns)
-                        added_cols = after_cols - before_cols
-                        self.logger.info(f"合并静态数据源 {name}: 添加 {added_cols} 列")
+                        self.logger.warning(f"动态源 [{name}] 未找到 'value' 列，跳过")
+                    continue
 
-                # 关键调试：检查静态数据
-                self.logger.info(f"静态数据合并后: {len(static_combined)} 条记录")
-                self.logger.info(f"静态数据列: {list(static_combined.columns)}")
+                # 🟡 普通数据源（全部字段）
+                feature_cols = [c for c in df.columns if c not in ["station_id", "date"]]
+                if not feature_cols:
+                    continue
 
-                # 分析站点匹配情况
-                dynamic_stations = set(final_wide['station_id'].unique())
-                static_stations = set(static_combined['station_id'].unique())
+                df_prefixed = df[["station_id", "date"] + feature_cols].copy()
+                rename_map = {col: f"{name}_{col}" for col in feature_cols}
+                df_prefixed = df_prefixed.rename(columns=rename_map)
+                final_wide = final_wide.merge(df_prefixed, on=["station_id", "date"], how="left")
+                self.logger.info(f"已合并动态源 [{name}]，当前行数: {len(final_wide)}")
 
-                self.logger.info(f"站点匹配分析:")
-                self.logger.info(f"  动态数据站点数: {len(dynamic_stations)}")
-                self.logger.info(f"  静态数据站点数: {len(static_stations)}")
-                self.logger.info(f"  共同站点数: {len(dynamic_stations & static_stations)}")
-                self.logger.info(f"  仅动态数据站点: {len(dynamic_stations - static_stations)}")
-                self.logger.info(f"  仅静态数据站点: {len(static_stations - dynamic_stations)}")
+            # 8. 合并数据库 SWE（确保完整行被保留 —— master_index 已包含 SWE 的并集）
+            if not swe_df.empty:
+                swe_merge_cols = [c for c in swe_df.columns if c not in ['station_id', 'date']]
+                if 'swe' not in swe_df.columns and swe_merge_cols:
+                    # 尝试将第一个可能包含的swe列重命名为 'swe'
+                    possible_swe = [c for c in swe_merge_cols if 'swe' in c.lower()]
+                    if possible_swe:
+                        swe_df = swe_df.rename(columns={possible_swe[0]: 'swe'})
+                        swe_merge_cols = [c for c in swe_df.columns if c not in ['station_id', 'date']]
 
-                # 处理站点不匹配问题
-                missing_dynamic_stations = dynamic_stations - static_stations
-                if missing_dynamic_stations:
-                    self.logger.warning(
-                        f"静态数据缺少 {len(missing_dynamic_stations)} 个动态数据站点的数据: {list(missing_dynamic_stations)[:5]}")
-
-                    # 为缺失的站点创建空记录
-                    missing_records = []
-                    for station_id in missing_dynamic_stations:
-                        record = {'station_id': station_id}
-                        # 为所有静态特征列设置NaN
-                        for col in static_combined.columns:
-                            if col != 'station_id':
-                                record[col] = np.nan
-                        missing_records.append(record)
-
-                    if missing_records:
-                        missing_df = pd.DataFrame(missing_records)
-                        static_combined = pd.concat([static_combined, missing_df], ignore_index=True)
-                        self.logger.info(f"添加了 {len(missing_records)} 个缺失站点的空记录")
-
-                # 现在将静态数据合并到动态数据框架中
-                if static_combined is not None:
-                    self.logger.info(f"准备合并静态数据到动态框架")
-
-                    # 记录合并前的状态
+                if 'swe' in swe_df.columns:
                     before_count = len(final_wide)
-                    before_static_features = [col for col in static_combined.columns if col != 'station_id']
-
-                    self.logger.info(f"合并前 - 动态数据记录数: {before_count}")
-                    self.logger.info(f"要合并的静态特征: {before_static_features}")
-
-                    # 关键修复：使用左连接，确保静态数据复制到所有时间点
-                    # 这会根据station_id将静态数据复制到该站点的所有时间记录
-                    final_wide = final_wide.merge(
-                        static_combined,
-                        on='station_id',
-                        how='left'
-                    )
-
+                    final_wide = final_wide.merge(swe_df[['station_id', 'date', 'swe']], on=['station_id', 'date'],
+                                                  how='left')
                     after_count = len(final_wide)
+                    swe_valid_count = final_wide['swe'].notna().sum()
+                    self.logger.info(f"合并数据库SWE数据: {before_count} -> {after_count} 行, 有效swe: {swe_valid_count}")
+                else:
+                    self.logger.warning("SWE 数据存在但未识别到swe列，跳过自动合并，请确认列名")
 
-                    # 统计静态数据的填充情况
-                    for feature in before_static_features:
-                        if feature in final_wide.columns:
-                            filled_count = final_wide[feature].notna().sum()
-                            fill_rate = (filled_count / len(final_wide)) * 100
-                            unique_stations_with_data = final_wide[final_wide[feature].notna()]['station_id'].nunique()
-                            self.logger.info(
-                                f"静态特征 {feature}: {filled_count}/{len(final_wide)} 记录有值 ({fill_rate:.1f}%), 涉及 {unique_stations_with_data} 个站点")
+            # 9. 合并数据库海拔（静态，按 station_id）
+            if not altitude_df.empty:
+                altitude_df = altitude_df.rename(columns={col: col for col in altitude_df.columns})  # 无操作，仅确保列在df中
+                if 'station_id' in altitude_df.columns and 'altitude' in altitude_df.columns:
+                    before_count = len(final_wide)
+                    final_wide = final_wide.merge(altitude_df[['station_id', 'altitude']].drop_duplicates('station_id'),
+                                                  on='station_id', how='left')
+                    after_count = len(final_wide)
+                    altitude_valid_count = final_wide[
+                        'altitude'].notna().sum() if 'altitude' in final_wide.columns else 0
+                    self.logger.info(f"合并数据库海拔数据: {before_count} -> {after_count} 行, 有效海拔: {altitude_valid_count}")
+                else:
+                    self.logger.warning("海拔表未包含 station_id 或 altitude 列，跳过海拔合并")
 
-                            # 检查是否每个时间点都有数据
-                            if 'date' in final_wide.columns:
-                                # 检查每个站点的所有时间点是否都有数据
-                                station_coverage = final_wide.groupby('station_id').apply(
-                                    lambda x: x[feature].notna().all()
-                                )
-                                fully_covered_stations = station_coverage[station_coverage].index.tolist()
-                                partially_covered_stations = station_coverage[~station_coverage].index.tolist()
+            # 10. GLDAS / 物候 / 年度 特殊处理（把原始 raw df 按需合并或做额外处理）
+            # 保持你原有的处理钩子：如果你需要特定列的处理逻辑，请在这里扩展
+            if gldas_dfs:
+                for g_name, g_df in gldas_dfs:
+                    self.logger.info(f"处理 GLDAS 源 {g_name}: {len(g_df)} 行 (合并到 final_wide)")
+                    # 尝试把 gldas 的关键变量（若存在 station_id,date）合并
+                    if {'station_id', 'date'}.issubset(g_df.columns):
+                        gdf = g_df.copy()
+                        gdf['station_id'] = gdf['station_id'].astype(str)
+                        gdf['date'] = pd.to_datetime(gdf['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                        # 取数值列并加前缀再合并
+                        num_cols = [c for c in gdf.select_dtypes(include=['number']).columns if
+                                    c not in ['station_id', 'date']]
+                        if num_cols:
+                            g_pref = gdf[['station_id', 'date'] + num_cols].drop_duplicates(['station_id', 'date'])
+                            # 重命名避免冲突
+                            rename_map = {c: f"{g_name}_{c}" for c in num_cols}
+                            g_pref = g_pref.rename(columns=rename_map)
+                            final_wide = final_wide.merge(g_pref, on=['station_id', 'date'], how='left')
+                            self.logger.info(f"  合并 GLDAS 特征: {len(num_cols)} 列")
+                    else:
+                        self.logger.warning(f"  GLDAS 源 {g_name} 缺少 station_id/date，跳过自动合并")
 
-                                self.logger.info(f"  完全覆盖的站点: {len(fully_covered_stations)}")
-                                self.logger.info(f"  部分覆盖的站点: {len(partially_covered_stations)}")
+            if phenology_dfs:
+                for p_name, p_df in phenology_dfs:
+                    self.logger.info(f"处理物候源 {p_name}: {len(p_df)} 行")
+                    if {'station_id', 'date'}.issubset(p_df.columns):
+                        pcopy = p_df.copy()
+                        pcopy['station_id'] = pcopy['station_id'].astype(str)
+                        pcopy['date'] = pd.to_datetime(pcopy['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                        # 合并可能的物候标识列（非时间维度）
+                        cols = [c for c in pcopy.columns if c not in ['station_id', 'date']]
+                        if cols:
+                            p_pref = pcopy[['station_id', 'date'] + cols].drop_duplicates(['station_id', 'date'])
+                            rename_map = {c: f"{p_name}_{c}" for c in cols}
+                            p_pref = p_pref.rename(columns=rename_map)
+                            final_wide = final_wide.merge(p_pref, on=['station_id', 'date'], how='left')
+                            self.logger.info(f"  合并物候特征: {len(cols)} 列")
 
-                    self.logger.info(f"合并所有静态数据: {before_count} -> {after_count} 行")
+            if yearly_dfs:
+                for y_name, y_df in yearly_dfs:
+                    self.logger.info(f"处理年度源 {y_name}: {len(y_df)} 行")
+                    # 年度数据通常按 station_id 合并（或按 station_id + year）
+                    if 'station_id' in y_df.columns:
+                        ycopy = y_df.copy()
+                        ycopy['station_id'] = ycopy['station_id'].astype(str)
+                        # 去掉时间相关字段再按 station_id 合并（若有年度特征）
+                        cols = [c for c in ycopy.columns if c not in ['station_id', 'date', 'year', 'month']]
+                        if cols:
+                            y_pref = ycopy[['station_id'] + cols].drop_duplicates('station_id')
+                            # 重命名避免冲突
+                            rename_map = {c: f"{y_name}_{c}" for c in cols}
+                            y_pref = y_pref.rename(columns=rename_map)
+                            final_wide = final_wide.merge(y_pref, on='station_id', how='left')
+                            self.logger.info(f"  合并年度特征: {len(cols)} 列")
 
-            # 10. 确保坐标信息完整
+            # 11. 确保坐标信息完整（尝试从已有 coordinate_dfs 补全）
             final_wide = self._ensure_complete_coordinates(final_wide)
+            # 如果仍然缺失，尝试用所有源补充
+            final_wide = self._supplement_coordinates_from_all_sources(final_wide)
 
-            # 11. 排序和整理
+            # 12. 排序、重置索引
+            if 'date' in final_wide.columns:
+                # 确保 date 为字符串 YYYY-MM-DD（便于导出）
+                final_wide['date'] = pd.to_datetime(final_wide['date'], errors='coerce').dt.strftime('%Y-%m-%d')
             final_wide = final_wide.sort_values(['station_id', 'date']).reset_index(drop=True)
 
-            # 最终数据验证
+            # 13. 最终验证与日志输出
             self._validate_final_wide_table(final_wide)
-
             self.logger.info(f"✅ 宽表创建完成: {final_wide.shape}")
+
             return final_wide
 
         except Exception as e:
             self.logger.error(f"创建宽表失败: {e}")
-            import traceback
-            self.logger.debug(f"详细错误: {traceback.format_exc()}")
+            self.logger.debug(traceback.format_exc())
             return pd.DataFrame()
 
     def validate_static_data_merge(self, final_wide, static_source_name):
@@ -1572,6 +1542,94 @@ class DataIntegrator:
         except Exception as e:
             self.logger.error(f"提取时间信息失败: {str(e)}")
             return None
+
+    def _build_master_from_union(self, dynamic_dfs, swe_df=None, static_combined=None):
+        """
+        使用所有动态数据源与数据库SWE的 (station_id, date) 并集构建主框架，
+        然后把 static_combined（静态特征）和各动态源 left merge 上去。
+        - dynamic_dfs: list of (source_name, df) where df has station_id & date
+        - swe_df: DataFrame with station_id & date (optional)
+        - static_combined: DataFrame with station_id and static features (optional)
+        Returns: final_wide DataFrame whose rows == union of all station_id/date pairs
+        """
+        try:
+            # 1. 收集所有 (station_id, date) 对
+            pairs = []
+            for name, df in dynamic_dfs:
+                if 'station_id' in df.columns and 'date' in df.columns:
+                    tmp = df[['station_id', 'date']].drop_duplicates()
+                    pairs.append(tmp)
+
+            if swe_df is not None and not swe_df.empty and 'station_id' in swe_df.columns and 'date' in swe_df.columns:
+                pairs.append(swe_df[['station_id', 'date']].drop_duplicates())
+
+            if not pairs:
+                # 没有动态或swe数据，返回空
+                return pd.DataFrame()
+
+            # 合并所有 pairs 的并集
+            master_index_df = pd.concat(pairs, ignore_index=True).drop_duplicates().reset_index(drop=True)
+
+            # 规范化类型与排序（可选）
+            master_index_df['station_id'] = master_index_df['station_id'].astype(str)
+            master_index_df['date'] = pd.to_datetime(master_index_df['date']).dt.strftime('%Y-%m-%d')
+
+            # 2. 以 master_index_df 为基础，先合并静态特征（按 station_id）
+            master = master_index_df.copy()
+            if static_combined is not None and not static_combined.empty:
+                # 确保静态表 station_id 为字符串
+                static_combined = static_combined.copy()
+                if 'station_id' in static_combined.columns:
+                    static_combined['station_id'] = static_combined['station_id'].astype(str)
+                    # 去除重复 station_id 保证一条静态记录
+                    static_one = static_combined.drop_duplicates(subset=['station_id'])
+                    master = master.merge(static_one, on='station_id', how='left')
+                else:
+                    self.logger.warning("_build_master_from_union: static_combined 缺少 station_id 列，跳过静态合并")
+
+            # 3. 把每个动态源的特征按 (station_id, date) 左连接到 master
+            for name, df in dynamic_dfs:
+                df_copy = df.copy()
+                df_copy['station_id'] = df_copy['station_id'].astype(str)
+                if 'date' in df_copy.columns:
+                    # 统一日期格式为 YYYY-MM-DD 字符串，防止匹配失败
+                    df_copy['date'] = pd.to_datetime(df_copy['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                # 取出非 id/date 的列作为特征
+                feature_cols = [c for c in df_copy.columns if c not in ['station_id', 'date']]
+                if not feature_cols:
+                    continue
+                # 为避免列名冲突，给列加上前缀（源名）
+                prefixed = df_copy[['station_id', 'date'] + feature_cols].copy()
+                # 如果源名是可读的，保留；否则使用 name
+                new_col_mapping = {col: f"{name}_{col}" for col in feature_cols}
+                prefixed = prefixed.rename(columns=new_col_mapping)
+                # 去重以防止重复 (station_id, date, feature...)
+                prefixed = prefixed.drop_duplicates(subset=['station_id', 'date'])
+                master = master.merge(prefixed, on=['station_id', 'date'], how='left')
+
+            # 4. 若提供了 swe_df，但你希望保留其原始列名 'swe'，则合并并重命名
+            if swe_df is not None and not swe_df.empty:
+                swe_copy = swe_df.copy()
+                swe_copy['station_id'] = swe_copy['station_id'].astype(str)
+                swe_copy['date'] = pd.to_datetime(swe_copy['date'], errors='coerce').dt.strftime('%Y-%m-%d')
+                # 假定 swe_df 已经被重命名为 'swe' 列；如果不是，请在调用前重命名
+                if 'swe' not in swe_copy.columns:
+                    # 尝试查找可能的swe列
+                    possible = [c for c in swe_copy.columns if 'swe' in c.lower()]
+                    if possible:
+                        swe_copy = swe_copy.rename(columns={possible[0]: 'swe'})
+                swe_copy = swe_copy[['station_id', 'date', 'swe']].drop_duplicates(subset=['station_id', 'date'])
+                master = master.merge(swe_copy, on=['station_id', 'date'], how='left')
+
+            # 5. 排序并返回
+            master = master.sort_values(['station_id', 'date']).reset_index(drop=True)
+            self.logger.info(f"_build_master_from_union: master 行数={len(master)} (由动态源+SWE并集构建)")
+            return master
+
+        except Exception as e:
+            self.logger.error(f"_build_master_from_union 失败: {e}")
+            self.logger.debug(traceback.format_exc())
+            return pd.DataFrame()
 
     def _export_time_statistics(self, time_statistics, output_dir):
         """导出时间统计信息到Excel文件

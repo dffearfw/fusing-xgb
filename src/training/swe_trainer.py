@@ -112,11 +112,12 @@ class SWEXGBoostTrainer:
             self.logger.info(f"删除 {removed_count} 个SWE为空值的样本")
         self.logger.info(f"剩余有效样本: {len(df_clean)} 行")
 
-        # 处理landuse哈希特征
+        # 处理landuse哈希特征 - 合并为单个向量特征
         df_clean = self._process_landuse_features(df_clean)
 
-        # 确定特征列（排除station_id, date, swe和原始的landuse_hash列）
-        exclude_columns = ['station_id', 'date', self.target_column]
+        # 确定特征列（排除station_id, date, swe、原始的landuse_hash列和hydrological_doy）
+        exclude_columns = ['station_id', 'date', self.target_column, 'hydrological_doy']
+
         # 排除原始的landuse_hash列
         original_landuse_columns = [col for col in df_clean.columns if col.startswith('landuse_hash_')]
         exclude_columns.extend(original_landuse_columns)
@@ -127,13 +128,13 @@ class SWEXGBoostTrainer:
             raise ValueError("没有找到可用的特征列")
 
         self.logger.info(f"使用 {len(self.feature_columns)} 个特征")
-        self.logger.info(f"特征列表前10个: {self.feature_columns[:10]}")
+        self.logger.info(f"特征列表: {self.feature_columns}")
 
         # 准备特征和目标变量
         X = df_clean[self.feature_columns].copy()
         y = df_clean[self.target_column].copy()
 
-        # 处理特征缺失值 - 确保X和y长度一致
+        # 处理特征缺失值
         X_processed = self._handle_missing_values(X)
 
         # 重要：确保X和y的长度一致
@@ -155,6 +156,9 @@ class SWEXGBoostTrainer:
         if len(X_processed) != len(y) or len(X_processed) != len(station_groups):
             raise ValueError(f"数据长度不一致: X={len(X_processed)}, y={len(y)}, station_groups={len(station_groups)}")
 
+        # 准备特征用于训练（处理landuse向量特征）
+        X_final = self._prepare_features_for_training(X_processed)
+
         # 统计信息
         station_count = len(np.unique(station_groups))
         year_count = len(np.unique(year_groups))
@@ -162,17 +166,23 @@ class SWEXGBoostTrainer:
         swe_std = y.std()
 
         self.logger.info("✅ 数据预处理完成")
-        self.logger.info(f"  📊 样本数: {len(X_processed)}")
-        self.logger.info(f"  🔧 特征数: {len(self.feature_columns)}")
+        self.logger.info(f"  📊 样本数: {len(X_final)}")
+        self.logger.info(f"  🔧 特征数: {X_final.shape[1]}")
         self.logger.info(f"  📍 站点数: {station_count}")
         self.logger.info(f"  📅 年份数: {year_count}")
         self.logger.info(f"  ❄️  SWE统计: 均值={swe_mean:.2f}mm, 标准差={swe_std:.2f}mm")
 
-        # 返回numpy数组
-        return X_processed.values, y.values, station_groups, year_groups
+        return X_final, y.values, station_groups, year_groups
 
     def _process_landuse_features(self, df):
-        """处理landuse哈希特征"""
+        """处理landuse哈希特征，将多个哈希列合并为单个向量特征
+
+        Args:
+            df (pd.DataFrame): 原始数据
+
+        Returns:
+            pd.DataFrame: 处理后的数据
+        """
         self.logger.info("处理landuse哈希特征...")
 
         # 找出所有的landuse_hash列
@@ -197,7 +207,8 @@ class SWEXGBoostTrainer:
                 self.logger.info(f"转换 {col} 为数值类型")
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # 创建landuse向量特征
+        # 创建landuse向量特征 - 使用字符串连接的方式表示向量
+        # 这样避免在DataFrame中存储numpy数组
         landuse_vectors = []
 
         for idx, row in df.iterrows():
@@ -212,29 +223,69 @@ class SWEXGBoostTrainer:
                         vector.append(float(value))
                     except (ValueError, TypeError):
                         vector.append(0.0)
-            landuse_vectors.append(vector)
+            # 将向量转换为字符串表示，避免numpy数组
+            vector_str = ','.join(map(str, vector))
+            landuse_vectors.append(vector_str)
 
-        # 将向量转换为numpy数组
-        landuse_array = np.array(landuse_vectors)
-
-        # 为每个landuse向量元素创建单独的特征列
-        for i in range(landuse_array.shape[1]):
-            df[f'landuse_vec_{i}'] = landuse_array[:, i]
-
-        # 创建统计特征
-        df['landuse_mean'] = np.mean(landuse_array, axis=1)
-        df['landuse_std'] = np.std(landuse_array, axis=1)
-        df['landuse_sum'] = np.sum(landuse_array, axis=1)
-        df['landuse_max'] = np.max(landuse_array, axis=1)
-        df['landuse_min'] = np.min(landuse_array, axis=1)
+        # 添加landuse向量特征
+        df['landuse_vector'] = landuse_vectors
 
         self.logger.info(f"✅ landuse特征处理完成")
-        self.logger.info(f"  创建了 {landuse_array.shape[1]} 个向量元素特征和5个统计特征")
+        self.logger.info(f"  创建了1个landuse向量特征（字符串表示）")
 
         return df
 
+    def _prepare_features_for_training(self, X_processed):
+        """准备特征用于训练，处理landuse向量特征
+
+        Args:
+            X_processed (pd.DataFrame): 处理后的特征数据
+
+        Returns:
+            np.array: 适合训练的特征矩阵
+        """
+        self.logger.info("准备特征用于训练...")
+
+        # 检查是否有landuse_vector特征
+        if 'landuse_vector' in X_processed.columns:
+            self.logger.info("处理landuse_vector特征...")
+
+            # 分离landuse向量特征和其他特征
+            non_vector_cols = [col for col in X_processed.columns if col != 'landuse_vector']
+            vector_col = 'landuse_vector'
+
+            # 处理非向量特征
+            if non_vector_cols:
+                non_vector_data = X_processed[non_vector_cols].values
+            else:
+                non_vector_data = np.empty((len(X_processed), 0))
+
+            # 处理landuse向量特征 - 将字符串向量转换为数值数组
+            vector_data_list = []
+            for vector_str in X_processed[vector_col]:
+                # 将字符串转换回数值数组
+                vector_values = [float(x) for x in vector_str.split(',')]
+                vector_data_list.append(vector_values)
+
+            vector_data = np.array(vector_data_list)
+
+            # 合并非向量特征和向量特征
+            final_features = np.hstack([non_vector_data, vector_data]) if non_vector_cols else vector_data
+
+            self.logger.info(f"特征矩阵形状: {final_features.shape}")
+            self.logger.info(f"  - 非向量特征: {non_vector_data.shape[1] if non_vector_cols else 0}")
+            self.logger.info(f"  - landuse向量特征: {vector_data.shape[1]}个元素")
+
+        else:
+            # 没有向量特征，直接返回数值
+            final_features = X_processed.values
+            self.logger.info(f"特征矩阵形状: {final_features.shape}")
+            self.logger.info("没有找到landuse_vector特征")
+
+        return final_features
+
     def _handle_missing_values(self, X):
-        """处理特征缺失值，确保不改变数据长度"""
+        """处理特征缺失值，支持landuse向量特征"""
         self.logger.info("处理特征缺失值...")
 
         initial_missing = X.isna().sum().sum()
@@ -245,35 +296,35 @@ class SWEXGBoostTrainer:
         X_processed = X.copy()
         initial_length = len(X_processed)
 
-        # 记录每列的缺失情况
-        missing_info = X_processed.isna().sum()
-        cols_with_missing = missing_info[missing_info > 0]
-
-        if len(cols_with_missing) > 0:
-            self.logger.info(f"发现 {len(cols_with_missing)} 个特征有缺失值")
-
-            # 对于缺失值过多的列，考虑删除
-            high_missing_cols = missing_info[missing_info > 0.5 * len(X_processed)].index
-            if len(high_missing_cols) > 0:
-                self.logger.warning(f"删除缺失值超过50%的特征: {list(high_missing_cols)}")
-                X_processed = X_processed.drop(columns=high_missing_cols)
-                # 更新特征列
-                self.feature_columns = [col for col in self.feature_columns if col not in high_missing_cols]
-
-        # 处理数值特征
+        # 处理数值特征（不包括landuse_vector）
         numeric_cols = X_processed.select_dtypes(include=[np.number]).columns
+        # 排除landuse_vector列
+        numeric_cols = [col for col in numeric_cols if col != 'landuse_vector']
+
         if len(numeric_cols) > 0:
             for col in numeric_cols:
                 if X_processed[col].isna().sum() > 0:
-                    # 使用中位数填充，而不是删除行
+                    # 使用中位数填充
                     median_val = X_processed[col].median()
                     if pd.isna(median_val):  # 如果中位数也是NaN，用0填充
                         median_val = 0
                     X_processed[col] = X_processed[col].fillna(median_val)
                     self.logger.debug(f"填充数值特征 '{col}' 的缺失值")
 
+        # 处理landuse_vector特征的缺失值
+        if 'landuse_vector' in X_processed.columns:
+            na_mask = X_processed['landuse_vector'].isna()
+            if na_mask.any():
+                self.logger.info(f"处理landuse_vector特征的缺失值")
+                # 用零向量字符串填充缺失值
+                zero_vector_str = ','.join(['0.0'] * 10)  # 假设有10个landuse_hash特征
+                X_processed.loc[na_mask, 'landuse_vector'] = zero_vector_str
+
         # 分类特征处理
         categorical_cols = X_processed.select_dtypes(include=['object']).columns
+        # 排除landuse_vector列（它是对象类型但需要特殊处理）
+        categorical_cols = [col for col in categorical_cols if col != 'landuse_vector']
+
         for col in categorical_cols:
             if X_processed[col].isna().sum() > 0:
                 if len(X_processed[col].mode()) > 0:
@@ -290,15 +341,10 @@ class SWEXGBoostTrainer:
         remaining_missing = X_processed.isna().sum().sum()
         if remaining_missing > 0:
             self.logger.warning(f"仍有 {remaining_missing} 个缺失值，将删除包含缺失值的行")
-            # 只删除包含缺失值的行，而不是全部
             X_processed = X_processed.dropna()
             removed_rows = initial_length - len(X_processed)
             if removed_rows > 0:
                 self.logger.info(f"删除了 {removed_rows} 行包含缺失值的数据")
-
-        final_length = len(X_processed)
-        if final_length != initial_length:
-            self.logger.info(f"数据长度变化: {initial_length} -> {final_length}")
 
         return X_processed
 
@@ -1352,18 +1398,37 @@ class SWEXGBoostTrainer:
             raise
 
     def get_feature_importance(self):
-        """获取特征重要性"""
+        """获取特征重要性，将landuse向量特征作为一个整体"""
         if self.model is None:
             raise ValueError("模型尚未训练，请先调用 train_final_model 方法")
 
         importance_scores = self.model.feature_importances_
 
+        # 计算landuse向量特征的总重要性
+        # 假设landuse向量是最后10个特征（根据landuse_hash列的数量）
+        landuse_vector_length = 10  # 根据实际情况调整
+        total_features = len(importance_scores)
+
+        # landuse向量特征的重要性是最后landuse_vector_length个特征的和
+        landuse_importance = np.sum(importance_scores[-landuse_vector_length:])
+
+        # 其他特征的重要性
+        other_importance = importance_scores[:-landuse_vector_length]
+
+        # 构建特征名称
+        other_feature_names = [col for col in self.feature_columns if col != 'landuse_vector']
+        feature_names = other_feature_names + ['landuse_vector']
+
+        importance_values = list(other_importance) + [landuse_importance]
+
         feature_importance_df = pd.DataFrame({
-            'feature': self.feature_columns,
-            'importance': importance_scores
+            'feature': feature_names,
+            'importance': importance_values
         }).sort_values('importance', ascending=False)
 
-        self.logger.info(f"特征重要性计算完成，最高重要性: {feature_importance_df['importance'].iloc[0]:.4f}")
+        self.logger.info(f"特征重要性计算完成")
+        self.logger.info(f"  landuse向量总重要性: {landuse_importance:.6f}")
+        self.logger.info(f"  最高重要性: {feature_importance_df['importance'].iloc[0]:.4f}")
 
         return feature_importance_df
 
