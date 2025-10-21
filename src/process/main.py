@@ -9,9 +9,8 @@ import logging
 import traceback
 from datetime import datetime
 from pathlib import Path
-import pandas as pd
 from config import config
-from integration import DataIntegrator
+from src.process.integration.integration import DataIntegrator
 from utils.security import SecureProcessor
 from utils.logging_setup import setup_logging
 
@@ -83,7 +82,7 @@ def validate_date(date_input):
 def show_time_statistics():
     """显示数据库时间统计信息"""
     try:
-        from src.process.integration import DataIntegrator
+        from src.process.integration.integration import DataIntegrator
 
         integrator = DataIntegrator('./output')
         time_stats = integrator.extract_time_info()
@@ -398,8 +397,8 @@ def main():
 
         # 确定要处理的数据源
         if 'all' in args.sources:
-            sources_to_process = ['snow_phenology','glsnow','cswe','snow_depth','era5_temperature','era5_swe','landuse'
-                                    ]  # 默认处理所有源,'landcover','terrain_features'
+            sources_to_process = ['snow_phenology','glsnow','cswe','snow_depth','era5_temperature','era5_swe','landuse','terrain_features'
+                                    ]  # 默认处理所有源,'landcover'
             logger.info("🌍 处理所有可用数据源")
         else:
             sources_to_process = args.sources
