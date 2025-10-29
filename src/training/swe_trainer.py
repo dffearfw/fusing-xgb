@@ -53,46 +53,6 @@ class SWEXGBoostTrainer:
         self.logger.info(f"初始化SWE XGBoost训练器")
         self.logger.info(f"模型参数: {self.params}")
 
-    def validate_data(self, df):
-        """验证输入数据
-
-        Args:
-            df (pd.DataFrame): 输入数据
-
-        Raises:
-            ValueError: 数据验证失败时抛出
-        """
-        self.logger.info("验证输入数据...")
-
-        # 检查DataFrame类型
-        if not isinstance(df, pd.DataFrame):
-            raise ValueError("输入数据必须是pandas DataFrame")
-
-        # 检查必要列
-        required_columns = ['station_id', 'date', self.target_column]
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            raise ValueError(f"缺少必要列: {missing_columns}")
-
-        # 检查目标变量
-        swe_na_count = df[self.target_column].isna().sum()
-        swe_total_count = len(df)
-        if swe_na_count == swe_total_count:
-            raise ValueError(f"{self.target_column}列全部为空值")
-
-        self.logger.info(f"SWE数据完整性: {swe_total_count - swe_na_count}/{swe_total_count} 有效")
-
-        # 检查样本数量
-        if len(df) < 10:
-            raise ValueError(f"样本数量太少 ({len(df)})，至少需要10个样本")
-
-        # 检查站点数量
-        station_count = df['station_id'].nunique()
-        if station_count < 2:
-            raise ValueError(f"站点数量太少 ({station_count})，至少需要2个站点")
-
-        self.logger.info(f"✅ 数据验证通过: {len(df)} 行, {len(df.columns)} 列, {station_count} 个站点")
-
     def preprocess_data(self, df):
         """数据预处理"""
         self.logger.info("开始数据预处理...")
@@ -103,24 +63,31 @@ class SWEXGBoostTrainer:
         # 创建数据副本
         df_clean = df.copy()
 
-        # 删除目标变量为空的样本
+        # 记录初始样本数
         initial_count = len(df_clean)
-        df_clean = df_clean.dropna(subset=[self.target_column]).copy()
-        removed_count = initial_count - len(df_clean)
+        self.logger.info(f"初始样本数: {initial_count} 行")
 
-        if removed_count > 0:
-            self.logger.info(f"删除 {removed_count} 个SWE为空值的样本")
-        self.logger.info(f"剩余有效样本: {len(df_clean)} 行")
+        # 对于CSWE特征，将无效值设为NaN让XGBoost处理
+        if 'cswe' in df_clean.columns:
+            cswe_invalid_mask = df_clean['cswe'] > 200
+            cswe_invalid_count = cswe_invalid_mask.sum()
+            if cswe_invalid_count > 0:
+                self.logger.info(f"发现 {cswe_invalid_count} 个CSWE大于200mm的值，将作为缺失值由XGBoost处理")
+                # 将这些无效值设为NaN，让XGBoost处理
+                df_clean.loc[cswe_invalid_mask, 'cswe'] = np.nan
 
-        # 处理landuse哈希特征 - 合并为单个向量特征
+        # 处理landuse独热编码特征
         df_clean = self._process_landuse_features(df_clean)
 
-        # 确定特征列（排除station_id, date, swe、原始的landuse_hash列和hydrological_doy）
+        # 统计站点样本数量
+        self._analyze_station_samples(df_clean)
+
+        # 确定特征列（排除station_id, date, swe、hydrological_doy和原始的landuse_hash列）
         exclude_columns = ['station_id', 'date', self.target_column, 'hydrological_doy']
 
-        # 排除原始的landuse_hash列
-        original_landuse_columns = [col for col in df_clean.columns if col.startswith('landuse_hash_')]
-        exclude_columns.extend(original_landuse_columns)
+        # 排除原始的landuse_hash列（如果存在）
+        original_landuse_hash_columns = [col for col in df_clean.columns if col.startswith('landuse_hash_')]
+        exclude_columns.extend(original_landuse_hash_columns)
 
         self.feature_columns = [col for col in df_clean.columns if col not in exclude_columns]
 
@@ -128,36 +95,28 @@ class SWEXGBoostTrainer:
             raise ValueError("没有找到可用的特征列")
 
         self.logger.info(f"使用 {len(self.feature_columns)} 个特征")
-        self.logger.info(f"特征列表: {self.feature_columns}")
+
+        # 检查缺失值情况
+        total_missing = df_clean[self.feature_columns].isna().sum().sum()
+        if total_missing > 0:
+            self.logger.info(f"特征数据中存在 {total_missing} 个缺失值，将由XGBoost自动处理")
+
+        # 检查目标变量缺失值
+        target_missing = df_clean[self.target_column].isna().sum()
+        if target_missing > 0:
+            self.logger.info(f"目标变量中存在 {target_missing} 个缺失值，将保留这些样本让XGBoost处理")
 
         # 准备特征和目标变量
         X = df_clean[self.feature_columns].copy()
         y = df_clean[self.target_column].copy()
 
-        # 处理特征缺失值
+        # 简化缺失值处理（主要依赖XGBoost）
         X_processed = self._handle_missing_values(X)
-
-        # 重要：确保X和y的长度一致
-        if len(X_processed) != len(y):
-            self.logger.warning(f"特征和目标变量长度不一致: X={len(X_processed)}, y={len(y)}")
-            # 找到共同的索引
-            common_idx = X_processed.index.intersection(y.index)
-            X_processed = X_processed.loc[common_idx]
-            y = y.loc[common_idx]
-            self.logger.info(f"对齐后: X={len(X_processed)}, y={len(y)}")
 
         # 准备分组信息
         df_clean['year'] = pd.to_datetime(df_clean['date']).dt.year
-        # 确保分组信息与处理后的数据对齐
-        station_groups = df_clean.loc[X_processed.index, 'station_id'].values
-        year_groups = df_clean.loc[X_processed.index, 'year'].values
-
-        # 最终检查
-        if len(X_processed) != len(y) or len(X_processed) != len(station_groups):
-            raise ValueError(f"数据长度不一致: X={len(X_processed)}, y={len(y)}, station_groups={len(station_groups)}")
-
-        # 准备特征用于训练（处理landuse向量特征）
-        X_final = self._prepare_features_for_training(X_processed)
+        station_groups = df_clean['station_id'].values
+        year_groups = df_clean['year'].values
 
         # 统计信息
         station_count = len(np.unique(station_groups))
@@ -166,16 +125,81 @@ class SWEXGBoostTrainer:
         swe_std = y.std()
 
         self.logger.info("✅ 数据预处理完成")
-        self.logger.info(f"  📊 样本数: {len(X_final)}")
-        self.logger.info(f"  🔧 特征数: {X_final.shape[1]}")
+        self.logger.info(f"  📊 样本数: {len(X_processed)}")
+        self.logger.info(f"  🔧 特征数: {len(self.feature_columns)}")
         self.logger.info(f"  📍 站点数: {station_count}")
         self.logger.info(f"  📅 年份数: {year_count}")
         self.logger.info(f"  ❄️  SWE统计: 均值={swe_mean:.2f}mm, 标准差={swe_std:.2f}mm")
 
-        return X_final, y.values, station_groups, year_groups
+        # 直接返回数值数组，缺失值用NaN表示，XGBoost会处理
+        return X_processed.values, y.values, station_groups, year_groups
+
+    def _analyze_station_samples(self, df):
+        """分析站点样本数量，特别关注样本数少的站点
+
+        Args:
+            df (pd.DataFrame): 数据
+        """
+        self.logger.info("分析站点样本数量...")
+
+        # 统计每个站点的样本数量
+        station_counts = df['station_id'].value_counts().sort_values()
+
+        # 统计不同样本数量的站点分布
+        count_ranges = {
+            '1 sample': (station_counts == 1).sum(),
+            '2 samples': (station_counts == 2).sum(),
+            '3 samples': (station_counts == 3).sum(),
+            '4-10 samples': ((station_counts >= 4) & (station_counts <= 10)).sum(),
+            '11-50 samples': ((station_counts >= 11) & (station_counts <= 50)).sum(),
+            '51-100 samples': ((station_counts >= 51) & (station_counts <= 100)).sum(),
+            '>100 samples': (station_counts > 100).sum()
+        }
+
+        self.logger.info("站点样本数量分布:")
+        for range_name, count in count_ranges.items():
+            self.logger.info(f"  {range_name}: {count} 个站点")
+
+        # 特别关注样本数小于等于3的站点
+        small_stations = station_counts[station_counts <= 3]
+
+        if len(small_stations) > 0:
+            self.logger.info(f"\n📋 样本数小于等于3个的站点 (共{len(small_stations)}个):")
+
+            # 按样本数量分组显示
+            for sample_count in [1, 2, 3]:
+                stations_with_count = small_stations[small_stations == sample_count]
+                if len(stations_with_count) > 0:
+                    self.logger.info(
+                        f"  {sample_count}个样本的站点 ({len(stations_with_count)}个): {list(stations_with_count.index)}")
+
+            # 计算这些站点的总样本数
+            total_small_samples = small_stations.sum()
+            self.logger.info(f"  这些站点的总样本数: {total_small_samples}")
+
+            # 计算占比
+            total_stations = len(station_counts)
+            total_samples = len(df)
+            small_stations_ratio = len(small_stations) / total_stations * 100
+            small_samples_ratio = total_small_samples / total_samples * 100
+
+            self.logger.info(f"  小样本站点占比: {small_stations_ratio:.1f}% ({len(small_stations)}/{total_stations})")
+            self.logger.info(f"  小样本数据占比: {small_samples_ratio:.1f}% ({total_small_samples}/{total_samples})")
+
+        else:
+            self.logger.info("没有发现样本数小于等于3个的站点")
+
+        # 显示总体统计
+        self.logger.info(f"\n📊 站点样本总体统计:")
+        self.logger.info(f"  总站点数: {len(station_counts)}")
+        self.logger.info(f"  总样本数: {len(df)}")
+        self.logger.info(f"  平均每个站点样本数: {len(df) / len(station_counts):.1f}")
+        self.logger.info(f"  最小样本数: {station_counts.min()}")
+        self.logger.info(f"  最大样本数: {station_counts.max()}")
+        self.logger.info(f"  中位数样本数: {station_counts.median()}")
 
     def _process_landuse_features(self, df):
-        """处理landuse哈希特征，将多个哈希列合并为单个向量特征
+        """处理landuse独热编码特征
 
         Args:
             df (pd.DataFrame): 原始数据
@@ -183,110 +207,46 @@ class SWEXGBoostTrainer:
         Returns:
             pd.DataFrame: 处理后的数据
         """
-        self.logger.info("处理landuse哈希特征...")
+        self.logger.info("处理landuse独热编码特征...")
 
-        # 找出所有的landuse_hash列
-        landuse_columns = [col for col in df.columns if col.startswith('landuse_hash_')]
+        # 找出所有的landuse独热编码列
+        landuse_columns = [col for col in df.columns if
+                           col.startswith('landuse_') and not col.startswith('landuse_hash_')]
 
         if not landuse_columns:
-            self.logger.warning("未找到landuse_hash特征列")
+            self.logger.warning("未找到landuse独热编码特征列")
             return df
 
-        self.logger.info(f"找到 {len(landuse_columns)} 个landuse哈希特征")
+        self.logger.info(f"找到 {len(landuse_columns)} 个landuse独热编码特征")
 
-        # 检查landuse列的数据类型
+        # 检查landuse列的数据类型和统计信息
         for col in landuse_columns:
             unique_count = df[col].nunique()
             na_count = df[col].isna().sum()
             dtype = df[col].dtype
             self.logger.debug(f"  {col}: 类型={dtype}, 唯一值={unique_count}, 缺失值={na_count}")
 
-        # 确保所有landuse列都是数值类型
+        # 确保所有landuse列都是数值类型（独热编码应该是0/1）
         for col in landuse_columns:
             if not pd.api.types.is_numeric_dtype(df[col]):
                 self.logger.info(f"转换 {col} 为数值类型")
                 df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # 创建landuse向量特征 - 使用字符串连接的方式表示向量
-        # 这样避免在DataFrame中存储numpy数组
-        landuse_vectors = []
-
-        for idx, row in df.iterrows():
-            vector = []
-            for col in landuse_columns:
-                value = row[col]
-                # 处理缺失值，用0填充
-                if pd.isna(value):
-                    vector.append(0.0)
-                else:
-                    try:
-                        vector.append(float(value))
-                    except (ValueError, TypeError):
-                        vector.append(0.0)
-            # 将向量转换为字符串表示，避免numpy数组
-            vector_str = ','.join(map(str, vector))
-            landuse_vectors.append(vector_str)
-
-        # 添加landuse向量特征
-        df['landuse_vector'] = landuse_vectors
-
-        self.logger.info(f"✅ landuse特征处理完成")
-        self.logger.info(f"  创建了1个landuse向量特征（字符串表示）")
+        self.logger.info(f"✅ landuse独热编码特征处理完成")
+        self.logger.info(f"  保留了 {len(landuse_columns)} 个landuse独热编码特征")
 
         return df
 
-    def _prepare_features_for_training(self, X_processed):
-        """准备特征用于训练，处理landuse向量特征
+    def _handle_missing_values(self, X):
+        """简化缺失值处理，主要依赖XGBoost内置机制
 
         Args:
-            X_processed (pd.DataFrame): 处理后的特征数据
+            X (pd.DataFrame): 特征数据
 
         Returns:
-            np.array: 适合训练的特征矩阵
+            pd.DataFrame: 处理后的特征数据
         """
-        self.logger.info("准备特征用于训练...")
-
-        # 检查是否有landuse_vector特征
-        if 'landuse_vector' in X_processed.columns:
-            self.logger.info("处理landuse_vector特征...")
-
-            # 分离landuse向量特征和其他特征
-            non_vector_cols = [col for col in X_processed.columns if col != 'landuse_vector']
-            vector_col = 'landuse_vector'
-
-            # 处理非向量特征
-            if non_vector_cols:
-                non_vector_data = X_processed[non_vector_cols].values
-            else:
-                non_vector_data = np.empty((len(X_processed), 0))
-
-            # 处理landuse向量特征 - 将字符串向量转换为数值数组
-            vector_data_list = []
-            for vector_str in X_processed[vector_col]:
-                # 将字符串转换回数值数组
-                vector_values = [float(x) for x in vector_str.split(',')]
-                vector_data_list.append(vector_values)
-
-            vector_data = np.array(vector_data_list)
-
-            # 合并非向量特征和向量特征
-            final_features = np.hstack([non_vector_data, vector_data]) if non_vector_cols else vector_data
-
-            self.logger.info(f"特征矩阵形状: {final_features.shape}")
-            self.logger.info(f"  - 非向量特征: {non_vector_data.shape[1] if non_vector_cols else 0}")
-            self.logger.info(f"  - landuse向量特征: {vector_data.shape[1]}个元素")
-
-        else:
-            # 没有向量特征，直接返回数值
-            final_features = X_processed.values
-            self.logger.info(f"特征矩阵形状: {final_features.shape}")
-            self.logger.info("没有找到landuse_vector特征")
-
-        return final_features
-
-    def _handle_missing_values(self, X):
-        """处理特征缺失值，支持landuse向量特征"""
-        self.logger.info("处理特征缺失值...")
+        self.logger.info("简化缺失值处理，主要依赖XGBoost内置机制...")
 
         initial_missing = X.isna().sum().sum()
         if initial_missing == 0:
@@ -294,59 +254,150 @@ class SWEXGBoostTrainer:
             return X
 
         X_processed = X.copy()
-        initial_length = len(X_processed)
 
-        # 处理数值特征（不包括landuse_vector）
-        numeric_cols = X_processed.select_dtypes(include=[np.number]).columns
-        # 排除landuse_vector列
-        numeric_cols = [col for col in numeric_cols if col != 'landuse_vector']
-
-        if len(numeric_cols) > 0:
-            for col in numeric_cols:
-                if X_processed[col].isna().sum() > 0:
-                    # 使用中位数填充
-                    median_val = X_processed[col].median()
-                    if pd.isna(median_val):  # 如果中位数也是NaN，用0填充
-                        median_val = 0
-                    X_processed[col] = X_processed[col].fillna(median_val)
-                    self.logger.debug(f"填充数值特征 '{col}' 的缺失值")
-
-        # 处理landuse_vector特征的缺失值
-        if 'landuse_vector' in X_processed.columns:
-            na_mask = X_processed['landuse_vector'].isna()
-            if na_mask.any():
-                self.logger.info(f"处理landuse_vector特征的缺失值")
-                # 用零向量字符串填充缺失值
-                zero_vector_str = ','.join(['0.0'] * 10)  # 假设有10个landuse_hash特征
-                X_processed.loc[na_mask, 'landuse_vector'] = zero_vector_str
-
-        # 分类特征处理
+        # 只处理分类特征，数值特征的缺失值留给XGBoost处理
         categorical_cols = X_processed.select_dtypes(include=['object']).columns
-        # 排除landuse_vector列（它是对象类型但需要特殊处理）
-        categorical_cols = [col for col in categorical_cols if col != 'landuse_vector']
 
         for col in categorical_cols:
             if X_processed[col].isna().sum() > 0:
-                if len(X_processed[col].mode()) > 0:
-                    fill_value = X_processed[col].mode()[0]
-                else:
-                    fill_value = 'missing'
-                X_processed[col] = X_processed[col].fillna(fill_value)
-                self.logger.debug(f"填充分类特征 '{col}' 的缺失值")
+                # 用'missing'填充，让XGBoost学习如何处理
+                X_processed[col] = X_processed[col].fillna('missing')
 
             # 转换为数值编码
             X_processed[col] = X_processed[col].astype('category').cat.codes
 
-        # 检查是否还有缺失值
-        remaining_missing = X_processed.isna().sum().sum()
-        if remaining_missing > 0:
-            self.logger.warning(f"仍有 {remaining_missing} 个缺失值，将删除包含缺失值的行")
-            X_processed = X_processed.dropna()
-            removed_rows = initial_length - len(X_processed)
-            if removed_rows > 0:
-                self.logger.info(f"删除了 {removed_rows} 行包含缺失值的数据")
+        self.logger.info(f"剩余缺失值数量: {X_processed.isna().sum().sum()} (将由XGBoost处理)")
 
         return X_processed
+
+    def _create_swe_products_comparison(self, df, output_dir):
+        """创建其他SWE产品与实测值的对比散点图
+
+        Args:
+            df (pd.DataFrame): 原始数据
+            output_dir (str): 输出目录路径
+        """
+        try:
+            self.logger.info("📊 生成SWE产品对比散点图...")
+
+            # 定义要对比的SWE产品列
+            swe_products = ['cswe', 'era5_swe', 'glsnow', 'gldas']
+
+            # 检查数据中是否存在这些列
+            available_products = [col for col in swe_products if col in df.columns]
+            missing_products = [col for col in swe_products if col not in df.columns]
+
+            if missing_products:
+                self.logger.warning(f"以下SWE产品列不存在: {missing_products}")
+
+            if not available_products:
+                self.logger.warning("没有找到可用的SWE产品列进行对比")
+                return
+
+            self.logger.info(f"将对比以下SWE产品: {available_products}")
+
+            # 设置图形样式
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'Arial']
+            plt.rcParams['axes.unicode_minus'] = False
+            sns.set_style("whitegrid")
+
+            # 创建子图
+            n_products = len(available_products)
+            n_cols = min(2, n_products)
+            n_rows = (n_products + n_cols - 1) // n_cols
+
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+            if n_products == 1:
+                axes = [axes]
+            elif n_rows > 1 and n_cols > 1:
+                axes = axes.flatten()
+
+            # 为每个SWE产品创建散点图
+            for i, product in enumerate(available_products):
+                if i < len(axes):
+                    ax = axes[i]
+                    self._plot_single_swe_product_comparison(ax, df, product)
+
+            # 隐藏多余的子图
+            for i in range(len(available_products), len(axes)):
+                axes[i].set_visible(False)
+
+            # 调整布局
+            plt.tight_layout()
+
+            # 保存图片
+            comparison_path = f'{output_dir}/swe_products_comparison.png'
+            plt.savefig(comparison_path, dpi=300, bbox_inches='tight')
+            plt.close()
+
+            self.logger.info(f"✅ SWE产品对比图保存: {comparison_path}")
+
+        except Exception as e:
+            self.logger.warning(f"生成SWE产品对比图失败: {str(e)}")
+
+    def _plot_single_swe_product_comparison(self, ax, df, product_col):
+        """绘制单个SWE产品与实测值的对比散点图"""
+        # 移除NaN值和无效值
+        if product_col == 'cswe':
+            mask = (~np.isnan(df[self.target_column]) &
+                    ~np.isnan(df[product_col]) &
+                    (df[product_col] <= 200))
+        else:
+            mask = (~np.isnan(df[self.target_column]) &
+                    ~np.isnan(df[product_col]))
+
+        y_true = df[self.target_column][mask]
+        y_product = df[product_col][mask]
+
+        if len(y_true) == 0:
+            ax.text(0.5, 0.5, 'No valid data', ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            ax.set_title(f'{product_col.upper()} vs Observed SWE')
+            return
+
+        # 设置坐标轴范围
+        max_range = 175
+        min_val = 0
+        max_val = max_range
+
+        # 1:1 参考线
+        ax.plot([min_val, max_val], [min_val, max_val], 'k-', alpha=0.8, linewidth=2)
+
+        # 散点图
+        ax.scatter(y_true, y_product, alpha=0.6, s=20, c='blue', edgecolors='none')
+
+        # 设置坐标轴
+        ax.set_xlabel('Observed SWE (mm)', fontsize=14)
+        ax.set_ylabel(f'{product_col.upper()} SWE (mm)', fontsize=14)
+        ax.set_title(f'{product_col.upper()} vs Observed SWE', fontsize=14, fontweight='bold')
+        ax.set_xlim([min_val, max_val])
+        ax.set_ylim([min_val, max_val])
+        ax.set_aspect('equal')
+        ax.grid(True, alpha=0.3)
+
+        # 计算评估指标
+        mae = mean_absolute_error(y_true, y_product)
+        rmse = np.sqrt(mean_squared_error(y_true, y_product))
+
+        # 安全计算相关系数
+        def safe_pearsonr(x, y):
+            if len(x) <= 1 or np.all(x == x[0]) or np.all(y == y[0]):
+                return np.nan, np.nan
+            if np.std(x) == 0 or np.std(y) == 0:
+                return np.nan, np.nan
+            try:
+                return pearsonr(x, y)
+            except:
+                return np.nan, np.nan
+
+        r, p_value = safe_pearsonr(y_true, y_product)
+        r_str = f"{r:.3f}" if not np.isnan(r) else "NaN"
+
+        stats_text = f'MAE = {mae:.2f} mm\nRMSE = {rmse:.2f} mm\nR = {r_str}\nN = {len(y_true)}'
+
+        ax.text(0.95, 0.95, stats_text, transform=ax.transAxes,
+                verticalalignment='top', horizontalalignment='right',
+                fontsize=13, fontfamily='monospace', weight='bold',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     def validate_data_consistency(self, X, y, station_groups, year_groups):
         """验证数据一致性"""
@@ -374,6 +425,51 @@ class SWEXGBoostTrainer:
 
         self.logger.info(f"✅ 数据一致性验证通过: 所有数据长度 = {list(unique_lengths)[0]}")
         return True
+
+    def validate_data(self, df):
+        """验证输入数据
+
+        Args:
+            df (pd.DataFrame): 输入数据
+
+        Raises:
+            ValueError: 数据验证失败时抛出
+        """
+        self.logger.info("验证输入数据...")
+
+        # 检查DataFrame类型
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("输入数据必须是pandas DataFrame")
+
+        # 检查必要列
+        required_columns = ['station_id', 'date', self.target_column]
+        missing_columns = [col for col in required_columns if col not in df.columns]
+        if missing_columns:
+            raise ValueError(f"缺少必要列: {missing_columns}")
+
+        # 检查目标变量
+        swe_na_count = df[self.target_column].isna().sum()
+        swe_total_count = len(df)
+
+        # 只是警告，不阻止训练
+        if swe_na_count > 0:
+            self.logger.warning(f"目标变量中有 {swe_na_count} 个缺失值，XGBoost将学习如何处理")
+
+        if swe_na_count == swe_total_count:
+            raise ValueError(f"{self.target_column}列全部为空值，无法训练")
+
+        # 检查CSWE列的无效值（如果存在）
+        if 'cswe' in df.columns:
+            cswe_invalid_count = (df['cswe'] > 200).sum()
+            if cswe_invalid_count > 0:
+                self.logger.info(f"发现 {cswe_invalid_count} 个CSWE大于200mm的值，将作为缺失值由XGBoost处理")
+
+        # 检查站点数量
+        station_count = df['station_id'].nunique()
+        if station_count < 2:
+            raise ValueError(f"站点数量太少 ({station_count})，至少需要2个站点")
+
+        self.logger.info(f"✅ 数据验证通过: {len(df)} 行, {len(df.columns)} 列, {station_count} 个站点")
 
     def evaluate_predictions(self, y_true, y_pred):
         """评估预测结果
@@ -624,17 +720,8 @@ class SWEXGBoostTrainer:
         self.logger.info("✅ 最终模型训练完成")
         return self.model
 
-
     def run_complete_analysis(self, df, output_dir=None):
-        """运行完整分析流程
-
-        Args:
-            df (pd.DataFrame): 输入数据
-            output_dir (str, optional): 输出目录路径
-
-        Returns:
-            dict: 包含所有分析结果的字典
-        """
+        """运行完整分析流程"""
         self.logger.info("=" * 70)
         self.logger.info("🚀 开始SWE XGBoost完整分析流程")
         self.logger.info("=" * 70)
@@ -699,7 +786,14 @@ class SWEXGBoostTrainer:
 
             self._save_results(results, output_dir)
 
-            # 7. 生成报告
+            # 7. 生成SWE产品对比图（使用原始数据）
+            self.logger.info("\n" + "=" * 50)
+            self.logger.info("步骤 7: 生成SWE产品对比图")
+            self.logger.info("=" * 50)
+
+            self._create_swe_products_comparison(df, output_dir)
+
+            # 8. 生成报告
             report = self._generate_report(results)
             print(report)
             self.logger.info("🎯 完整分析完成！")
@@ -710,55 +804,43 @@ class SWEXGBoostTrainer:
             raise
 
     def _create_scatter_plots(self, results, output_dir):
-        """创建两种交叉验证方法的预测值与实际值散点图
-
-        Args:
-            results (dict): 分析结果
-            output_dir (str): 输出目录路径
-        """
+        """创建两种交叉验证方法的预测值与实际值散点图"""
         try:
             self.logger.info("📊 生成散点图...")
 
-            # 设置图形样式
-            plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'Arial']
+            # 设置图形样式 - 使用支持中文的字体
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'Arial']
             plt.rcParams['axes.unicode_minus'] = False
             sns.set_style("whitegrid")
 
-            # 创建子图 - 现在左图是年度CV，右图是站点CV
+            # 创建子图
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
-            # 左图：年度交叉验证散点图（使用中位数指标）
+            # 左图：年度交叉验证散点图
             if 'yearly_cv' in results:
-                # 使用中位数指标
-                median_metrics = results['yearly_cv']['median']
+                overall_metrics = results['yearly_cv']['overall']
                 self._plot_single_scatter(
                     ax1,
                     results['yearly_cv']['true_values'],
                     results['yearly_cv']['predictions'],
-                    median_metrics,  # 使用中位数指标
-                    '年度交叉验证',
-                    '预测 SWE (mm)',
-                    use_median=True  # 添加标记表明使用中位数
+                    overall_metrics,
+                    'Yearly Cross-Validation',  # 使用英文标题
+                    'Predicted SWE (mm)'
                 )
 
-            # 右图：站点交叉验证散点图（使用聚合指标）
+            # 右图：站点交叉验证散点图
             if 'station_cv' in results:
-                # 使用聚合指标
                 overall_metrics = results['station_cv']['overall']
                 self._plot_single_scatter(
                     ax2,
                     results['station_cv']['true_values'],
                     results['station_cv']['predictions'],
-                    overall_metrics,  # 使用聚合指标
-                    '站点交叉验证',
-                    '预测 SWE (mm)',
-                    use_median=False  # 添加标记表明使用聚合值
+                    overall_metrics,
+                    'Station Cross-Validation',  # 使用英文标题
+                    'Predicted SWE (mm)'
                 )
 
-            # 调整布局
             plt.tight_layout()
-
-            # 保存图片
             scatter_path = f'{output_dir}/scatter_plots.png'
             plt.savefig(scatter_path, dpi=300, bbox_inches='tight')
             plt.close()
@@ -768,26 +850,16 @@ class SWEXGBoostTrainer:
         except Exception as e:
             self.logger.warning(f"生成散点图失败: {str(e)}")
 
-    def _plot_single_scatter(self, ax, y_true, y_pred, metrics, title, ylabel, use_median=False):
-        """绘制单个散点图
-
-        Args:
-            ax: matplotlib轴对象
-            y_true: 真实值数组
-            y_pred: 预测值数组
-            metrics: 评估指标字典
-            title: 图标题
-            ylabel: 纵坐标标签
-            use_median: 是否使用中位数指标
-        """
+    def _plot_single_scatter(self, ax, y_true, y_pred, metrics, title, ylabel):
+        """绘制单个散点图"""
         # 移除NaN值
         mask = ~(np.isnan(y_true) | np.isnan(y_pred))
         y_true_clean = y_true[mask]
         y_pred_clean = y_pred[mask]
 
         if len(y_true_clean) == 0:
-            ax.text(0.5, 0.5, '无有效数据', ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(title)
+            ax.text(0.5, 0.5, 'No valid data', ha='center', va='center', transform=ax.transAxes, fontsize=14)
+            ax.set_title(title, fontsize=16)
             return
 
         # 设置坐标轴范围到175mm
@@ -795,223 +867,126 @@ class SWEXGBoostTrainer:
         min_val = 0
         max_val = max_range
 
-        # 1:1 参考线 - 黑色实线
+        # 1:1 参考线
         ax.plot([min_val, max_val], [min_val, max_val], 'k-', alpha=0.8, linewidth=2)
 
-        # 使用清晰的散点图，根据密度着色
+        # 使用散点图
         try:
-            # 使用2D核密度估计来着色
             from scipy.stats import gaussian_kde
-
-            # 计算点的密度
             xy = np.vstack([y_true_clean, y_pred_clean])
             z = gaussian_kde(xy)(xy)
-
-            # 按密度排序，确保高密度点在上层
             idx = z.argsort()
             y_true_sorted, y_pred_sorted, z_sorted = y_true_clean[idx], y_pred_clean[idx], z[idx]
 
-            # 绘制散点图，使用清晰的点
             scatter = ax.scatter(y_true_sorted, y_pred_sorted,
-                                 c=z_sorted,
-                                 cmap='viridis',
-                                 s=15,
-                                 alpha=0.7,
-                                 edgecolors='none',
-                                 marker='o')
-
-            # 添加颜色条
-            cbar = plt.colorbar(scatter, ax=ax, label='点密度')
-
-        except Exception as e:
-            self.logger.warning(f"密度着色失败，使用普通散点图: {e}")
-            # 备用方案：普通散点图
+                                 c=z_sorted, cmap='viridis', s=15, alpha=0.7,
+                                 edgecolors='none', marker='o')
+            plt.colorbar(scatter, ax=ax, label='Point Density')
+        except:
             scatter = ax.scatter(y_true_clean, y_pred_clean,
                                  alpha=0.6, s=15, c='blue', edgecolors='none')
 
-        # 添加回归趋势线（虚线）
+        # 添加回归趋势线
         if len(y_true_clean) > 1:
             try:
-                # 计算线性回归
                 slope, intercept, r_value, p_value, std_err = stats.linregress(y_true_clean, y_pred_clean)
-
-                # 生成回归线数据点
                 x_reg = np.linspace(min_val, max_val, 100)
                 y_reg = slope * x_reg + intercept
-
-                # 绘制回归线 - 红色虚线
                 ax.plot(x_reg, y_reg, 'r--', alpha=0.8, linewidth=2)
-
-            except Exception as e:
-                self.logger.warning(f"计算回归线失败: {e}")
+            except:
+                pass
 
         # 设置坐标轴
-        ax.set_xlabel('实际 SWE (mm)')
-        ax.set_ylabel(ylabel)
-
-        # 在标题中注明使用的指标类型
-        if use_median:
-            title_with_metric = f'{title} (中位数指标)'
-        else:
-            title_with_metric = f'{title} (聚合指标)'
-
-        ax.set_title(title_with_metric, fontsize=14, fontweight='bold')
-
-        # 设置坐标轴范围
+        ax.set_xlabel('Observed SWE (mm)', fontsize=14)
+        ax.set_ylabel(ylabel, fontsize=14)
+        ax.set_title(title, fontsize=16, fontweight='bold')
         ax.set_xlim([min_val, max_val])
         ax.set_ylim([min_val, max_val])
         ax.set_aspect('equal')
-
-        # 添加网格
         ax.grid(True, alpha=0.3)
 
-        # 添加统计信息文本框 - 根据指标类型显示不同的值
-        if use_median:
-            # 使用中位数指标
-            mae = metrics['MAE']
-            rmse = metrics['RMSE']
-            r = metrics['R']
-            n = len(y_true_clean)  # 使用实际样本数
-        else:
-            # 使用聚合指标
-            mae = metrics['MAE']
-            rmse = metrics['RMSE']
-            r = metrics['R']
-            n = len(y_true_clean)  # 使用实际样本数
+        # 添加统计信息
+        mae = metrics['MAE']
+        rmse = metrics['RMSE']
+        r = metrics['R']
+        n = len(y_true_clean)
 
-        # 安全处理相关系数显示
-        if np.isnan(r):
-            r_str = "NaN"
-        else:
-            r_str = f"{r:.3f}"
-
+        r_str = f"{r:.3f}" if not np.isnan(r) else "NaN"
         stats_text = f'MAE = {mae:.2f} mm\nRMSE = {rmse:.2f} mm\nR = {r_str}\nN = {n}'
 
-        # 右上角，无边框，放大字体
         ax.text(0.95, 0.95, stats_text, transform=ax.transAxes,
                 verticalalignment='top', horizontalalignment='right',
-                fontsize=12,
-                fontfamily='monospace',
-                weight='bold',
+                fontsize=14, fontfamily='monospace', weight='bold',
                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     def _create_combined_scatter_plot(self, results, output_dir):
-        """创建合并的散点图（两种方法在同一图中）
-
-        Args:
-            results (dict): 分析结果
-            output_dir (str): 输出目录路径
-        """
+        """创建合并的散点图"""
         try:
-            plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'Arial']
+            # 设置字体
+            plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'Arial']
             plt.rcParams['axes.unicode_minus'] = False
 
             fig, ax = plt.subplots(figsize=(10, 8))
 
-            # 设置坐标轴范围到175mm
             max_range = 175
             min_val = 0
             max_val = max_range
 
-            # 1:1 参考线 - 黑色实线
+            # 1:1 参考线
             ax.plot([min_val, max_val], [min_val, max_val], 'k-', alpha=0.8, linewidth=2)
 
-            colors = ['#ff7f0e', '#1f77b4']  # 橙色(年度CV)和蓝色(站点CV)
-            labels = ['年度CV (中位数)', '站点CV (聚合)']
+            colors = ['#ff7f0e', '#1f77b4']
+            labels = ['Yearly CV', 'Station CV']  # 使用英文标签
             methods = ['yearly_cv', 'station_cv']
-            metric_types = ['median', 'overall']  # 对应的指标类型
 
-            # 收集所有点用于密度计算
-            all_true = []
-            all_pred = []
-            all_colors = []
-
-            for i, (method, metric_type) in enumerate(zip(methods, metric_types)):
+            # 收集所有点
+            for i, method in enumerate(methods):
                 if method in results:
                     y_true = results[method]['true_values']
                     y_pred = results[method]['predictions']
-
                     mask = ~(np.isnan(y_true) | np.isnan(y_pred))
                     y_true_clean = y_true[mask]
                     y_pred_clean = y_pred[mask]
 
                     if len(y_true_clean) > 0:
-                        # 为每种方法添加点
-                        scatter = ax.scatter(y_true_clean, y_pred_clean,
-                                             c=colors[i],
-                                             s=15,
-                                             alpha=0.6,
-                                             edgecolors='none',
-                                             marker='o',
-                                             label=labels[i])
+                        ax.scatter(y_true_clean, y_pred_clean,
+                                   c=colors[i], s=15, alpha=0.6,
+                                   edgecolors='none', marker='o',
+                                   label=labels[i])
 
-                        all_true.extend(y_true_clean)
-                        all_pred.extend(y_pred_clean)
-                        all_colors.extend([colors[i]] * len(y_true_clean))
+            if len(ax.collections) == 0:
+                ax.text(0.5, 0.5, 'No valid data', ha='center', va='center',
+                        transform=ax.transAxes, fontsize=14)
+            else:
+                # 设置坐标轴
+                ax.set_xlim([min_val, max_val])
+                ax.set_ylim([min_val, max_val])
+                ax.set_aspect('equal')
+                ax.set_xlabel('Observed SWE (mm)', fontsize=14)
+                ax.set_ylabel('Predicted SWE (mm)', fontsize=14)
+                ax.set_title('SWE Prediction vs Observation Comparison', fontsize=16, fontweight='bold')
+                ax.grid(True, alpha=0.3)
 
-            if len(all_true) == 0:
-                ax.text(0.5, 0.5, '无有效数据', ha='center', va='center', transform=ax.transAxes)
-                plt.savefig(f'{output_dir}/combined_scatter_plot.png', dpi=300, bbox_inches='tight')
-                plt.close()
-                return
+                # 添加统计信息
+                stats_text = ""
+                if 'yearly_cv' in results:
+                    yearly_metrics = results['yearly_cv']['overall']
+                    yearly_r = yearly_metrics['R']
+                    yearly_r_str = f"{yearly_r:.3f}" if not np.isnan(yearly_r) else "NaN"
+                    stats_text += f"Yearly CV:\nMAE={yearly_metrics['MAE']:.2f}\nRMSE={yearly_metrics['RMSE']:.2f}\nR={yearly_r_str}\nN={len(results['yearly_cv']['true_values'])}\n\n"
 
-            # 分别计算两种方法的回归线
-            for i, method in enumerate(methods):
-                if method in results:
-                    y_true = results[method]['true_values']
-                    y_pred = results[method]['predictions']
+                if 'station_cv' in results:
+                    station_metrics = results['station_cv']['overall']
+                    station_r = station_metrics['R']
+                    station_r_str = f"{station_r:.3f}" if not np.isnan(station_r) else "NaN"
+                    stats_text += f"Station CV:\nMAE={station_metrics['MAE']:.2f}\nRMSE={station_metrics['RMSE']:.2f}\nR={station_r_str}\nN={len(results['station_cv']['true_values'])}"
 
-                    mask = ~(np.isnan(y_true) | np.isnan(y_pred))
-                    y_true_clean = y_true[mask]
-                    y_pred_clean = y_pred[mask]
+                ax.text(0.95, 0.95, stats_text, transform=ax.transAxes,
+                        verticalalignment='top', horizontalalignment='right',
+                        fontsize=13, fontfamily='monospace', weight='bold',
+                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
-                    if len(y_true_clean) > 1:
-                        try:
-                            slope, intercept, r_value, p_value, std_err = stats.linregress(y_true_clean, y_pred_clean)
-
-                            x_reg = np.linspace(min_val, max_val, 100)
-                            y_reg = slope * x_reg + intercept
-
-                            # 使用不同线型
-                            linestyle = '--' if i == 0 else '-.'
-                            ax.plot(x_reg, y_reg, color=colors[i], linestyle=linestyle,
-                                    alpha=0.8, linewidth=2)
-                        except Exception as e:
-                            self.logger.warning(f"计算{method}回归线失败: {e}")
-
-            # 设置坐标轴
-            ax.set_xlim([min_val, max_val])
-            ax.set_ylim([min_val, max_val])
-            ax.set_aspect('equal')
-            ax.set_xlabel('实际 SWE (mm)')
-            ax.set_ylabel('预测 SWE (mm)')
-            ax.set_title('SWE预测值与实际值散点图比较\n(年度CV使用中位数指标，站点CV使用聚合指标)',
-                         fontsize=14, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-
-            # 添加统计信息 - 使用对应的指标类型
-            stats_text = ""
-            if 'yearly_cv' in results:
-                yearly_metrics = results['yearly_cv']['median']  # 使用中位数
-                yearly_r = yearly_metrics['R']
-                yearly_r_str = f"{yearly_r:.3f}" if not np.isnan(yearly_r) else "NaN"
-                stats_text += f"年度CV(中位数):\nMAE={yearly_metrics['MAE']:.2f}\nRMSE={yearly_metrics['RMSE']:.2f}\nR={yearly_r_str}\nN={len(results['yearly_cv']['true_values'])}\n\n"
-
-            if 'station_cv' in results:
-                station_metrics = results['station_cv']['overall']  # 使用聚合值
-                station_r = station_metrics['R']
-                station_r_str = f"{station_r:.3f}" if not np.isnan(station_r) else "NaN"
-                stats_text += f"站点CV(聚合):\nMAE={station_metrics['MAE']:.2f}\nRMSE={station_metrics['RMSE']:.2f}\nR={station_r_str}\nN={len(results['station_cv']['true_values'])}"
-
-            ax.text(0.95, 0.95, stats_text, transform=ax.transAxes,
-                    verticalalignment='top', horizontalalignment='right',
-                    fontsize=11,
-                    fontfamily='monospace',
-                    weight='bold',
-                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
-
-            # 添加图例
-            ax.legend(loc='lower left', framealpha=0.9)
+                ax.legend(loc='lower left', framealpha=0.9, fontsize=12)
 
             plt.tight_layout()
             combined_path = f'{output_dir}/combined_scatter_plot.png'
@@ -1034,7 +1009,7 @@ class SWEXGBoostTrainer:
             self.logger.info("📊 生成特征重要性排序图...")
 
             # 设置图形样式
-            plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'Arial']
+            plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
             plt.rcParams['axes.unicode_minus'] = False
             sns.set_style("whitegrid")
 
@@ -1044,7 +1019,7 @@ class SWEXGBoostTrainer:
 
             feature_importance_df = results['feature_importance']
 
-            # 选择前20个最重要的特征（如果特征很多的话）
+            # 选择前20个最重要的特征
             top_n = min(20, len(feature_importance_df))
             top_features = feature_importance_df.head(top_n)
 
@@ -1054,7 +1029,7 @@ class SWEXGBoostTrainer:
             # 创建水平条形图
             fig, ax = plt.subplots(figsize=(12, 10))
 
-            # 创建颜色映射（从红色到蓝色，重要特征用暖色）
+            # 创建颜色映射
             colors = plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(top_features)))
 
             # 绘制水平条形图（重要特征在上面）
@@ -1065,15 +1040,15 @@ class SWEXGBoostTrainer:
                            alpha=0.8,
                            edgecolor='black',
                            linewidth=0.5,
-                           height=0.7)  # 调整条形高度
+                           height=0.7)
 
-            # 设置y轴标签（重要特征在上面）
+            # 设置y轴标签
             ax.set_yticks(y_pos)
             ax.set_yticklabels(top_features['feature'], fontsize=10)
 
             # 设置x轴
-            ax.set_xlabel('特征重要性', fontsize=12, fontweight='bold')
-            ax.set_title(f'XGBoost模型特征重要性排序 (Top {top_n})',
+            ax.set_xlabel('Feature Importance', fontsize=12, fontweight='bold')
+            ax.set_title(f'XGBoost Model Feature Importance Ranking (Top {top_n})',
                          fontsize=14, fontweight='bold', pad=20)
 
             # 在条形末端添加数值标签
@@ -1086,7 +1061,7 @@ class SWEXGBoostTrainer:
             # 添加网格线
             ax.grid(True, alpha=0.3, axis='x')
 
-            # 设置x轴范围，留出一些空间给标签
+            # 设置x轴范围
             x_max = top_features['importance'].max() * 1.15
             ax.set_xlim(0, x_max)
 
@@ -1104,7 +1079,7 @@ class SWEXGBoostTrainer:
             self.logger.warning(f"生成特征重要性排序图失败: {str(e)}")
 
     def _create_feature_importance_comprehensive(self, results, output_dir):
-        """创建更详细的特征重要性分析图（重要特征在上方）
+        """创建更详细的特征重要性分析图
 
         Args:
             results (dict): 分析结果
@@ -1116,11 +1091,15 @@ class SWEXGBoostTrainer:
 
             feature_importance_df = results['feature_importance']
 
+            # 设置字体
+            plt.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial']
+            plt.rcParams['axes.unicode_minus'] = False
+
             # 创建包含多个子图的综合图表
             fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-            fig.suptitle('XGBoost模型特征重要性综合分析', fontsize=16, fontweight='bold')
+            fig.suptitle('XGBoost Model Feature Importance Analysis', fontsize=16, fontweight='bold')
 
-            # 1. 水平条形图（主要排序图）- 重要特征在上面
+            # 1. 水平条形图（主要排序图）
             top_n = min(15, len(feature_importance_df))
             top_features = feature_importance_df.head(top_n)
             top_features = top_features.iloc[::-1]  # 反转顺序
@@ -1132,8 +1111,8 @@ class SWEXGBoostTrainer:
 
             ax1.set_yticks(y_pos)
             ax1.set_yticklabels(top_features['feature'], fontsize=9)
-            ax1.set_xlabel('特征重要性')
-            ax1.set_title(f'Top {top_n} 特征重要性排序（重要特征在上方）')
+            ax1.set_xlabel('Feature Importance')
+            ax1.set_title(f'Top {top_n} Feature Importance Ranking')
             ax1.grid(True, alpha=0.3, axis='x')
 
             # 在条形上添加数值
@@ -1146,14 +1125,13 @@ class SWEXGBoostTrainer:
             x_max1 = top_features['importance'].max() * 1.15
             ax1.set_xlim(0, x_max1)
 
-            # 2. 饼图（显示前10个特征的相对重要性）- 按重要性排序
+            # 2. 饼图（显示前10个特征的相对重要性）
             top_10 = feature_importance_df.head(10)
-            # 计算其他特征的总和
             others_sum = feature_importance_df['importance'].iloc[10:].sum()
 
             if others_sum > 0:
                 pie_data = list(top_10['importance']) + [others_sum]
-                pie_labels = list(top_10['feature']) + ['其他特征']
+                pie_labels = list(top_10['feature']) + ['Other Features']
             else:
                 pie_data = list(top_10['importance'])
                 pie_labels = list(top_10['feature'])
@@ -1161,7 +1139,7 @@ class SWEXGBoostTrainer:
             colors2 = plt.cm.Set3(np.linspace(0, 1, len(pie_data)))
             wedges, texts, autotexts = ax2.pie(pie_data, labels=pie_labels, autopct='%1.1f%%',
                                                colors=colors2, startangle=90)
-            ax2.set_title('前10个特征重要性分布')
+            ax2.set_title('Top 10 Feature Importance Distribution')
 
             # 美化饼图文本
             for autotext in autotexts:
@@ -1174,9 +1152,9 @@ class SWEXGBoostTrainer:
 
             ax3.plot(features_count, cumulative_importance, 'o-', linewidth=2, markersize=4, color='#2E86AB')
             ax3.fill_between(features_count, 0, cumulative_importance, alpha=0.3, color='#A5C8D9')
-            ax3.set_xlabel('特征数量')
-            ax3.set_ylabel('累积重要性')
-            ax3.set_title('特征累积重要性')
+            ax3.set_xlabel('Number of Features')
+            ax3.set_ylabel('Cumulative Importance')
+            ax3.set_title('Feature Cumulative Importance')
             ax3.grid(True, alpha=0.3)
 
             # 标记80%和90%重要性的点
@@ -1185,29 +1163,29 @@ class SWEXGBoostTrainer:
             idx_90 = (cumulative_importance >= 0.9).idxmax() if (cumulative_importance >= 0.9).any() else len(
                 cumulative_importance) - 1
 
-            ax3.axhline(y=0.8, color='red', linestyle='--', alpha=0.7, label='80%重要性')
-            ax3.axhline(y=0.9, color='orange', linestyle='--', alpha=0.7, label='90%重要性')
+            ax3.axhline(y=0.8, color='red', linestyle='--', alpha=0.7, label='80% Importance')
+            ax3.axhline(y=0.9, color='orange', linestyle='--', alpha=0.7, label='90% Importance')
             ax3.axvline(x=idx_80 + 1, color='red', linestyle='--', alpha=0.5)
             ax3.axvline(x=idx_90 + 1, color='orange', linestyle='--', alpha=0.5)
             ax3.legend()
 
             # 4. 特征重要性统计
             importance_stats = {
-                '总特征数': len(feature_importance_df),
-                '平均重要性': f"{feature_importance_df['importance'].mean():.4f}",
-                '最大重要性': f"{feature_importance_df['importance'].max():.4f}",
-                '最小重要性': f"{feature_importance_df['importance'].min():.4f}",
-                '重要性标准差': f"{feature_importance_df['importance'].std():.4f}",
-                f'前5个特征贡献度': f"{feature_importance_df['importance'].head(5).sum() * 100:.1f}%",
-                f'前10个特征贡献度': f"{feature_importance_df['importance'].head(10).sum() * 100:.1f}%",
-                f'最重要特征': feature_importance_df['feature'].iloc[0]
+                'Total Features': len(feature_importance_df),
+                'Mean Importance': f"{feature_importance_df['importance'].mean():.4f}",
+                'Max Importance': f"{feature_importance_df['importance'].max():.4f}",
+                'Min Importance': f"{feature_importance_df['importance'].min():.4f}",
+                'Std Importance': f"{feature_importance_df['importance'].std():.4f}",
+                'Top 5 Features': f"{feature_importance_df['importance'].head(5).sum() * 100:.1f}%",
+                'Top 10 Features': f"{feature_importance_df['importance'].head(10).sum() * 100:.1f}%",
+                'Most Important': feature_importance_df['feature'].iloc[0]
             }
 
             # 创建统计信息表格
             ax4.axis('off')
             table_data = [[k, v] for k, v in importance_stats.items()]
             table = ax4.table(cellText=table_data,
-                              colLabels=['统计项', '数值'],
+                              colLabels=['Statistic', 'Value'],
                               cellLoc='left',
                               loc='center',
                               bbox=[0.1, 0.1, 0.8, 0.8])
@@ -1220,7 +1198,7 @@ class SWEXGBoostTrainer:
                 table[(i, 0)].set_facecolor('#F0F0F0')
                 table[(i, 0)].set_text_props(weight='bold')
 
-            ax4.set_title('特征重要性统计信息')
+            ax4.set_title('Feature Importance Statistics')
 
             plt.tight_layout()
 
@@ -1391,6 +1369,15 @@ class SWEXGBoostTrainer:
             self._create_feature_importance_plot(results, output_dir)
             self._create_feature_importance_comprehensive(results, output_dir)
 
+            # 11. 生成SWE产品对比图（需要原始数据）
+            # 我们需要重新加载数据来获取原始SWE产品列
+            try:
+                # 这里假设原始数据路径存储在某个地方，或者我们需要在run_complete_analysis中传递df
+                # 由于df在run_complete_analysis中可用，我们可以在那里调用
+                pass
+            except Exception as e:
+                self.logger.warning(f"生成SWE产品对比图失败: {e}")
+
             self.logger.info(f"📁 所有结果已保存到: {output_dir}")
 
         except Exception as e:
@@ -1398,37 +1385,34 @@ class SWEXGBoostTrainer:
             raise
 
     def get_feature_importance(self):
-        """获取特征重要性，将landuse向量特征作为一个整体"""
+        """获取特征重要性"""
         if self.model is None:
             raise ValueError("模型尚未训练，请先调用 train_final_model 方法")
 
         importance_scores = self.model.feature_importances_
 
-        # 计算landuse向量特征的总重要性
-        # 假设landuse向量是最后10个特征（根据landuse_hash列的数量）
-        landuse_vector_length = 10  # 根据实际情况调整
-        total_features = len(importance_scores)
+        self.logger.info(f"模型特征重要性数组长度: {len(importance_scores)}")
+        self.logger.info(f"特征列数量: {len(self.feature_columns)}")
 
-        # landuse向量特征的重要性是最后landuse_vector_length个特征的和
-        landuse_importance = np.sum(importance_scores[-landuse_vector_length:])
-
-        # 其他特征的重要性
-        other_importance = importance_scores[:-landuse_vector_length]
-
-        # 构建特征名称
-        other_feature_names = [col for col in self.feature_columns if col != 'landuse_vector']
-        feature_names = other_feature_names + ['landuse_vector']
-
-        importance_values = list(other_importance) + [landuse_importance]
+        # 检查长度是否匹配
+        if len(importance_scores) != len(self.feature_columns):
+            self.logger.warning(f"特征数量不匹配: 模型输出{len(importance_scores)}个, 特征列{len(self.feature_columns)}个")
+            # 使用截断到最小长度
+            min_length = min(len(importance_scores), len(self.feature_columns))
+            importance_scores = importance_scores[:min_length]
+            feature_names = self.feature_columns[:min_length]
+            self.logger.info(f"截断后: 特征{min_length}个")
+        else:
+            feature_names = self.feature_columns
 
         feature_importance_df = pd.DataFrame({
             'feature': feature_names,
-            'importance': importance_values
+            'importance': importance_scores
         }).sort_values('importance', ascending=False)
 
         self.logger.info(f"特征重要性计算完成")
-        self.logger.info(f"  landuse向量总重要性: {landuse_importance:.6f}")
-        self.logger.info(f"  最高重要性: {feature_importance_df['importance'].iloc[0]:.4f}")
+        self.logger.info(
+            f"最高重要性特征: {feature_importance_df['feature'].iloc[0]} = {feature_importance_df['importance'].iloc[0]:.4f}")
 
         return feature_importance_df
 
@@ -1701,6 +1685,11 @@ class SWEXGBoostTrainer:
                 report_lines.append(f"  ✅ 强烈推荐使用年度交叉验证进行时间评估")
             else:
                 report_lines.append(f"  ⚠️  两种方法各有优势，请根据具体应用场景选择")
+
+            # 添加SWE产品对比说明
+            report_lines.append(f"\n📈 SWE产品对比:")
+            report_lines.append(f"  已生成CSWE、ERA5_SWE、Glsnow、GLDAS等产品与实测值的对比散点图")
+            report_lines.append(f"  详见输出目录中的 'swe_products_comparison.png'")
 
         report_lines.append("\n" + "=" * 80)
 

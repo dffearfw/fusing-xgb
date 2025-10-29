@@ -8,6 +8,7 @@ import sys
 import os
 import argparse
 import pandas as pd
+from cluster import train_swe_cluster_ensemble
 
 # 添加当前目录到路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +29,38 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("SWETrainingMain")
+
+
+def build_model_parameters(args):
+    """根据命令行参数构建模型参数字典
+
+    Args:
+        args: argparse参数对象
+
+    Returns:
+        dict: XGBoost参数字典
+    """
+    params = {
+        'n_estimators': args.trees,
+        'learning_rate': args.lr,
+        'max_depth': args.depth,
+        'min_child_weight': getattr(args, 'min_child_weight', 5),
+        'gamma': getattr(args, 'gamma', 0),
+        'subsample': args.subsample,
+        'colsample_bytree': args.colsample,
+        'reg_alpha': getattr(args, 'reg_alpha', 0.05),
+        'random_state': 42,
+        'objective': 'reg:squarederror',
+        'eval_metric': 'rmse'
+    }
+
+    # 可选：添加其他参数，如果用户在命令行中指定了的话
+    optional_params = ['reg_lambda', 'max_delta_step', 'scale_pos_weight']
+    for param in optional_params:
+        if hasattr(args, param) and getattr(args, param) is not None:
+            params[param] = getattr(args, param)
+
+    return params
 
 
 def main():
@@ -57,6 +90,11 @@ def main():
     parser.add_argument('--colsample', type=float, default=0.5,
                         help='特征采样比例 (默认: 0.5)')
 
+    parser.add_argument('--cluster-mode', action='store_true',
+                       help='使用聚类集成模式')
+    parser.add_argument('--n-clusters', type=int, default=4,
+                       help='聚类数量 (默认: 4)')
+
     args = parser.parse_args()
 
     try:
@@ -75,6 +113,26 @@ def main():
         logger.info(f"数据加载成功: {len(df)} 行, {len(df.columns)} 列")
         logger.info(f"数据列: {list(df.columns)}")
 
+        if args.cluster_mode:
+            # 使用聚类集成模式
+            logger.info("🎯 使用聚类集成模式")
+            logger.info(f"聚类数量: {args.n_clusters}")
+
+            results = train_swe_cluster_ensemble(
+                data_df=df,
+                output_dir=args.output,
+                n_clusters=args.n_clusters,
+                params=build_model_parameters(args)  # 使用您原有的参数构建函数
+            )
+        else:
+            # 使用原有模式
+            from swe_trainer import train_swe_model
+            results = train_swe_model(
+                data_df=df,
+                output_dir=args.output,
+                params=build_model_parameters(args)
+            )
+
         # 2. 设置模型参数
         params = {
             'n_estimators': args.trees,
@@ -84,7 +142,10 @@ def main():
             'gamma': 0,
             'subsample': args.subsample,
             'colsample_bytree': args.colsample,
-            'reg_alpha': 0.05
+            'reg_alpha': 0.05,
+            'random_state': 42,
+            'objective': 'reg:squarederror',
+            'eval_metric': 'rmse',
         }
 
         logger.info(f"模型参数: n_estimators={params['n_estimators']}, "
