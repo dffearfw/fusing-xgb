@@ -24,21 +24,14 @@
             </Attribute>
           </value>
         </entry>
-        <entry key="\src\training\swe_cluster_ensemble_results_20251028_155755\station_cv_predictions.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\src\training\swe_cluster_ensemble_results_20251028_155755\yearly_cv_predictions.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
         <entry key="\src\training\swe_cluster_ensemble_results_20251028_215408\station_cv_predictions.csv">
+          <value>
+            <Attribute>
+              <option name="separator" value="," />
+            </Attribute>
+          </value>
+        </entry>
+        <entry key="\src\training\swe_cluster_ensemble_results_20251028_215408\yearly_cv_predictions.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />
@@ -81,20 +74,6 @@
           </value>
         </entry>
         <entry key="\src\training\swe_model_results_20251023_091112\yearly_cv_predictions.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\src\training\swe_model_results_20251023_094220\station_cv_predictions.csv">
-          <value>
-            <Attribute>
-              <option name="separator" value="," />
-            </Attribute>
-          </value>
-        </entry>
-        <entry key="\src\training\swe_model_results_20251023_094220\yearly_cv_predictions.csv">
           <value>
             <Attribute>
               <option name="separator" value="," />

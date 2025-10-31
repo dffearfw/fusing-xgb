@@ -1,3 +1,5 @@
+import logging
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -139,64 +141,146 @@ class EnhancedSpatialDataset(Dataset):
 
 
 class EnhancedGNNWRTrainer:
-    """增强的GNNWR训练器"""
+    """增强的GNNWR训练器 - 内存优化版本"""
 
     def __init__(self, input_dim, coords, hidden_dims=[64, 32, 16],
-                 learning_rate=0.001, bandwidth=None, use_spatial_weights=True):
+                 learning_rate=0.001, bandwidth=None, use_spatial_weights=True,
+                 max_samples_for_spatial=5000, device='auto'):
+
+        # 添加 logger 初始化
+        self.logger = logging.getLogger("EnhancedGNNWRTrainer")
+
+        # 自动检测或指定设备
+        if device == 'auto':
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+
+        self.logger.info(f"使用设备: {self.device}")
+
+        if self.device.type == 'cuda':
+            self.logger.info(f"GPU信息: {torch.cuda.get_device_name()}")
+            self.logger.info(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
+
+
+
+
+        print(f"=== EnhancedGNNWRTrainer 初始化调试 ===")
+        print(f"输入 coords 类型: {type(coords)}")
+        print(f"输入 coords is None: {coords is None}")
+        print(f"输入 coords id: {id(coords)}")
+
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.coords = coords
+        if coords is not None:
+            self.coords = coords.copy()  # 创建副本，避免修改原数据
+        else:
+            self.coords = None
+
         self.use_spatial_weights = use_spatial_weights
 
-        # 初始化空间权重计算器
-        self.weight_calculator = SpatialWeightCalculator(bandwidth=bandwidth)
-        if bandwidth is None:
-            # 自动计算自适应带宽
-            bandwidth = self.weight_calculator.adaptive_bandwidth(coords)
-            self.weight_calculator.bandwidth = bandwidth
+        print(f"EnhancedGNNWRTrainer 初始化完成")
+        print(f"保存的 coords id: {id(self.coords)}")
 
-        # 计算全局空间权重矩阵
-        self.global_weights = self.weight_calculator.calculate_weights(coords, coords)
+        # 检查样本数量，如果太多则禁用空间权重
+        if coords is not None and len(coords) > max_samples_for_spatial:
+            self.logger.warning(f"样本数量 {len(coords)} 超过限制 {max_samples_for_spatial}，禁用空间权重")
+            self.use_spatial_weights = False
+
+        # 初始化空间权重计算器（仅在需要时）
+        if self.use_spatial_weights and coords is not None:
+            self.weight_calculator = SpatialWeightCalculator(bandwidth=bandwidth)
+            if bandwidth is None:
+                # 使用较小的k值以减少计算量
+                bandwidth = self.weight_calculator.adaptive_bandwidth(coords, k=5)
+                self.weight_calculator.bandwidth = bandwidth
+
+            # 计算全局空间权重矩阵（分批计算以避免内存问题）
+            self.global_weights = self._compute_sparse_weights(coords)
+        else:
+            self.weight_calculator = None
+            self.global_weights = None
 
         # 初始化模型
         self.model = EnhancedGNNWRModel(input_dim, hidden_dims).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
         self.criterion = nn.MSELoss()
 
-        # 空间自相关性分析
-        self.spatial_analyzer = SpatialAutocorrelation()
+        self.logger.info(f"EnhancedGNNWR训练器初始化完成，使用空间权重: {self.use_spatial_weights}")
 
-    def spatial_weighted_loss(self, outputs, targets, weights):
-        """空间加权损失函数"""
-        return (weights * (outputs - targets) ** 2).mean()
+    def _compute_sparse_weights(self, coords, max_neighbors=50):
+        """计算稀疏空间权重矩阵以减少内存使用"""
+        n_samples = len(coords)
+        self.logger.info(f"计算稀疏空间权重矩阵，最大邻居数: {max_neighbors}")
+
+        # 使用KD树快速查找最近邻
+        from scipy.spatial import cKDTree
+        tree = cKDTree(coords)
+
+        # 查找每个点的k个最近邻
+        distances, indices = tree.query(coords, k=min(max_neighbors + 1, n_samples))
+
+        # 创建稀疏权重矩阵
+        row_indices = []
+        col_indices = []
+        weight_values = []
+
+        for i in range(n_samples):
+            # 排除自身（距离为0）
+            mask = distances[i] > 0
+            valid_indices = indices[i][mask]
+            valid_distances = distances[i][mask]
+
+            # 计算权重（高斯核）
+            weights = np.exp(-0.5 * (valid_distances / self.weight_calculator.bandwidth) ** 2)
+
+            # 添加到稀疏矩阵数据
+            for j, weight in zip(valid_indices, weights):
+                row_indices.append(i)
+                col_indices.append(j)
+                weight_values.append(weight)
+
+        # 创建稀疏矩阵
+        from scipy.sparse import csr_matrix
+        sparse_weights = csr_matrix((weight_values, (row_indices, col_indices)),
+                                    shape=(n_samples, n_samples))
+
+        self.logger.info(f"稀疏权重矩阵创建完成: {sparse_weights.nnz} 个非零元素")
+        return sparse_weights
 
     def train(self, train_loader, epochs=100, patience=10, validate_spatial=True):
-        """训练模型"""
+        """训练模型 - 内存优化版本"""
         self.model.train()
         best_loss = float('inf')
         patience_counter = 0
-        train_losses = []
-        spatial_stats = []
+
+        # 大样本时禁用空间验证
+        if validate_spatial and self.global_weights is not None:
+            n_samples = self.global_weights.shape[0] if hasattr(self.global_weights, 'shape') else 0
+            if n_samples > 5000:
+                validate_spatial = False
+                self.logger.info("样本数量较大，禁用空间自相关性验证")
 
         for epoch in range(epochs):
             epoch_loss = 0.0
-            all_predictions = []
-            all_targets = []
-
             for batch in train_loader:
-                if len(batch) == 4:  # 有空间权重
-                    batch_features, batch_targets, batch_coords, batch_weights = batch
-                    batch_weights = batch_weights.to(self.device)
-                else:  # 没有空间权重
+                if len(batch) == 3:  # 有坐标
                     batch_features, batch_targets, batch_coords = batch
-                    batch_weights = None
+                else:  # 没有坐标
+                    batch_features, batch_targets = batch
+                    batch_coords = None
 
                 batch_features = batch_features.to(self.device)
                 batch_targets = batch_targets.to(self.device)
-                batch_coords = batch_coords.to(self.device)
 
                 self.optimizer.zero_grad()
 
-                if self.use_spatial_weights and batch_weights is not None:
+                if self.use_spatial_weights and batch_coords is not None:
+                    # 计算批次内的空间权重
+                    batch_coords_np = batch_coords.cpu().numpy()
+                    batch_weights = self.weight_calculator.calculate_weights(
+                        batch_coords_np, batch_coords_np)
+                    batch_weights = torch.FloatTensor(batch_weights).to(self.device)
+
                     outputs = self.model(batch_features, batch_weights, batch_coords)
                     loss = self.spatial_weighted_loss(outputs, batch_targets, batch_weights)
                 else:
@@ -207,111 +291,88 @@ class EnhancedGNNWRTrainer:
                 self.optimizer.step()
 
                 epoch_loss += loss.item()
-                all_predictions.extend(outputs.detach().cpu().numpy())
-                all_targets.extend(batch_targets.cpu().numpy())
 
             epoch_loss /= len(train_loader)
-            train_losses.append(epoch_loss)
-
-            # 空间自相关性分析
-            if validate_spatial and epoch % 10 == 0:
-                residuals = np.array(all_targets) - np.array(all_predictions)
-                morans_i = self.spatial_analyzer.morans_i(residuals, self.global_weights)
-                spatial_stats.append(morans_i)
-                print(f"Epoch {epoch}, Loss: {epoch_loss:.6f}, Moran's I: {morans_i:.4f}")
-            else:
-                print(f"Epoch {epoch}, Loss: {epoch_loss:.6f}")
 
             # 早停法
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 patience_counter = 0
-                # 保存最佳模型
-                torch.save(self.model.state_dict(), 'best_gnnwr_model.pth')
             else:
                 patience_counter += 1
 
             if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
+                self.logger.info(f"早停在epoch {epoch}")
                 break
 
-        # 绘制训练曲线和空间统计
-        self._plot_training_stats(train_losses, spatial_stats)
-
-        # 加载最佳模型
-        self.model.load_state_dict(torch.load('best_gnnwr_model.pth'))
+            if epoch % 20 == 0:
+                self.logger.info(f"Epoch {epoch}, Loss: {epoch_loss:.6f}")
 
     def predict(self, features, coords=None):
-        """预测 - 支持不同位置预测"""
+        """预测方法"""
         self.model.eval()
         with torch.no_grad():
             features_tensor = torch.FloatTensor(features).to(self.device)
 
-            if coords is not None and self.use_spatial_weights:
-                # 计算预测位置的空间权重
-                predict_weights = self.weight_calculator.calculate_weights(
-                    self.coords, coords)
-                weights_tensor = torch.FloatTensor(predict_weights).to(self.device)
+            if self.use_spatial_weights and coords is not None:
+                # 如果有坐标数据，计算空间权重
                 coords_tensor = torch.FloatTensor(coords).to(self.device)
+                # 计算批次内的空间权重
+                batch_coords_np = coords_tensor.cpu().numpy()
+                batch_weights = self.weight_calculator.calculate_weights(
+                    batch_coords_np, batch_coords_np)
+                batch_weights = torch.FloatTensor(batch_weights).to(self.device)
 
-                predictions = []
-                for i in range(len(features)):
-                    pred = self.model(features_tensor[i:i + 1],
-                                      weights_tensor[:, i:i + 1],
-                                      coords_tensor[i:i + 1])
-                    predictions.append(pred.item())
-                return np.array(predictions)
+                outputs = self.model(features_tensor, batch_weights, coords_tensor)
             else:
-                predictions = self.model(features_tensor)
-                return predictions.cpu().numpy()
+                # 没有空间权重
+                outputs = self.model(features_tensor)
 
-    def _plot_training_stats(self, losses, spatial_stats):
-        """绘制训练统计图"""
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+            return outputs.cpu().numpy().flatten()
 
-        # 损失曲线
-        ax1.plot(losses)
-        ax1.set_title('Training Loss')
-        ax1.set_xlabel('Epoch')
-        ax1.set_ylabel('MSE Loss')
-        ax1.grid(True)
-
-        # 空间自相关性
-        if spatial_stats:
-            ax2.plot(range(0, len(losses), 10)[:len(spatial_stats)], spatial_stats)
-            ax2.set_title("Moran's I of Residuals")
-            ax2.set_xlabel('Epoch')
-            ax2.set_ylabel("Moran's I")
-            ax2.grid(True)
-            ax2.axhline(y=0, color='r', linestyle='--', alpha=0.7)
-
-        plt.tight_layout()
-        plt.savefig('training_stats.png', dpi=300, bbox_inches='tight')
-        plt.close()
+    def spatial_weighted_loss(self, outputs, targets, weights):
+        """空间加权损失函数"""
+        return (weights * (outputs.squeeze() - targets) ** 2).mean()
 
 
-class SpatialDataset(Dataset):
-    """空间数据集"""
 
-    def __init__(self, features, targets, spatial_weights=None):
-        """
-        Args:
-            features (np.array): 特征数据
-            targets (np.array): 目标变量
-            spatial_weights (np.array, optional): 空间权重
-        """
+class EnhancedSpatialDataset(Dataset):
+    """增强的空间数据集 - 详细调试版本"""
+
+    def __init__(self, features, targets, coords=None):
+        print(f"=== EnhancedSpatialDataset 初始化调试 ===")
+        print(f"输入 coords 类型: {type(coords)}")
+        print(f"输入 coords is None: {coords is None}")
+        print(f"输入 coords id: {id(coords)}")
+
+        if coords is not None:
+            print(f"输入 coords 形状: {coords.shape}")
+            print(f"输入 coords 数据类型: {coords.dtype}")
+        else:
+            print("❌ 输入 coords 为 None!")
+
         self.features = torch.FloatTensor(features)
         self.targets = torch.FloatTensor(targets)
-        self.spatial_weights = torch.FloatTensor(spatial_weights) if spatial_weights is not None else None
+
+        print(f"特征转换后 coords 状态: {coords is None}")
+
+        # 直接转换，不添加任何虚拟坐标逻辑
+        if coords is not None:
+            print("开始坐标转换...")
+            self.coords = torch.FloatTensor(coords)
+            print("坐标转换成功")
+        else:
+            # 如果coords为None，直接抛出错误
+            raise ValueError("坐标数据不能为None")
+
+        print(f"EnhancedSpatialDataset 初始化完成")
+        print(f"最终 coords 形状: {self.coords.shape}")
 
     def __len__(self):
         return len(self.features)
 
     def __getitem__(self, idx):
-        if self.spatial_weights is not None:
-            return self.features[idx], self.targets[idx], self.spatial_weights[idx]
-        else:
-            return self.features[idx], self.targets[idx]
+        return self.features[idx], self.targets[idx], self.coords[idx]
 
 
 # 使用示例

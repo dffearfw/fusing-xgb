@@ -1,8 +1,3 @@
-"""
-Create on 2025/10/1
-
-@auther:Thinkpad
-"""
 import logging
 import sys
 import os
@@ -64,7 +59,7 @@ def build_model_parameters(args):
 
 
 def main():
-    """主函数 - 命令行接口"""
+    """主函数 - 命令行接口 - 修复版本：删除重复训练"""
     parser = argparse.ArgumentParser(
         description='SWE XGBoost模型训练',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -94,6 +89,8 @@ def main():
                        help='使用聚类集成模式')
     parser.add_argument('--n-clusters', type=int, default=4,
                        help='聚类数量 (默认: 4)')
+    parser.add_argument('--use-rf', action='store_true',
+                        help='在聚类集成中使用随机森林代替XGBoost')
 
     args = parser.parse_args()
 
@@ -113,62 +110,46 @@ def main():
         logger.info(f"数据加载成功: {len(df)} 行, {len(df.columns)} 列")
         logger.info(f"数据列: {list(df.columns)}")
 
+        # 构建模型参数
+        params = build_model_parameters(args)
+        logger.info(f"模型参数: n_estimators={params['n_estimators']}, "
+                    f"learning_rate={params['learning_rate']}, "
+                    f"max_depth={params['max_depth']}")
+
         if args.cluster_mode:
             # 使用聚类集成模式
             logger.info("🎯 使用聚类集成模式")
             logger.info(f"聚类数量: {args.n_clusters}")
+            logger.info(f"使用{'随机森林' if args.use_rf else 'XGBoost'}作为基础模型")
 
             results = train_swe_cluster_ensemble(
                 data_df=df,
                 output_dir=args.output,
                 n_clusters=args.n_clusters,
-                params=build_model_parameters(args)  # 使用您原有的参数构建函数
+                params=params,
+                use_rf=args.use_rf
             )
         else:
-            # 使用原有模式
+            # 使用原有模式（保持XGBoost不变）
             from swe_trainer import train_swe_model
+            logger.info("🎯 使用标准XGBoost模式")
             results = train_swe_model(
                 data_df=df,
                 output_dir=args.output,
-                params=build_model_parameters(args)
+                params=params
             )
-
-        # 2. 设置模型参数
-        params = {
-            'n_estimators': args.trees,
-            'learning_rate': args.lr,
-            'max_depth': args.depth,
-            'min_child_weight': 5,
-            'gamma': 0,
-            'subsample': args.subsample,
-            'colsample_bytree': args.colsample,
-            'reg_alpha': 0.05,
-            'random_state': 42,
-            'objective': 'reg:squarederror',
-            'eval_metric': 'rmse',
-        }
-
-        logger.info(f"模型参数: n_estimators={params['n_estimators']}, "
-                    f"learning_rate={params['learning_rate']}, "
-                    f"max_depth={params['max_depth']}")
-
-        # 3. 训练模型
-        logger.info("🎯 开始模型训练...")
-        results = train_swe_model(
-            data_df=df,
-            output_dir=args.output,
-            params=params
-        )
 
         logger.info("✅ 模型训练完成！")
 
-        # 4. 显示关键结果
+        # 显示关键结果
         print_summary(results)
 
         return 0
 
     except Exception as e:
         logger.error(f"❌ 程序执行失败: {e}")
+        import traceback
+        logger.error(f"详细错误: {traceback.format_exc()}")
         return 1
 
 
@@ -231,40 +212,39 @@ def load_data(file_path):
 
 
 def print_summary(results):
-    """打印结果摘要
-
-    Args:
-        results (dict): 训练结果
-    """
+    """打印结果摘要 - 修复版本：处理缺失的station_cv"""
     print("\n" + "=" * 70)
     print("🎉 SWE模型训练完成摘要")
     print("=" * 70)
 
+    # 站点交叉验证结果（如果存在）
     if 'station_cv' in results:
         station = results['station_cv']['overall']
         print(f"\n📍 站点交叉验证 (空间评估):")
         print(f"   MAE:  {station['MAE']:8.3f} mm")
         print(f"   RMSE: {station['RMSE']:8.3f} mm")
         print(f"   R:    {station['R']:8.3f}")
-        print(f"   样本数: {station['样本数']:6d}")
+        print(f"   样本数: {station.get('样本数', station.get('samples', 'N/A')):>6}")
         print(f"   折叠数: {results['station_cv']['folds']:6d}")
 
+    # 年度交叉验证结果
     if 'yearly_cv' in results:
         yearly = results['yearly_cv']['overall']
         print(f"\n📅 年度交叉验证 (时间评估):")
         print(f"   MAE:  {yearly['MAE']:8.3f} mm")
         print(f"   RMSE: {yearly['RMSE']:8.3f} mm")
         print(f"   R:    {yearly['R']:8.3f}")
-        print(f"   样本数: {yearly['样本数']:6d}")
+        print(f"   样本数: {yearly.get('样本数', yearly.get('samples', 'N/A')):>6}")
         print(f"   折叠数: {results['yearly_cv']['folds']:6d}")
 
+    # 特征重要性（如果存在）
     if 'feature_importance' in results:
         top_features = results['feature_importance'].head(3)
         print(f"\n🔍 重要特征 Top 3:")
         for i, (_, row) in enumerate(top_features.iterrows(), 1):
             print(f"   {i}. {row['feature']:20} {row['importance']:.4f}")
 
-    # 性能比较
+    # 性能比较（如果两者都存在）
     if 'station_cv' in results and 'yearly_cv' in results:
         station_r = results['station_cv']['overall']['R']
         yearly_r = results['yearly_cv']['overall']['R']
@@ -274,6 +254,9 @@ def print_summary(results):
             print(f"   站点CV性能更优，推荐用于空间评估")
         else:
             print(f"   年度CV性能更优，推荐用于时间评估")
+    else:
+        print(f"\n💡 建议:")
+        print(f"   使用年度交叉验证结果进行评估")
 
     print("=" * 70)
     print("📁 详细结果已保存到输出目录")

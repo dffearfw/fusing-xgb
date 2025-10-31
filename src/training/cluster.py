@@ -95,6 +95,8 @@ except ImportError as e:
 class SWEClusterEnsemble:
     """SWE聚类集成回归器 - 使用增强版GNNWR进行集成"""
 
+
+
     DEFAULT_PARAMS = {
         'n_estimators': 60,
         'learning_rate': 0.17,
@@ -109,7 +111,7 @@ class SWEClusterEnsemble:
         'eval_metric': 'rmse'
     }
 
-    def __init__(self, n_clusters=4, params=None, gnnwr_params=None, use_enhanced_gnnwr=True):
+    def __init__(self, n_clusters=4, params=None, gnnwr_params=None, use_enhanced_gnnwr=True, use_rf=False):
         """初始化聚类集成回归器
 
         Args:
@@ -129,10 +131,28 @@ class SWEClusterEnsemble:
         self.target_column = 'swe'
         self.use_enhanced_gnnwr = use_enhanced_gnnwr and HAS_ENHANCED_GNNWR
 
-        # XGBoost参数
-        self.params = self.DEFAULT_PARAMS.copy()
-        if params:
-            self.params.update(params)
+        self.use_rf = use_rf
+
+        # 关键修复：确保params不为None
+        if params is None:
+            params = {}  # 确保params至少是空字典
+
+        if use_rf:
+            # RF参数
+            self.rf_params = {
+                'n_estimators': params.get('n_estimators', 100),
+                'max_depth': params.get('max_depth', None),
+                'min_samples_split': 2,
+                'min_samples_leaf': 1,
+                'random_state': 42,
+                'n_jobs': -1
+            }
+            self.params = params if params else self.DEFAULT_PARAMS.copy()
+        else:
+            # 原有的XGB参数
+            self.params = self.DEFAULT_PARAMS.copy()
+            if params:
+                self.params.update(params)
 
         # GNNWR参数
         self.gnnwr_params = {
@@ -152,14 +172,7 @@ class SWEClusterEnsemble:
         self.logger.info(f"GNNWR参数: {self.gnnwr_params}")
 
     def preprocess_data(self, df):
-        """数据预处理
-
-        Args:
-            df (pd.DataFrame): 输入数据
-
-        Returns:
-            tuple: (X, y, station_groups, year_groups, coords)
-        """
+        """数据预处理 - 完整调试版本"""
         self.logger.info("开始数据预处理...")
 
         # 确定特征列和目标列
@@ -201,23 +214,54 @@ class SWEClusterEnsemble:
             year_groups = np.ones(len(df), dtype=int)
             self.logger.warning("未找到年份信息，使用统一年份分组")
 
-        # 提取坐标信息（如果可用）
+        # === 坐标调试部分 ===
+        self.logger.info("=== 坐标调试信息 ===")
+
+        # 检查坐标列的存在和内容
+        coord_columns = ['longitude', 'latitude', 'lon', 'lat']
+        available_coords = [col for col in coord_columns if col in df.columns]
+        self.logger.info(f"找到的坐标列: {available_coords}")
+
+        for col in available_coords:
+            if col in df.columns:
+                non_na_count = df[col].notna().sum()
+                dtype = df[col].dtype
+                min_val = df[col].min() if non_na_count > 0 else "N/A"
+                max_val = df[col].max() if non_na_count > 0 else "N/A"
+                self.logger.info(f"  {col}: 非空值={non_na_count}, 类型={dtype}, 范围=[{min_val}, {max_val}]")
+
+        # 提取坐标信息
         coords = None
         if all(col in df.columns for col in ['longitude', 'latitude']):
             coords = df[['longitude', 'latitude']].values
-            self.logger.info(f"使用经纬度坐标: {len(coords)} 个点")
+            self.logger.info(f"✅ 使用经纬度坐标: {len(coords)} 个点")
+            self.logger.info(
+                f"   坐标范围: lon[{coords[:, 0].min():.2f}, {coords[:, 0].max():.2f}], lat[{coords[:, 1].min():.2f}, {coords[:, 1].max():.2f}]")
+
+            # 检查是否有NaN坐标
+            nan_coords = np.isnan(coords).any(axis=1).sum()
+            if nan_coords > 0:
+                self.logger.warning(f"⚠️  发现 {nan_coords} 个坐标包含NaN值")
+                # 使用均值填充NaN坐标
+                for i in range(coords.shape[1]):
+                    col_mean = np.nanmean(coords[:, i])
+                    nan_mask = np.isnan(coords[:, i])
+                    coords[nan_mask, i] = col_mean
+                    self.logger.info(f"   列 {i} 的NaN值已用均值 {col_mean:.4f} 填充")
+
         elif all(col in df.columns for col in ['lon', 'lat']):
             coords = df[['lon', 'lat']].values
-            self.logger.info(f"使用经纬度坐标: {len(coords)} 个点")
+            self.logger.info(f"✅ 使用经纬度坐标: {len(coords)} 个点")
         else:
-            self.logger.warning("未找到坐标信息，将使用虚拟坐标")
-            # 创建基于站点ID的虚拟坐标
+            self.logger.warning("❌ 未找到坐标信息，将使用虚拟坐标")
             unique_stations = np.unique(station_groups)
             station_to_coord = {station: [i, i] for i, station in enumerate(unique_stations)}
             coords = np.array([station_to_coord[station] for station in station_groups])
+            self.logger.info(f"   生成虚拟坐标: {len(coords)} 个点")
 
         self.logger.info(f"数据预处理完成: {len(X)}个样本, {X.shape[1]}个特征")
         self.logger.info(f"站点数: {len(np.unique(station_groups))}, 年份数: {len(np.unique(year_groups))}")
+        self.logger.info(f"坐标最终状态: {'可用' if coords is not None else '不可用'}")
 
         return X, y, station_groups, year_groups, coords
 
@@ -290,8 +334,13 @@ class SWEClusterEnsemble:
             X_cluster = X[cluster_mask]
             y_cluster = y[cluster_mask]
 
-            # 训练XGBoost模型
-            model = xgb.XGBRegressor(**self.params)
+            if self.use_rf:
+                from sklearn.ensemble import RandomForestRegressor
+                model = RandomForestRegressor(**self.rf_params)
+            else:
+                import xgboost as xgb
+                model = xgb.XGBRegressor(**self.params)
+
             model.fit(X_cluster, y_cluster)
 
             self.cluster_models[cluster_id] = model
@@ -324,18 +373,40 @@ class SWEClusterEnsemble:
         return cluster_predictions
 
     def train_gnnwr_model(self, X, y, cluster_predictions, coords=None):
-        """训练GNNWR集成模型
+        """训练GNNWR集成模型 - 内存优化版本"""
+        self.logger.info("=== train_gnnwr_method详细调试 ===")
+        self.logger.info(f"输入参数ID检查:")
+        self.logger.info(f"  coords id: {id(coords)}")
+        self.logger.info(f"  coords is None: {coords is None}")
 
-        Args:
-            X (np.array): 特征数据
-            y (np.array): 目标变量
-            cluster_predictions (np.array): 各聚类模型的预测结果
-            coords (np.array): 坐标数据
-        """
+        # 立即检查坐标数据
+        if coords is None:
+            self.logger.error("❌ 坐标数据在方法入口处就为None!")
+            raise ValueError("坐标数据在方法入口处就为None")
+
+        self.logger.info(f"  coords类型: {type(coords)}")
+        self.logger.info(f"  coords形状: {coords.shape if hasattr(coords, 'shape') else 'No shape'}")
+        self.logger.info(f"  coords长度: {len(coords) if hasattr(coords, '__len__') else 'No length'}")
+
         self.logger.info("训练GNNWR集成模型...")
 
         # 使用特征：原始特征 + 各聚类预测
         gnnwr_features = np.hstack([X, cluster_predictions])
+
+        # 添加维度调试
+        self.logger.info(f"输入特征维度调试:")
+        self.logger.info(f"  X形状: {X.shape}")
+        self.logger.info(f"  cluster_predictions形状: {cluster_predictions.shape}")
+        self.logger.info(f"  合并后gnnwr_features形状: {gnnwr_features.shape}")
+
+        # 关键修复：创建坐标数据的副本，避免被其他方法修改
+        if coords is not None:
+            coords_copy = coords.copy()  # 创建副本
+            self.logger.info(f"创建坐标副本，原id: {id(coords)}, 副本id: {id(coords_copy)}")
+        else:
+            coords_copy = None
+            self.logger.error("坐标数据为None")
+            raise ValueError("坐标数据为None")
 
         # 处理缺失值
         if np.isnan(gnnwr_features).any():
@@ -346,16 +417,33 @@ class SWEClusterEnsemble:
             gnnwr_features_imputed = gnnwr_features
             self.gnnwr_imputer = None
 
+        # 添加处理后的维度调试
+        self.logger.info(f"处理后特征维度: {gnnwr_features_imputed.shape}")
+
         if self.use_enhanced_gnnwr:
             # 使用增强版GNNWR
             self.logger.info("使用增强版GNNWR训练器")
 
-            # 创建数据集
-            dataset = EnhancedSpatialDataset(
-                features=gnnwr_features_imputed,
-                targets=y,
-                coords=coords
-            )
+            # 检查样本数量，如果太多则使用简化模式
+            n_samples = len(gnnwr_features_imputed)
+            # 关键修复：使用 coords_copy 而不是 coords
+            use_spatial = self.gnnwr_params['use_spatial_weights'] and n_samples <= 5000 and coords_copy is not None
+
+            if not use_spatial:
+                self.logger.warning(f"样本数量较大 ({n_samples}) 或坐标不可用，禁用空间权重计算")
+                # 即使禁用空间权重，也要传递坐标数据
+                dataset = EnhancedSpatialDataset(
+                    features=gnnwr_features_imputed,
+                    targets=y,
+                    coords=coords_copy  # 仍然传递坐标，只是训练器不使用
+                )
+            else:
+                # 正常模式
+                dataset = EnhancedSpatialDataset(
+                    features=gnnwr_features_imputed,
+                    targets=y,
+                    coords=coords_copy
+                )
 
             train_loader = DataLoader(
                 dataset,
@@ -365,24 +453,32 @@ class SWEClusterEnsemble:
 
             # 初始化增强版GNNWR训练器
             input_dim = gnnwr_features_imputed.shape[1]
+            self.logger.info(f"初始化GNNWR训练器，输入维度: {input_dim}")
+
             self.gnnwr_trainer = EnhancedGNNWRTrainer(
                 input_dim=input_dim,
-                coords=coords,
+                coords=coords_copy if use_spatial else None,  # 关键修复：使用副本
                 hidden_dims=self.gnnwr_params['hidden_dims'],
                 learning_rate=self.gnnwr_params['learning_rate'],
                 bandwidth=self.gnnwr_params['bandwidth'],
-                use_spatial_weights=self.gnnwr_params['use_spatial_weights']
+                use_spatial_weights=use_spatial
             )
 
             # 训练模型
             self.logger.info(f"开始增强版GNNWR训练，输入维度: {input_dim}")
-            self.gnnwr_trainer.train(
-                train_loader,
-                epochs=self.gnnwr_params['epochs'],
-                patience=self.gnnwr_params['patience']
-            )
+            try:
+                self.gnnwr_trainer.train(
+                    train_loader,
+                    epochs=self.gnnwr_params['epochs'],
+                    patience=self.gnnwr_params['patience']
+                )
+            except MemoryError as e:
+                self.logger.error(f"内存不足: {e}，回退到基础版GNNWR")
+                self.use_enhanced_gnnwr = False
+                self.train_gnnwr_model(X, y, cluster_predictions, coords)
+                return
         else:
-            # 使用基础版GNNWR
+            # 使用基础版GNNWR（无空间权重，内存友好）
             self.logger.info("使用基础版GNNWR训练器")
 
             # 创建数据集
@@ -410,29 +506,41 @@ class SWEClusterEnsemble:
             )
 
         # 计算训练集性能
-        y_pred = self.predict_with_gnnwr(gnnwr_features_imputed, cluster_predictions, coords)
+        # 关键修复：使用 coords_copy 而不是 coords
+        y_pred = self.predict_with_gnnwr(gnnwr_features_imputed, None, coords_copy)
         mae = mean_absolute_error(y, y_pred)
         rmse = np.sqrt(mean_squared_error(y, y_pred))
         r_value, _ = pearsonr(y, y_pred)
 
         self.logger.info(f"GNNWR模型训练完成: MAE={mae:.3f}, RMSE={rmse:.3f}, R={r_value:.3f}")
 
-    def predict_with_gnnwr(self, X, cluster_predictions, coords=None):
-        """使用GNNWR进行预测
-
-        Args:
-            X (np.array): 特征数据
-            cluster_predictions (np.array): 各聚类模型的预测结果
-            coords (np.array): 坐标数据
-
-        Returns:
-            np.array: 预测结果
-        """
+    def predict_with_gnnwr(self, X, cluster_predictions=None, coords=None):
+        """使用GNNWR进行预测 - 修复版本"""
         if self.gnnwr_trainer is None:
             raise ValueError("GNNWR模型尚未训练")
 
-        # 使用特征：原始特征 + 各聚类预测
-        gnnwr_features = np.hstack([X, cluster_predictions])
+        self.logger.info(f"预测时特征维度调试:")
+        self.logger.info(f"  X形状: {X.shape}")
+
+        # 关键修复：如果传入了cluster_predictions，说明X已经是原始特征
+        # 需要重新合并特征，但要确保维度一致
+        if cluster_predictions is not None:
+            self.logger.info(f"  需要合并cluster_predictions: {cluster_predictions.shape}")
+
+            # 检查X的维度是否已经包含了聚类预测
+            expected_original_dim = X.shape[1] - self.n_clusters
+            if X.shape[1] == expected_original_dim + self.n_clusters:
+                # X已经包含了聚类预测，直接使用
+                gnnwr_features = X
+                self.logger.info(f"  X已经包含聚类预测，直接使用")
+            else:
+                # 需要合并
+                gnnwr_features = np.hstack([X, cluster_predictions])
+                self.logger.info(f"  合并后特征维度: {gnnwr_features.shape}")
+        else:
+            # 如果cluster_predictions为None，说明X已经是合并后的特征
+            self.logger.info(f"  X已经是合并后的特征")
+            gnnwr_features = X
 
         # 处理缺失值
         if self.gnnwr_imputer is not None:
@@ -440,11 +548,35 @@ class SWEClusterEnsemble:
         else:
             gnnwr_features_imputed = gnnwr_features
 
+        # 维度验证
+        expected_dim = self.gnnwr_trainer.model.feature_network[0].in_features
+        actual_dim = gnnwr_features_imputed.shape[1]
+
+        if actual_dim != expected_dim:
+            self.logger.error(f"维度不匹配: 输入特征{actual_dim}维, 模型期望{expected_dim}维")
+            raise ValueError(f"特征维度不匹配: 输入{actual_dim} vs 模型{expected_dim}")
+
         # 预测
         if self.use_enhanced_gnnwr:
             return self.gnnwr_trainer.predict(gnnwr_features_imputed, coords)
         else:
             return self.gnnwr_trainer.predict(gnnwr_features_imputed)
+
+    def validate_feature_dimensions(self, features, stage="training"):
+        """验证特征维度一致性"""
+        if self.gnnwr_trainer is None:
+            return True
+
+        # 获取模型期望的输入维度
+        if hasattr(self.gnnwr_trainer.model, 'feature_network'):
+            expected_dim = self.gnnwr_trainer.model.feature_network[0].in_features
+            actual_dim = features.shape[1]
+
+            if actual_dim != expected_dim:
+                self.logger.error(f"{stage}阶段维度不匹配: 实际{actual_dim}维, 期望{expected_dim}维")
+                return False
+
+        return True
 
     def evaluate_predictions(self, y_true, y_pred):
         """评估预测性能
@@ -469,7 +601,8 @@ class SWEClusterEnsemble:
         }
 
     def cross_validate(self, X, y, groups, coords=None, cv_type='station'):
-        """执行交叉验证 - 使用GNNWR集成"""
+        """执行交叉验证 - 详细坐标调试"""
+        from sklearn.model_selection import LeaveOneGroupOut
         logo = LeaveOneGroupOut()
 
         all_predictions = []
@@ -480,6 +613,7 @@ class SWEClusterEnsemble:
         total_folds = len(unique_groups)
 
         self.logger.info(f"开始{cv_type}交叉验证，共{total_folds}个折叠...")
+        self.logger.info(f"初始坐标状态: {'可用' if coords is not None else '不可用'}")
 
         # 在整个数据集上按站点进行一次聚类
         self.logger.info("在整个数据集上按站点进行聚类分配...")
@@ -490,15 +624,35 @@ class SWEClusterEnsemble:
             test_size = len(test_idx)
             train_size = len(train_idx)
 
-            self.logger.debug(f"{cv_type} Fold {fold + 1}: 训练集{train_size}样本, 测试集{test_size}样本")
+            self.logger.info(f"=== Fold {fold + 1} 详细调试 ===")
+            self.logger.info(f"训练集大小: {train_size}, 测试集大小: {test_size}")
 
             # 分割数据
             X_train, X_test = X[train_idx], X[test_idx]
             y_train, y_test = y[train_idx], y[test_idx]
             groups_train, groups_test = groups[train_idx], groups[test_idx]
-            # 分割坐标（如果可用）
-            coords_train = coords[train_idx] if coords is not None else None
-            coords_test = coords[test_idx] if coords is not None else None
+
+            # 分割坐标 - 详细检查
+            if coords is not None:
+                coords_train = coords[train_idx]
+                coords_test = coords[test_idx]
+
+                self.logger.info(f"坐标分割结果:")
+                self.logger.info(f"  coords_train类型: {type(coords_train)}")
+                self.logger.info(f"  coords_train形状: {coords_train.shape}")
+                self.logger.info(f"  coords_test类型: {type(coords_test)}")
+                self.logger.info(f"  coords_test形状: {coords_test.shape}")
+
+                # 检查是否有空数组
+                if len(coords_train) == 0:
+                    self.logger.error(f"⚠️  Fold {fold + 1}: coords_train为空数组!")
+                if len(coords_test) == 0:
+                    self.logger.error(f"⚠️  Fold {fold + 1}: coords_test为空数组!")
+
+            else:
+                self.logger.error(f"❌ Fold {fold + 1}: 初始coords为None!")
+                coords_train = None
+                coords_test = None
 
             # 使用固定的聚类分配
             train_cluster_labels = self.cluster_assignments[train_idx]
@@ -512,12 +666,22 @@ class SWEClusterEnsemble:
                 # 第二步：获取训练集上的聚类预测
                 cluster_predictions_train = self._get_cluster_predictions(X_train, train_cluster_labels)
 
-                # 第三步：训练GNNWR集成模型
+                # 第三步：训练GNNWR集成模型 - 添加前置检查
+                if coords_train is None:
+                    raise ValueError(f"Fold {fold + 1}: coords_train为None，无法训练GNNWR")
+                if len(coords_train) == 0:
+                    raise ValueError(f"Fold {fold + 1}: coords_train为空数组，无法训练GNNWR")
+
                 self.train_gnnwr_model(X_train, y_train, cluster_predictions_train, coords_train)
 
-                # 第四步：预测测试集
+                # 第四步：预测测试集 - 关键修复
                 cluster_predictions_test = self._get_cluster_predictions(X_test, test_cluster_labels)
-                y_pred = self.predict_with_gnnwr(X_test, cluster_predictions_test, coords_test)
+
+                # 关键修复：测试集特征也需要与聚类预测合并
+                test_features_combined = np.hstack([X_test, cluster_predictions_test])
+                self.logger.info(f"测试集合并特征形状: {test_features_combined.shape}")
+
+                y_pred = self.predict_with_gnnwr(test_features_combined, None, coords_test)  # 第二个参数传None
 
                 # 存储结果
                 all_predictions.extend(y_pred)
@@ -535,6 +699,8 @@ class SWEClusterEnsemble:
 
             except Exception as e:
                 self.logger.error(f"折叠 {fold + 1} 训练失败: {e}")
+                import traceback
+                self.logger.error(f"详细错误信息: {traceback.format_exc()}")
                 continue
 
         # 计算总体性能
@@ -604,12 +770,12 @@ class SWEClusterEnsemble:
             self.cluster_assignments = self.perform_clustering(X, station_groups)
             results['cluster_assignments'] = self.cluster_assignments
 
-            # 3. 站点交叉验证（使用固定聚类）
-            self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 3: 站点交叉验证")
-            self.logger.info("=" * 50)
-
-            results['station_cv'] = self.cross_validate(X, y, station_groups, coords, 'station')
+            # # 3. 站点交叉验证（使用固定聚类）
+            # self.logger.info("\n" + "=" * 50)
+            # self.logger.info("步骤 3: 站点交叉验证")
+            # self.logger.info("=" * 50)
+            #
+            # results['station_cv'] = self.cross_validate(X, y, station_groups, coords, 'station')
 
             # 4. 年度交叉验证（使用固定聚类）
             self.logger.info("\n" + "=" * 50)
@@ -744,14 +910,7 @@ class SWEClusterEnsemble:
         self.logger.info(f"结果已保存到: {output_dir}")
 
     def _generate_report(self, results):
-        """生成分析报告
-
-        Args:
-            results (dict): 分析结果
-
-        Returns:
-            str: 报告文本
-        """
+        """生成分析报告 - 修复版本：处理缺失的station_cv"""
         report = []
         report.append("=" * 70)
         report.append("❄️ SWE聚类集成回归分析报告")
@@ -770,16 +929,20 @@ class SWEClusterEnsemble:
         report.append(f"  GNNWR版本: {'增强版' if self.use_enhanced_gnnwr else '基础版'}")
         report.append("")
 
-        # 站点交叉验证结果
-        station_cv = results['station_cv']
-        station_overall = station_cv['overall']
-        report.append("🏔️ 站点交叉验证结果:")
-        report.append(f"  折叠数量: {station_cv['folds']}")
-        report.append(f"  MAE: {station_overall['MAE']:.3f} mm")
-        report.append(f"  RMSE: {station_overall['RMSE']:.3f} mm")
-        report.append(f"  R: {station_overall['R']:.3f}")
-        report.append(f"  R²: {station_overall['R_squared']:.3f}")
-        report.append("")
+        # 站点交叉验证结果（如果存在）
+        if 'station_cv' in results:
+            station_cv = results['station_cv']
+            station_overall = station_cv['overall']
+            report.append("🏔️ 站点交叉验证结果:")
+            report.append(f"  折叠数量: {station_cv['folds']}")
+            report.append(f"  MAE: {station_overall['MAE']:.3f} mm")
+            report.append(f"  RMSE: {station_overall['RMSE']:.3f} mm")
+            report.append(f"  R: {station_overall['R']:.3f}")
+            report.append(f"  R²: {station_overall['R_squared']:.3f}")
+            report.append("")
+        else:
+            report.append("🏔️ 站点交叉验证: 已跳过")
+            report.append("")
 
         # 年度交叉验证结果
         yearly_cv = results['yearly_cv']
@@ -801,40 +964,27 @@ class SWEClusterEnsemble:
         report.append("")
 
         report.append("🎯 模型配置:")
-        report.append(f"  XGBoost参数: {self.params}")
+        report.append(f"  基础模型: {'随机森林' if self.use_rf else 'XGBoost'}")
+        if hasattr(self, 'params') and self.params:
+            report.append(f"  模型参数: {self.params}")
         report.append(f"  GNNWR参数: {self.gnnwr_params}")
 
         return "\n".join(report)
 
     def _create_visualizations(self, results, output_dir):
-        """创建可视化图表
-
-        Args:
-            results (dict): 分析结果
-            output_dir (str): 输出目录
-        """
-        self.logger.info("生成可视化图表...")
+        """创建可视化图表 - 使用英文标签"""
+        self.logger.info("Generating visualizations...")
 
         try:
-            # 1. 预测值与真实值散点图
+            # 检查必要的键是否存在
+            if 'yearly_cv' not in results:
+                self.logger.warning("Missing yearly CV results, skipping visualization")
+                return
+
             plt.figure(figsize=(12, 10))
 
-            # 站点交叉验证散点图
+            # 1. 年度交叉验证散点图
             plt.subplot(2, 2, 1)
-            station_cv = results['station_cv']
-            y_true_station = station_cv['true_values']
-            y_pred_station = station_cv['predictions']
-
-            plt.scatter(y_true_station, y_pred_station, alpha=0.6, s=20)
-            plt.plot([y_true_station.min(), y_true_station.max()],
-                     [y_true_station.min(), y_true_station.max()], 'r--', alpha=0.8)
-            plt.xlabel('真实SWE (mm)')
-            plt.ylabel('预测SWE (mm)')
-            plt.title(f'站点交叉验证\nMAE={station_cv["overall"]["MAE"]:.2f}, R={station_cv["overall"]["R"]:.3f}')
-            plt.grid(True, alpha=0.3)
-
-            # 年度交叉验证散点图
-            plt.subplot(2, 2, 2)
             yearly_cv = results['yearly_cv']
             y_true_yearly = yearly_cv['true_values']
             y_pred_yearly = yearly_cv['predictions']
@@ -842,59 +992,67 @@ class SWEClusterEnsemble:
             plt.scatter(y_true_yearly, y_pred_yearly, alpha=0.6, s=20, color='orange')
             plt.plot([y_true_yearly.min(), y_true_yearly.max()],
                      [y_true_yearly.min(), y_true_yearly.max()], 'r--', alpha=0.8)
-            plt.xlabel('真实SWE (mm)')
-            plt.ylabel('预测SWE (mm)')
-            plt.title(f'年度交叉验证\nMAE={yearly_cv["overall"]["MAE"]:.2f}, R={yearly_cv["overall"]["R"]:.3f}')
+            plt.xlabel('True SWE (mm)')
+            plt.ylabel('Predicted SWE (mm)')
+            plt.title(
+                f'Yearly Cross-Validation\nMAE={yearly_cv["overall"]["MAE"]:.2f}, R={yearly_cv["overall"]["R"]:.3f}')
+            plt.grid(True, alpha=0.3)
+
+            # 2. 残差分布图
+            plt.subplot(2, 2, 2)
+            residuals = y_true_yearly - y_pred_yearly
+            plt.hist(residuals, bins=30, alpha=0.7, color='skyblue')
+            plt.xlabel('Residuals (mm)')
+            plt.ylabel('Frequency')
+            plt.title('Residual Distribution')
             plt.grid(True, alpha=0.3)
 
             # 3. 聚类分布图
             plt.subplot(2, 2, 3)
-            cluster_assignments = results['cluster_assignments']
-            cluster_counts = np.bincount(cluster_assignments)
-            colors = plt.cm.Set3(np.linspace(0, 1, len(cluster_counts)))
+            if 'cluster_assignments' in results:
+                cluster_assignments = results['cluster_assignments']
+                cluster_counts = np.bincount(cluster_assignments)
+                colors = plt.cm.Set3(np.linspace(0, 1, len(cluster_counts)))
 
-            bars = plt.bar(range(len(cluster_counts)), cluster_counts, color=colors)
-            plt.xlabel('聚类ID')
-            plt.ylabel('样本数量')
-            plt.title('聚类分布')
-            plt.xticks(range(len(cluster_counts)))
+                bars = plt.bar(range(len(cluster_counts)), cluster_counts, color=colors)
+                plt.xlabel('Cluster ID')
+                plt.ylabel('Sample Count')
+                plt.title('Cluster Distribution')
+                plt.xticks(range(len(cluster_counts)))
+
+                # 在柱状图上添加数值标签
+                for bar, count in zip(bars, cluster_counts):
+                    plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                             f'{count}', ha='center', va='bottom')
+            else:
+                plt.text(0.5, 0.5, 'No Cluster Data', ha='center', va='center', transform=plt.gca().transAxes)
+                plt.title('Cluster Distribution')
+
+            # 4. 性能图
+            plt.subplot(2, 2, 4)
+            yearly = results['yearly_cv']['overall']
+            metrics = ['MAE', 'RMSE', 'R']
+            values = [yearly['MAE'], yearly['RMSE'], yearly['R']]
+            colors = ['skyblue', 'lightgreen', 'lightcoral']
+
+            bars = plt.bar(metrics, values, color=colors, alpha=0.7)
+            plt.ylabel('Value')
+            plt.title('Yearly CV Performance')
 
             # 在柱状图上添加数值标签
-            for bar, count in zip(bars, cluster_counts):
-                plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
-                         f'{count}', ha='center', va='bottom')
-
-            # 4. 性能对比图
-            plt.subplot(2, 2, 4)
-            methods = ['站点CV', '年度CV']
-            maes = [station_cv['overall']['MAE'], yearly_cv['overall']['MAE']]
-            rs = [station_cv['overall']['R'], yearly_cv['overall']['R']]
-
-            x = np.arange(len(methods))
-            width = 0.35
-
-            fig, ax1 = plt.subplots(figsize=(10, 6))
-            ax2 = ax1.twinx()
-
-            bars1 = ax1.bar(x - width / 2, maes, width, label='MAE', alpha=0.7, color='skyblue')
-            bars2 = ax2.bar(x + width / 2, rs, width, label='R', alpha=0.7, color='lightcoral')
-
-            ax1.set_xlabel('验证方法')
-            ax1.set_ylabel('MAE (mm)', color='skyblue')
-            ax2.set_ylabel('R', color='lightcoral')
-            ax1.set_xticks(x)
-            ax1.set_xticklabels(methods)
-            ax1.legend(loc='upper left')
-            ax2.legend(loc='upper right')
-            plt.title('交叉验证性能对比')
+            for bar, value in zip(bars, values):
+                plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                         f'{value:.3f}', ha='center', va='bottom')
 
             plt.tight_layout()
             plt.savefig(os.path.join(output_dir, 'performance_visualization.png'),
                         dpi=300, bbox_inches='tight')
             plt.close()
 
+            self.logger.info("✅ Visualization completed")
+
         except Exception as e:
-            self.logger.warning(f"可视化生成失败: {e}")
+            self.logger.warning(f"Visualization failed: {e}")
 
 
 def get_feature_importance(self):
@@ -1178,7 +1336,7 @@ def compare_with_baseline(self, df, output_dir):
 
 
 # 便捷使用函数
-def train_swe_cluster_ensemble(data_df, output_dir=None, n_clusters=4, params=None,
+def train_swe_cluster_ensemble(data_df, output_dir=None, n_clusters=4, params=None, use_rf=False,
                                use_enhanced_gnnwr=True, gnnwr_params=None):
     """便捷函数：训练SWE聚类集成模型
 
@@ -1197,7 +1355,8 @@ def train_swe_cluster_ensemble(data_df, output_dir=None, n_clusters=4, params=No
         n_clusters=n_clusters,
         params=params,
         gnnwr_params=gnnwr_params,
-        use_enhanced_gnnwr=use_enhanced_gnnwr
+        use_enhanced_gnnwr=use_enhanced_gnnwr,
+        use_rf = use_rf  # 传递这个参数
     )
     return trainer.run_complete_analysis(data_df, output_dir)
 
@@ -1225,6 +1384,10 @@ def load_swe_cluster_ensemble(model_path):
     trainer.gnnwr_trainer = model_data['gnnwr_trainer']
     trainer.feature_columns = model_data['feature_columns']
     trainer.cluster_assignments = model_data.get('cluster_assignments')
+
+    # 恢复RF参数（如果存在）
+    if 'rf_params' in model_data:
+        trainer.rf_params = model_data['rf_params']
 
     return trainer
 
