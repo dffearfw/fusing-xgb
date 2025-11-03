@@ -3,6 +3,7 @@ import logging
 # import logger
 import numpy as np
 import pandas as pd
+import torch
 import xgboost as xgb
 from sklearn.cluster import KMeans
 from sklearn.impute import SimpleImputer
@@ -15,6 +16,7 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
+from torch import optim
 from torch.utils.data import DataLoader
 
 # 先创建logger
@@ -1449,6 +1451,346 @@ def test_cluster_ensemble():
     return results
 
 
+class PureGNNWRModel(nn.Module):
+    """纯净版GNNWR模型 - 直接特征输入，专注深度学习优化"""
+
+    def __init__(self, input_dim, hidden_dims=[128, 64, 32, 16], output_dim=1,
+                 dropout_rate=0.3, use_batch_norm=True):
+        super(PureGNNWRModel, self).__init__()
+
+        # 深度特征提取网络
+        layers = []
+        prev_dim = input_dim
+
+        for hidden_dim in hidden_dims:
+            layers.append(nn.Linear(prev_dim, hidden_dim))
+
+            if use_batch_norm:
+                layers.append(nn.BatchNorm1d(hidden_dim))
+
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            prev_dim = hidden_dim
+
+        self.feature_network = nn.Sequential(*layers)
+
+        # 输出层
+        self.output_layer = nn.Sequential(
+            nn.Linear(prev_dim, prev_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate / 2),
+            nn.Linear(prev_dim // 2, output_dim)
+        )
+
+    def forward(self, x, spatial_weights=None, coords=None):
+        # 特征提取
+        features = self.feature_network(x)
+
+        # 空间平滑（如果提供了空间权重）
+        if spatial_weights is not None:
+            # 空间平滑：每个位置的特征是其邻近位置的加权平均
+            row_sums = torch.sum(spatial_weights, dim=1, keepdim=True)
+            normalized_weights = spatial_weights / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
+            smoothed_features = torch.matmul(normalized_weights, features)
+            output = self.output_layer(smoothed_features)
+        else:
+            output = self.output_layer(features)
+
+        return output.squeeze()
+
+
+class PureGNNWRTrainer:
+    """纯净版GNNWR训练器 - 全套深度学习优化"""
+
+    def __init__(self, input_dim, coords, hidden_dims=[128, 64, 32, 16],
+                 learning_rate=0.001, bandwidth=10.0, dropout_rate=0.3,
+                 weight_decay=1e-4, device='auto'):
+
+        # 设备设置
+        if device == 'auto':
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(device)
+
+        self.logger = logging.getLogger("PureGNNWR")
+        self.logger.info(f"纯净版GNNWR - 使用设备: {self.device}")
+
+        # 模型初始化
+        self.model = PureGNNWRModel(
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            dropout_rate=dropout_rate
+        ).to(self.device)
+
+        # 优化器 - 使用AdamW
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999)
+        )
+
+        # 学习率调度器
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=10
+        )
+
+        self.criterion = nn.HuberLoss()  # 使用HuberLoss更稳定
+
+        # 空间权重计算
+        self.coords = coords.copy() if coords is not None else None
+        self.bandwidth = bandwidth
+
+    def _compute_spatial_weights(self, batch_coords):
+        """计算空间权重矩阵"""
+        n_batch = batch_coords.shape[0]
+        if n_batch <= 1:
+            return torch.ones((n_batch, n_batch), device=self.device)
+
+        # 计算欧氏距离
+        diff = batch_coords.unsqueeze(1) - batch_coords.unsqueeze(0)
+        distances = torch.sqrt(torch.sum(diff ** 2, dim=2) + 1e-8)
+
+        # 高斯核函数
+        weights = torch.exp(-0.5 * (distances / self.bandwidth) ** 2)
+
+        return weights
+
+    def train(self, train_loader, val_loader=None, epochs=200, early_stopping_patience=20):
+        """完整深度学习训练流程"""
+        self.model.train()
+        best_val_loss = float('inf')
+        patience_counter = 0
+        train_losses = []
+        val_losses = []
+
+        for epoch in range(epochs):
+            # 训练阶段
+            self.model.train()
+            epoch_train_loss = 0.0
+
+            for batch in train_loader:
+                if len(batch) == 3:
+                    batch_features, batch_targets, batch_coords = batch
+                else:
+                    batch_features, batch_targets = batch
+                    batch_coords = None
+
+                batch_features = batch_features.to(self.device)
+                batch_targets = batch_targets.to(self.device)
+
+                self.optimizer.zero_grad()
+
+                # 计算空间权重（如果有坐标）
+                spatial_weights = None
+                if batch_coords is not None:
+                    batch_coords = batch_coords.to(self.device)
+                    spatial_weights = self._compute_spatial_weights(batch_coords)
+
+                # 前向传播
+                outputs = self.model(batch_features, spatial_weights, batch_coords)
+                loss = self.criterion(outputs, batch_targets)
+
+                # 反向传播
+                loss.backward()
+
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                self.optimizer.step()
+                epoch_train_loss += loss.item()
+
+            epoch_train_loss /= len(train_loader)
+            train_losses.append(epoch_train_loss)
+
+            # 验证阶段
+            if val_loader is not None:
+                val_loss = self.validate(val_loader)
+                val_losses.append(val_loss)
+
+                # 学习率调度
+                self.scheduler.step(val_loss)
+
+                # 早停
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    # 保存最佳模型
+                    torch.save(self.model.state_dict(), 'best_pure_gnnwr_model.pth')
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= early_stopping_patience:
+                    self.logger.info(f"早停在epoch {epoch}, 最佳验证loss: {best_val_loss:.6f}")
+                    # 加载最佳模型
+                    self.model.load_state_dict(torch.load('best_pure_gnnwr_model.pth'))
+                    break
+            else:
+                # 如果没有验证集，使用训练loss
+                self.scheduler.step(epoch_train_loss)
+
+            if epoch % 10 == 0:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                if val_loader is not None:
+                    self.logger.info(f"Epoch {epoch:3d} | Train Loss: {epoch_train_loss:.6f} | "
+                                     f"Val Loss: {val_loss:.6f} | LR: {current_lr:.2e}")
+                else:
+                    self.logger.info(f"Epoch {epoch:3d} | Train Loss: {epoch_train_loss:.6f} | "
+                                     f"LR: {current_lr:.2e}")
+
+        return train_losses, val_losses
+
+    def validate(self, val_loader):
+        """验证集评估"""
+        self.model.eval()
+        val_loss = 0.0
+
+        with torch.no_grad():
+            for batch in val_loader:
+                if len(batch) == 3:
+                    batch_features, batch_targets, batch_coords = batch
+                else:
+                    batch_features, batch_targets = batch
+                    batch_coords = None
+
+                batch_features = batch_features.to(self.device)
+                batch_targets = batch_targets.to(self.device)
+
+                spatial_weights = None
+                if batch_coords is not None:
+                    batch_coords = batch_coords.to(self.device)
+                    spatial_weights = self._compute_spatial_weights(batch_coords)
+
+                outputs = self.model(batch_features, spatial_weights, batch_coords)
+                loss = self.criterion(outputs, batch_targets)
+                val_loss += loss.item()
+
+        return val_loss / len(val_loader)
+
+    def predict(self, features, coords=None):
+        """预测"""
+        self.model.eval()
+
+        with torch.no_grad():
+            features_tensor = torch.FloatTensor(features).to(self.device)
+
+            # 分批预测避免内存溢出
+            batch_size = 1024
+            predictions = []
+
+            for i in range(0, len(features), batch_size):
+                batch_features = features_tensor[i:i + batch_size]
+
+                spatial_weights = None
+                if coords is not None:
+                    batch_coords = torch.FloatTensor(coords[i:i + batch_size]).to(self.device)
+                    spatial_weights = self._compute_spatial_weights(batch_coords)
+
+                batch_pred = self.model(batch_features, spatial_weights, batch_coords)
+                predictions.append(batch_pred.cpu().numpy())
+
+            return np.concatenate(predictions)
+
+
+def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=42):
+    """
+    运行纯净版GNNWR分析
+    直接在现有cluster.py中调用这个函数进行对比实验
+    """
+    from sklearn.model_selection import train_test_split
+
+    logger = logging.getLogger("PureGNNWRAnalysis")
+    logger.info("=" * 60)
+    logger.info("🚀 开始纯净版GNNWR对比分析")
+    logger.info("=" * 60)
+
+    try:
+        # 使用SWEClusterEnsemble的数据预处理（排除经纬度特征）
+        ensemble = SWEClusterEnsemble(n_clusters=1)  # 临时实例用于数据预处理
+        X, y, station_groups, year_groups, coords = ensemble.preprocess_data(df)
+
+        logger.info(f"数据加载: {len(X)}样本, {X.shape[1]}特征")
+
+        # 划分训练测试集
+        X_train, X_test, y_train, y_test, coords_train, coords_test = train_test_split(
+            X, y, coords, test_size=test_size, random_state=random_state
+        )
+
+        logger.info(f"数据划分: 训练集 {len(X_train)}, 测试集 {len(X_test)}")
+
+        # 创建数据集
+        train_dataset = EnhancedSpatialDataset(X_train, y_train, coords_train)
+        test_dataset = EnhancedSpatialDataset(X_test, y_test, coords_test)
+
+        # 数据加载器
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
+        test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=4)
+
+        # 训练纯净版GNNWR
+        trainer = PureGNNWRTrainer(
+            input_dim=X.shape[1],
+            coords=coords_train,
+            hidden_dims=[128, 64, 32, 16],
+            learning_rate=0.001,
+            dropout_rate=0.3,
+            weight_decay=1e-4,
+            device='cuda'
+        )
+
+        logger.info("开始纯净版GNNWR训练...")
+
+        # 训练
+        train_losses, val_losses = trainer.train(train_loader, test_loader, epochs=200)
+
+        # 最终评估
+        y_pred = trainer.predict(X_test, coords_test)
+
+        # 计算评估指标
+        mae = mean_absolute_error(y_test, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+        r_value, _ = pearsonr(y_test, y_pred)
+
+        results = {
+            'MAE': mae,
+            'RMSE': rmse,
+            'R': r_value,
+            'R_squared': r_value ** 2,
+            'samples': len(y_test)
+        }
+
+        # 输出结果
+        logger.info("🎯 纯净版GNNWR分析完成!")
+        logger.info(f"测试集性能: MAE={mae:.3f}, RMSE={rmse:.3f}, R={r_value:.3f}")
+
+        print("\n" + "=" * 60)
+        print("纯净版GNNWR最终结果:")
+        print("=" * 60)
+        print(f"MAE:           {mae:.3f} mm")
+        print(f"RMSE:          {rmse:.3f} mm")
+        print(f"R:             {r_value:.3f}")
+        print(f"R²:            {r_value ** 2:.3f}")
+        print(f"测试样本数:     {len(y_test)}")
+        print("=" * 60)
+
+        return results, trainer
+
+    except Exception as e:
+        logger.error(f"纯净版GNNWR分析失败: {e}")
+        raise
+
+
+# 在SWEClusterEnsemble类中添加一个便捷方法
+def SWEClusterEnsemble_run_pure_comparison(self, df):
+    """
+    在SWEClusterEnsemble类中添加的方法
+    用于快速运行纯净版对比实验
+    """
+    return train_pure_gnnwr_analysis(df)
+
+
+
+
+
 if __name__ == "__main__":
     # 配置日志
     logging.basicConfig(
@@ -1457,5 +1799,13 @@ if __name__ == "__main__":
     )
 
     print("测试聚类集成模型...")
-    results = test_cluster_ensemble()
+
+    # 直接运行纯净版对比（需要先有数据文件）
+    try:
+        import pandas as pd
+        df = pd.read_excel("lu_onehot.xlsx")  # 替换为您的数据文件
+        results, trainer = train_pure_gnnwr_analysis(df)
+    except Exception as e:
+        print(f"示例运行失败: {e}")
+        print("请确保有数据文件并修改文件路径")
     print("测试完成！")

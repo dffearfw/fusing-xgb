@@ -4,6 +4,7 @@ import os
 import argparse
 import pandas as pd
 from cluster import train_swe_cluster_ensemble
+from cluster import train_pure_gnnwr_analysis
 
 # 添加当前目录到路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -99,6 +100,8 @@ def main():
                         help='使用Optuna优化指定模型的超参数')
     parser.add_argument('--n-trials', type=int, default=50,
                         help='Optuna优化试验次数')
+    parser.add_argument('--pure-gnnwr', action='store_true',
+                        help='运行纯净版GNNWR对比实验')
 
     args = parser.parse_args()
 
@@ -160,6 +163,10 @@ def main():
             else:
                 best_params = optimize_swe_model(df, args.optimize, args.n_trials)
                 logger.info(f"最佳参数: {best_params}")
+
+        if args.pure_gnnwr:
+            from cluster import train_pure_gnnwr_analysis
+            results = train_pure_gnnwr_analysis(df)
 
         logger.info("✅ 模型训练完成！")
 
