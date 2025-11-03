@@ -436,7 +436,7 @@ class SWEClusterEnsemble:
 
             # 检查样本数量，如果太多则使用简化模式
             # 关键修复：使用 coords_copy 而不是 coords
-            use_spatial = self.gnnwr_params['use_spatial_weights'] and n_samples <= 5000 and coords_copy is not None
+            use_spatial = self.gnnwr_params['use_spatial_weights'] and n_samples <= 20000 and coords_copy is not None
 
             if not use_spatial:
                 self.logger.warning(f"样本数量较大 ({n_samples}) 或坐标不可用，禁用空间权重计算")
