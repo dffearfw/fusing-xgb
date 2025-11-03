@@ -130,7 +130,7 @@ class SWEClusterEnsemble:
         self.feature_columns = None
         self.target_column = 'swe'
         self.use_enhanced_gnnwr = use_enhanced_gnnwr and HAS_ENHANCED_GNNWR
-
+        self.device = device
         self.use_rf = use_rf
 
         # 关键修复：确保params不为None
@@ -154,7 +154,7 @@ class SWEClusterEnsemble:
             if params:
                 self.params.update(params)
 
-        self.device = device
+
         # GNNWR参数
         self.gnnwr_params = {
             'hidden_dims': [64, 32, 16],
@@ -163,7 +163,9 @@ class SWEClusterEnsemble:
             'batch_size': 32,
             'patience': 10,
             'bandwidth': None,
-            'use_spatial_weights': True
+            'use_spatial_weights': True,
+            'device': device,  # 传递设备参数
+            'num_workers': min(6, os.cpu_count() // 2)
         }
         if gnnwr_params:
             self.gnnwr_params.update(gnnwr_params)
@@ -1352,7 +1354,7 @@ def compare_with_baseline(self, df, output_dir):
 
 # 便捷使用函数
 def train_swe_cluster_ensemble(data_df, output_dir=None, n_clusters=4, params=None, use_rf=False,
-                               use_enhanced_gnnwr=True, gnnwr_params=None):
+                               use_enhanced_gnnwr=True, gnnwr_params=None, device='auto'):
     """便捷函数：训练SWE聚类集成模型
 
     Args:
@@ -1371,7 +1373,8 @@ def train_swe_cluster_ensemble(data_df, output_dir=None, n_clusters=4, params=No
         params=params,
         gnnwr_params=gnnwr_params,
         use_enhanced_gnnwr=use_enhanced_gnnwr,
-        use_rf = use_rf  # 传递这个参数
+        use_rf = use_rf, # 传递这个参数
+        device = device  # 添加device参数
     )
     return trainer.run_complete_analysis(data_df, output_dir)
 
