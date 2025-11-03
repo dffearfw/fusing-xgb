@@ -82,14 +82,24 @@ class EnhancedGNNWRModel(nn.Module):
 
     def forward(self, x, spatial_weights=None, coords=None):
         # 特征提取
-        features = self.feature_network(x)
+        features = self.feature_network(x)  # 形状: [batch_size, hidden_dim]
 
-        # 空间注意力加权
+        # 空间注意力加权 - 改进版本
         if self.use_attention and spatial_weights is not None and coords is not None:
-            # 应用空间权重
-            weighted_features = features * spatial_weights.unsqueeze(1)
+            # 方法：空间平滑 - 使用邻近样本的特征进行加权平均
+            batch_size = features.shape[0]
+            hidden_dim = features.shape[1]
+
+            # 归一化空间权重
+            row_sums = torch.sum(spatial_weights, dim=1, keepdim=True)
+            normalized_weights = spatial_weights / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
+
+            # 应用空间平滑：weighted_features[i] = Σ_j normalized_weights[i,j] * features[j]
+            weighted_features = torch.matmul(normalized_weights, features)
+
             output = self.output_layer(weighted_features)
         else:
+            # 没有空间权重
             output = self.output_layer(features)
 
         return output.squeeze()
