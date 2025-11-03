@@ -95,6 +95,10 @@ def main():
                         help='训练设备: auto(自动选择), cuda(GPU), cpu(CPU)')
     parser.add_argument('--num-workers', type=int, default=None,
                         help='数据加载工作进程数 (默认: 自动设置)')
+    parser.add_argument('--optimize', choices=['rf', 'xgb', 'gnnwr', 'all'],
+                        help='使用Optuna优化指定模型的超参数')
+    parser.add_argument('--n-trials', type=int, default=50,
+                        help='Optuna优化试验次数')
 
     args = parser.parse_args()
 
@@ -143,6 +147,19 @@ def main():
                 output_dir=args.output,
                 params=params
             )
+
+        # 在主函数中添加优化逻辑
+        if args.optimize:
+            from optuna_optimizer import optimize_swe_model
+            logger.info(f"开始超参数优化: {args.optimize}, 试验次数: {args.n_trials}")
+
+            if args.optimize == 'all':
+                for model_type in ['rf', 'gnnwr']:
+                    best_params = optimize_swe_model(df, model_type, args.n_trials)
+                    logger.info(f"{model_type} 最佳参数: {best_params}")
+            else:
+                best_params = optimize_swe_model(df, args.optimize, args.n_trials)
+                logger.info(f"最佳参数: {best_params}")
 
         logger.info("✅ 模型训练完成！")
 
