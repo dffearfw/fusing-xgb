@@ -157,14 +157,16 @@ class SWEClusterEnsemble:
 
         # GNNWR参数
         self.gnnwr_params = {
-            'hidden_dims': [64, 32, 16],
+            'hidden_dims': [128, 64, 32, 16],
             'learning_rate': 0.001,
-            'epochs': 100,
-            'batch_size': 32,
-            'patience': 10,
-            'bandwidth': None,
+            'epochs': 200,
+            'batch_size': 64,
+            'patience': 20,
+            'bandwidth':5.0,
             'use_spatial_weights': True,
             'device': device,  # 传递设备参数
+            'dropout_rate': 0.3,  # 添加dropout
+            'weight_decay': 1e-4,  # 权重衰减
             'num_workers': min(6, os.cpu_count() // 2)
         }
         if gnnwr_params:
@@ -436,7 +438,7 @@ class SWEClusterEnsemble:
 
             # 检查样本数量，如果太多则使用简化模式
             # 关键修复：使用 coords_copy 而不是 coords
-            use_spatial = self.gnnwr_params['use_spatial_weights'] and n_samples <= 20000 and coords_copy is not None
+            use_spatial = self.gnnwr_params['use_spatial_weights'] and coords_copy is not None
 
             if not use_spatial:
                 self.logger.warning(f"样本数量较大 ({n_samples}) 或坐标不可用，禁用空间权重计算")

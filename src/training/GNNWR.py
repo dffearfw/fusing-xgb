@@ -48,33 +48,42 @@ class SpatialWeightCalculator:
 
 
 class EnhancedGNNWRModel(nn.Module):
-    """增强的地理神经网络加权回归模型"""
+    """优化的GNNWR模型 - 精度优先版本"""
 
-    def __init__(self, input_dim, hidden_dims=[64, 32, 16], output_dim=1,
-                 spatial_dim=2, use_attention=True):
+    def __init__(self, input_dim, hidden_dims=[128, 64, 32, 16], output_dim=1,
+                 dropout_rate=0.3, use_attention=True):
         super(EnhancedGNNWRModel, self).__init__()
         self.use_attention = use_attention
 
-        # 主特征处理网络
+        # 增强的特征处理网络
         layers = []
         prev_dim = input_dim
 
-        for hidden_dim in hidden_dims:
+        for i, hidden_dim in enumerate(hidden_dims):
             layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
                 nn.BatchNorm1d(hidden_dim),
                 nn.ReLU(),
-                nn.Dropout(0.2)
+                nn.Dropout(dropout_rate)
             ])
             prev_dim = hidden_dim
 
         self.feature_network = nn.Sequential(*layers)
-        self.output_layer = nn.Linear(prev_dim, output_dim)
 
-        # 空间注意力机制
+        # 输出层
+        self.output_layer = nn.Sequential(
+            nn.Linear(prev_dim, prev_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate // 2),
+            nn.Linear(prev_dim // 2, output_dim)
+        )
+
+        # 增强的空间注意力
         if use_attention:
             self.spatial_attention = nn.Sequential(
-                nn.Linear(spatial_dim + input_dim, 32),
+                nn.Linear(2, 64),
+                nn.ReLU(),
+                nn.Linear(64, 32),
                 nn.ReLU(),
                 nn.Linear(32, 1),
                 nn.Sigmoid()
@@ -82,24 +91,16 @@ class EnhancedGNNWRModel(nn.Module):
 
     def forward(self, x, spatial_weights=None, coords=None):
         # 特征提取
-        features = self.feature_network(x)  # 形状: [batch_size, hidden_dim]
+        features = self.feature_network(x)
 
-        # 空间注意力加权 - 改进版本
+        # 空间注意力加权
         if self.use_attention and spatial_weights is not None and coords is not None:
-            # 方法：空间平滑 - 使用邻近样本的特征进行加权平均
-            batch_size = features.shape[0]
-            hidden_dim = features.shape[1]
-
-            # 归一化空间权重
+            # 空间平滑
             row_sums = torch.sum(spatial_weights, dim=1, keepdim=True)
             normalized_weights = spatial_weights / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
-
-            # 应用空间平滑：weighted_features[i] = Σ_j normalized_weights[i,j] * features[j]
             weighted_features = torch.matmul(normalized_weights, features)
-
             output = self.output_layer(weighted_features)
         else:
-            # 没有空间权重
             output = self.output_layer(features)
 
         return output.squeeze()
@@ -301,45 +302,37 @@ class EnhancedGNNWRTrainer:
         self.logger.info(f"稀疏权重矩阵创建完成: {sparse_weights.nnz} 个非零元素")
         return sparse_weights
 
-
-    def train(self, train_loader, epochs=100, patience=10, validate_spatial=True, pin_memory=True):
-        """训练模型 - 内存优化版本"""
+    def train(self, train_loader, epochs=200, patience=20):
+        """训练模型 - 精度优化版本"""
         self.model.train()
         best_loss = float('inf')
         patience_counter = 0
+        train_losses = []
+        val_losses = []
 
-        # 如果使用CUDA，启用cudnn自动优化
-        if self.device.type == 'cuda':
-            torch.cuda.empty_cache()  # 清空GPU缓存
-            initial_memory = torch.cuda.memory_allocated()
-            torch.backends.cudnn.benchmark = True
-
-        # # 大样本时禁用空间验证
-        # if validate_spatial and self.global_weights is not None:
-        #     n_samples = self.global_weights.shape[0] if hasattr(self.global_weights, 'shape') else 0
-        #     if n_samples > 5000:
-        #         validate_spatial = False
-        #         self.logger.info("样本数量较大，禁用空间自相关性验证")
+        # 学习率调度器
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', factor=0.5, patience=10, verbose=True
+        )
 
         for epoch in range(epochs):
             epoch_loss = 0.0
+            self.model.train()
+
             for batch in train_loader:
                 if len(batch) == 3:
                     batch_features, batch_targets, batch_coords = batch
-                    batch_features = batch_features.to(self.device, non_blocking=True)
-                    batch_targets = batch_targets.to(self.device, non_blocking=True)
-                    batch_coords = batch_coords.to(self.device, non_blocking=True)
                 else:
                     batch_features, batch_targets = batch
-                    batch_features = batch_features.to(self.device, non_blocking=True)
-                    batch_targets = batch_targets.to(self.device, non_blocking=True)
                     batch_coords = None
 
+                batch_features = batch_features.to(self.device)
+                batch_targets = batch_targets.to(self.device)
 
                 self.optimizer.zero_grad()
 
                 if self.use_spatial_weights and batch_coords is not None:
-                    # GPU上的空间权重计算
+                    batch_coords = batch_coords.to(self.device)
                     batch_weights = self._compute_gpu_spatial_weights(batch_coords)
                     outputs = self.model(batch_features, batch_weights, batch_coords)
                     loss = self.spatial_weighted_loss(outputs, batch_targets, batch_weights)
@@ -348,31 +341,39 @@ class EnhancedGNNWRTrainer:
                     loss = self.criterion(outputs, batch_targets)
 
                 loss.backward()
-                self.optimizer.step()
 
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                self.optimizer.step()
                 epoch_loss += loss.item()
 
             epoch_loss /= len(train_loader)
+            train_losses.append(epoch_loss)
 
-            # 早停法
+            # 学习率调度
+            scheduler.step(epoch_loss)
+
+            # 早停
             if epoch_loss < best_loss:
                 best_loss = epoch_loss
                 patience_counter = 0
+                # 保存最佳模型
+                torch.save(self.model.state_dict(), 'best_gnnwr_model.pth')
             else:
                 patience_counter += 1
 
             if patience_counter >= patience:
-                self.logger.info(f"早停在epoch {epoch}")
+                self.logger.info(f"早停在epoch {epoch}, 最佳loss: {best_loss:.6f}")
+                # 加载最佳模型
+                self.model.load_state_dict(torch.load('best_gnnwr_model.pth'))
                 break
 
-            if epoch % 20 == 0:
-                self.logger.info(f"Epoch {epoch}, Loss: {epoch_loss:.6f}")
+            if epoch % 10 == 0:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.logger.info(f"Epoch {epoch}, Loss: {epoch_loss:.6f}, LR: {current_lr:.6f}")
 
-            if self.device.type == 'cuda' and epoch % 10 == 0:
-                # 监控GPU内存使用
-                allocated = torch.cuda.memory_allocated() / 1024 ** 3
-                cached = torch.cuda.memory_reserved() / 1024 ** 3
-                self.logger.info(f"GPU内存 - 已分配: {allocated:.2f}GB, 缓存: {cached:.2f}GB")
+        return train_losses
 
     def predict(self, features, coords=None):
         """预测方法"""

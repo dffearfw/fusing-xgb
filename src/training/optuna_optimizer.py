@@ -158,3 +158,91 @@ def optimize_swe_model(data_df, model_type='rf', n_trials=50):
         raise ValueError("model_type必须是 'rf', 'xgb' 或 'gnnwr'")
 
     return best_params
+
+
+def optimize_gnnwr_params_enhanced(self, X, y, coords, cv_folds=3, n_trials=30):
+    """增强的GNNWR参数优化 - 使用GPU加速"""
+
+    def objective(trial):
+        try:
+            gnnwr_params = {
+                'hidden_dims': [
+                    trial.suggest_int('hidden1', 64, 256),
+                    trial.suggest_int('hidden2', 32, 128),
+                    trial.suggest_int('hidden3', 16, 64),
+                    trial.suggest_int('hidden4', 8, 32)
+                ],
+                'learning_rate': trial.suggest_float('learning_rate', 1e-4, 1e-2, log=True),
+                'batch_size': trial.suggest_categorical('batch_size', [32, 64, 128]),
+                'epochs': 100,  # 固定轮数用于快速评估
+                'patience': 15,
+                'dropout_rate': trial.suggest_float('dropout', 0.1, 0.5),
+                'bandwidth': trial.suggest_float('bandwidth', 2.0, 15.0),
+                'use_spatial_weights': True,
+                'device': 'cuda'  # 使用GPU加速
+            }
+
+            # 快速交叉验证评估
+            from sklearn.model_selection import KFold
+            kf = KFold(n_splits=cv_folds, shuffle=True, random_state=42)
+            mae_scores = []
+
+            for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+                if fold >= 2:  # 只做2折加速评估
+                    break
+
+                X_train, X_val = X[train_idx], X[val_idx]
+                y_train, y_val = y[train_idx], y[val_idx]
+                coords_train = coords[train_idx] if coords is not None else None
+                coords_val = coords[val_idx] if coords is not None else None
+
+                # 快速训练和评估
+                score = self._fast_gnnwr_eval(X_train, y_train, X_val, y_val,
+                                              coords_train, coords_val, gnnwr_params)
+                mae_scores.append(score)
+
+            return np.mean(mae_scores)
+
+        except Exception as e:
+            self.logger.warning(f"试验失败: {e}")
+            return float('inf')
+
+    study = optuna.create_study(direction='minimize')
+    study.optimize(objective, n_trials=n_trials, timeout=3600)  # 1小时超时
+
+    self.logger.info(f"GNNWR最佳参数: {study.best_params}")
+    self.logger.info(f"GNNWR最佳MAE: {study.best_value:.4f}")
+
+    return study.best_params
+
+
+def _fast_gnnwr_eval(self, X_train, y_train, X_val, y_val, coords_train, coords_val, gnnwr_params):
+    """快速GNNWR评估"""
+    try:
+        from cluster import SWEClusterEnsemble
+
+        # 创建简化训练器进行快速评估
+        trainer = SWEClusterEnsemble(
+            n_clusters=4,
+            gnnwr_params=gnnwr_params,
+            use_enhanced_gnnwr=True,
+            device='cuda'
+        )
+
+        # 模拟GNNWR训练过程（简化版）
+        # 这里需要根据您的实际训练逻辑调整
+        cluster_predictions = np.random.randn(len(X_train), 4)  # 模拟聚类预测
+
+        # 训练GNNWR
+        trainer.train_gnnwr_model(X_train, y_train, cluster_predictions, coords_train)
+
+        # 预测验证集
+        cluster_predictions_val = np.random.randn(len(X_val), 4)
+        y_pred = trainer.predict_with_gnnwr(X_val, cluster_predictions_val, coords_val)
+
+        mae = np.mean(np.abs(y_val - y_pred))
+        return mae
+
+    except Exception as e:
+        self.logger.error(f"快速评估失败: {e}")
+        return float('inf')
