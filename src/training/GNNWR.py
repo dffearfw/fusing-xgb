@@ -1,4 +1,5 @@
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -162,6 +163,10 @@ class EnhancedGNNWRTrainer:
             self.logger.info(f"GPU信息: {torch.cuda.get_device_name()}")
             self.logger.info(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
 
+        # 初始化模型并移动到设备
+        self.model = EnhancedGNNWRModel(input_dim, hidden_dims).to(self.device)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        self.criterion = nn.MSELoss()
 
 
 
@@ -181,10 +186,10 @@ class EnhancedGNNWRTrainer:
         print(f"EnhancedGNNWRTrainer 初始化完成")
         print(f"保存的 coords id: {id(self.coords)}")
 
-        # 检查样本数量，如果太多则禁用空间权重
-        if coords is not None and len(coords) > max_samples_for_spatial:
-            self.logger.warning(f"样本数量 {len(coords)} 超过限制 {max_samples_for_spatial}，禁用空间权重")
-            self.use_spatial_weights = False
+        # # 检查样本数量，如果太多则禁用空间权重
+        # if coords is not None and len(coords) > max_samples_for_spatial:
+        #     self.logger.warning(f"样本数量 {len(coords)} 超过限制 {max_samples_for_spatial}，禁用空间权重")
+        #     self.use_spatial_weights = False
 
         # 初始化空间权重计算器（仅在需要时）
         if self.use_spatial_weights and coords is not None:
@@ -206,6 +211,45 @@ class EnhancedGNNWRTrainer:
         self.criterion = nn.MSELoss()
 
         self.logger.info(f"EnhancedGNNWR训练器初始化完成，使用空间权重: {self.use_spatial_weights}")
+
+    def _compute_gpu_spatial_weights(self, batch_coords):
+        """在GPU上计算空间权重"""
+        n_batch = batch_coords.shape[0]
+
+        if n_batch <= 1:
+            return torch.ones((n_batch, n_batch), device=self.device)
+
+        # 使用PyTorch向量化计算（GPU加速）
+        diff = batch_coords.unsqueeze(1) - batch_coords.unsqueeze(0)
+        distances = torch.sqrt(torch.sum(diff ** 2, dim=2))
+
+        # 自适应带宽
+        sorted_distances = torch.sort(distances, dim=1).values
+        bandwidth = torch.mean(sorted_distances[:, 1:6])  # 前5个邻居
+
+        # 计算权重
+        weights = torch.exp(-0.5 * (distances / bandwidth) ** 2)
+
+        # 归一化
+        row_sums = torch.sum(weights, dim=1, keepdim=True)
+        weights = weights / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
+
+        return weights
+
+    def create_optimized_dataloader(dataset, batch_size=32, num_workers=None, pin_memory=True):
+        """创建优化的数据加载器"""
+        if num_workers is None:
+            # 自动设置工作进程数
+            num_workers = min(8, os.cpu_count() // 2)  # 使用一半的CPU核心
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,  # 加速GPU数据传输
+            persistent_workers=True if num_workers > 0 else False  # 保持工作进程
+        )
 
     def _compute_sparse_weights(self, coords, max_neighbors=50):
         """计算稀疏空间权重矩阵以减少内存使用"""
@@ -247,40 +291,46 @@ class EnhancedGNNWRTrainer:
         self.logger.info(f"稀疏权重矩阵创建完成: {sparse_weights.nnz} 个非零元素")
         return sparse_weights
 
-    def train(self, train_loader, epochs=100, patience=10, validate_spatial=True):
+
+    def train(self, train_loader, epochs=100, patience=10, validate_spatial=True, pin_memory=True):
         """训练模型 - 内存优化版本"""
         self.model.train()
         best_loss = float('inf')
         patience_counter = 0
 
-        # 大样本时禁用空间验证
-        if validate_spatial and self.global_weights is not None:
-            n_samples = self.global_weights.shape[0] if hasattr(self.global_weights, 'shape') else 0
-            if n_samples > 5000:
-                validate_spatial = False
-                self.logger.info("样本数量较大，禁用空间自相关性验证")
+        # 如果使用CUDA，启用cudnn自动优化
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()  # 清空GPU缓存
+            initial_memory = torch.cuda.memory_allocated()
+            torch.backends.cudnn.benchmark = True
+
+        # # 大样本时禁用空间验证
+        # if validate_spatial and self.global_weights is not None:
+        #     n_samples = self.global_weights.shape[0] if hasattr(self.global_weights, 'shape') else 0
+        #     if n_samples > 5000:
+        #         validate_spatial = False
+        #         self.logger.info("样本数量较大，禁用空间自相关性验证")
 
         for epoch in range(epochs):
             epoch_loss = 0.0
             for batch in train_loader:
-                if len(batch) == 3:  # 有坐标
+                if len(batch) == 3:
                     batch_features, batch_targets, batch_coords = batch
-                else:  # 没有坐标
+                    batch_features = batch_features.to(self.device, non_blocking=True)
+                    batch_targets = batch_targets.to(self.device, non_blocking=True)
+                    batch_coords = batch_coords.to(self.device, non_blocking=True)
+                else:
                     batch_features, batch_targets = batch
+                    batch_features = batch_features.to(self.device, non_blocking=True)
+                    batch_targets = batch_targets.to(self.device, non_blocking=True)
                     batch_coords = None
 
-                batch_features = batch_features.to(self.device)
-                batch_targets = batch_targets.to(self.device)
 
                 self.optimizer.zero_grad()
 
                 if self.use_spatial_weights and batch_coords is not None:
-                    # 计算批次内的空间权重
-                    batch_coords_np = batch_coords.cpu().numpy()
-                    batch_weights = self.weight_calculator.calculate_weights(
-                        batch_coords_np, batch_coords_np)
-                    batch_weights = torch.FloatTensor(batch_weights).to(self.device)
-
+                    # GPU上的空间权重计算
+                    batch_weights = self._compute_gpu_spatial_weights(batch_coords)
                     outputs = self.model(batch_features, batch_weights, batch_coords)
                     loss = self.spatial_weighted_loss(outputs, batch_targets, batch_weights)
                 else:
@@ -307,6 +357,12 @@ class EnhancedGNNWRTrainer:
 
             if epoch % 20 == 0:
                 self.logger.info(f"Epoch {epoch}, Loss: {epoch_loss:.6f}")
+
+            if self.device.type == 'cuda' and epoch % 10 == 0:
+                # 监控GPU内存使用
+                allocated = torch.cuda.memory_allocated() / 1024 ** 3
+                cached = torch.cuda.memory_reserved() / 1024 ** 3
+                self.logger.info(f"GPU内存 - 已分配: {allocated:.2f}GB, 缓存: {cached:.2f}GB")
 
     def predict(self, features, coords=None):
         """预测方法"""

@@ -111,7 +111,7 @@ class SWEClusterEnsemble:
         'eval_metric': 'rmse'
     }
 
-    def __init__(self, n_clusters=4, params=None, gnnwr_params=None, use_enhanced_gnnwr=True, use_rf=False):
+    def __init__(self, n_clusters=4, params=None, gnnwr_params=None, use_enhanced_gnnwr=True, use_rf=False, device='auto'):
         """初始化聚类集成回归器
 
         Args:
@@ -154,6 +154,7 @@ class SWEClusterEnsemble:
             if params:
                 self.params.update(params)
 
+        self.device = device
         # GNNWR参数
         self.gnnwr_params = {
             'hidden_dims': [64, 32, 16],
@@ -420,12 +421,18 @@ class SWEClusterEnsemble:
         # 添加处理后的维度调试
         self.logger.info(f"处理后特征维度: {gnnwr_features_imputed.shape}")
 
+        # 根据数据大小自动调整参数（统一设置）
+        n_samples = len(gnnwr_features_imputed)
+        batch_size = min(128, max(32, n_samples // 100))  # 自适应批次大小
+        num_workers = min(6, os.cpu_count() // 2)  # 使用一半CPU核心
+
+        self.logger.info(f"数据加载器配置: batch_size={batch_size}, workers={num_workers}")
+
         if self.use_enhanced_gnnwr:
             # 使用增强版GNNWR
             self.logger.info("使用增强版GNNWR训练器")
 
             # 检查样本数量，如果太多则使用简化模式
-            n_samples = len(gnnwr_features_imputed)
             # 关键修复：使用 coords_copy 而不是 coords
             use_spatial = self.gnnwr_params['use_spatial_weights'] and n_samples <= 5000 and coords_copy is not None
 
@@ -447,8 +454,11 @@ class SWEClusterEnsemble:
 
             train_loader = DataLoader(
                 dataset,
-                batch_size=self.gnnwr_params['batch_size'],
-                shuffle=True
+                batch_size=batch_size,  # 修复：使用自适应批次大小
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=True,  # 如果使用GPU则启用
+                persistent_workers=num_workers > 0
             )
 
             # 初始化增强版GNNWR训练器
@@ -483,10 +493,15 @@ class SWEClusterEnsemble:
 
             # 创建数据集
             dataset = SpatialDataset(gnnwr_features_imputed, y)
+
+            # 修复：基础版也使用优化配置
             train_loader = DataLoader(
                 dataset,
-                batch_size=self.gnnwr_params['batch_size'],
-                shuffle=True
+                batch_size=batch_size,  # 使用自适应批次大小
+                shuffle=True,
+                num_workers=num_workers,  # 添加多线程支持
+                pin_memory=True,
+                persistent_workers=num_workers > 0
             )
 
             # 初始化基础版GNNWR训练器

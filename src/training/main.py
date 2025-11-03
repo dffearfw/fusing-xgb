@@ -91,6 +91,10 @@ def main():
                        help='聚类数量 (默认: 4)')
     parser.add_argument('--use-rf', action='store_true',
                         help='在聚类集成中使用随机森林代替XGBoost')
+    parser.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto',
+                        help='训练设备: auto(自动选择), cuda(GPU), cpu(CPU)')
+    parser.add_argument('--num-workers', type=int, default=None,
+                        help='数据加载工作进程数 (默认: 自动设置)')
 
     args = parser.parse_args()
 
@@ -126,8 +130,9 @@ def main():
                 data_df=df,
                 output_dir=args.output,
                 n_clusters=args.n_clusters,
-                params=params,
-                use_rf=args.use_rf
+                params=build_model_parameters(args),
+                use_rf=args.use_rf,
+                device=args.device
             )
         else:
             # 使用原有模式（保持XGBoost不变）
