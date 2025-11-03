@@ -42,4 +42,4 @@ def run_optimized_training(data_path):
 
 
 if __name__ == "__main__":
-    run_optimized_training('data.csv')
+    run_optimized_training('E:/pycharmworkspace/fusing-xgb/src/training/lu_onehot.xlsx')
