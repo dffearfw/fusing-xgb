@@ -463,7 +463,7 @@ class SWEClusterEnsemble:
                 batch_size=batch_size,  # 修复：使用自适应批次大小
                 shuffle=True,
                 num_workers=num_workers,
-                pin_memory=True,  # 如果使用GPU则启用
+                pin_memory=False,  # 如果使用GPU则启用
                 persistent_workers=num_workers > 0
             )
 
@@ -506,7 +506,7 @@ class SWEClusterEnsemble:
                 batch_size=batch_size,  # 使用自适应批次大小
                 shuffle=True,
                 num_workers=num_workers,  # 添加多线程支持
-                pin_memory=True,
+                pin_memory=False,
                 persistent_workers=num_workers > 0
             )
 
@@ -1508,7 +1508,8 @@ class PureGNNWRTrainer:
 
         # 设备设置
         if device == 'auto':
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.device = torch.device('cpu')
+            torch.set_num_threads(16)
         else:
             self.device = torch.device(device)
 

@@ -155,16 +155,17 @@ class EnhancedSpatialDataset(Dataset):
 class EnhancedGNNWRTrainer:
     """增强的GNNWR训练器 - 内存优化版本"""
 
-    def __init__(self, input_dim, coords, hidden_dims=[64, 32, 16],
+    def __init__(self, input_dim, coords, hidden_dims=[256, 128, 64, 32],
                  learning_rate=0.001, bandwidth=None, use_spatial_weights=True,
-                 max_samples_for_spatial=5000, device='auto'):
+                 max_samples_for_spatial=20000, device='auto'):
 
         # 添加 logger 初始化
         self.logger = logging.getLogger("EnhancedGNNWRTrainer")
 
         # 自动检测或指定设备
         if device == 'auto':
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            self.device = torch.device('cpu')
+            torch.set_num_threads(16)
         else:
             self.device = torch.device(device)
 
@@ -186,7 +187,8 @@ class EnhancedGNNWRTrainer:
         print(f"输入 coords is None: {coords is None}")
         print(f"输入 coords id: {id(coords)}")
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cpu')
+        torch.set_num_threads(16)
         if coords is not None:
             self.coords = coords.copy()  # 创建副本，避免修改原数据
         else:
@@ -247,11 +249,30 @@ class EnhancedGNNWRTrainer:
 
         return weights
 
+    def _compute_cpu_spatial_weights(self, batch_coords):
+        n_batch = batch_coords.shape[0]
+        if n_batch <= 1:
+            return torch.ones((n_batch, n_batch), device=self.device)
+
+        # 使用numpy计算（CPU上更快）
+        batch_coords_np = batch_coords.numpy()
+        distances = cdist(batch_coords_np, batch_coords_np, metric='euclidean')
+        weights = np.exp(-0.5 * (distances / self.bandwidth) ** 2)
+
+        # 转换为tensor
+        weights_tensor = torch.FloatTensor(weights).to(self.device)
+
+        # 归一化
+        row_sums = torch.sum(weights_tensor, dim=1, keepdim=True)
+        normalized_weights = weights_tensor / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
+
+        return normalized_weights
+
     def create_optimized_dataloader(dataset, batch_size=32, num_workers=None, pin_memory=True):
         """创建优化的数据加载器"""
         if num_workers is None:
             # 自动设置工作进程数
-            num_workers = min(8, os.cpu_count() // 2)  # 使用一半的CPU核心
+            num_workers = min(12, os.cpu_count() - 4)  # 使用一半的CPU核心
 
         return DataLoader(
             dataset,
@@ -333,7 +354,7 @@ class EnhancedGNNWRTrainer:
 
                 if self.use_spatial_weights and batch_coords is not None:
                     batch_coords = batch_coords.to(self.device)
-                    batch_weights = self._compute_gpu_spatial_weights(batch_coords)
+                    batch_weights = self._compute_cpu_spatial_weights(batch_coords)  # 使用CPU版本
                     outputs = self.model(batch_features, batch_weights, batch_coords)
                     loss = self.spatial_weighted_loss(outputs, batch_targets, batch_weights)
                 else:
@@ -386,9 +407,7 @@ class EnhancedGNNWRTrainer:
                 coords_tensor = torch.FloatTensor(coords).to(self.device)
                 # 计算批次内的空间权重
                 batch_coords_np = coords_tensor.cpu().numpy()
-                batch_weights = self.weight_calculator.calculate_weights(
-                    batch_coords_np, batch_coords_np)
-                batch_weights = torch.FloatTensor(batch_weights).to(self.device)
+                batch_weights = self._compute_cpu_spatial_weights(coords_tensor)
 
                 outputs = self.model(features_tensor, batch_weights, coords_tensor)
             else:
