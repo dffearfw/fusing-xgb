@@ -1,92 +1,139 @@
 import os
-import sys
 import ctypes
-import glob
+import subprocess
+import sys
 
 
-def check_dll_dependencies():
-    """检查c10.dll的依赖关系"""
-    print("=== DLL依赖关系检查 ===")
+def set_dll_directory():
+    """设置DLL搜索目录优先级"""
+    torch_lib_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib"
 
-    # c10.dll路径（根据你的错误信息）
-    c10_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib\c10.dll"
-
-    if not os.path.exists(c10_path):
-        print(f"❌ c10.dll不存在: {c10_path}")
-        return
-
-    print(f"✓ c10.dll存在: {c10_path}")
-
-    # 尝试加载c10.dll
+    # 方法1：使用SetDllDirectory (最高优先级)
     try:
-        c10_dll = ctypes.WinDLL(c10_path)
-        print("✓ c10.dll可以正常加载")
-        return True
+        kernel32 = ctypes.WinDLL('kernel32.dll')
+        kernel32.SetDllDirectoryW(torch_lib_path)
+        print("✓ 已设置DLL目录优先级")
     except Exception as e:
-        print(f"❌ c10.dll加载失败: {e}")
+        print(f"SetDllDirectory失败: {e}")
 
-        # 检查缺失的依赖
-        print("\n=== 检查缺失的DLL ===")
-        try:
-            result = subprocess.run(['dumpbin', '/dependents', c10_path],
-                                    capture_output=True, text=True, shell=True)
-            if result.returncode == 0:
-                print("c10.dll依赖:")
-                for line in result.stdout.split('\n'):
-                    if '.dll' in line.lower():
-                        print(f"  {line.strip()}")
-        except:
-            print("无法运行dumpbin命令")
-
-        return False
+    # 方法2：强制添加到PATH开头
+    os.environ['PATH'] = torch_lib_path + ';' + os.environ['PATH']
+    print("✓ 已强制PATH优先级")
 
 
-def check_cuda_libraries():
-    """检查CUDA相关库"""
-    print("\n=== CUDA库检查 ===")
+def preload_essential_dlls():
+    """预加载必需的DLL"""
+    torch_lib_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib"
 
-    cuda_paths = [
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.1\bin",
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9\bin",
-        r"C:\Windows\System32",
+    print("=== 预加载DLL ===")
+
+    # 按依赖顺序加载
+    load_order = [
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "msvcp140.dll",
+        "cudart64_12.dll",
+        "cublas64_12.dll",
+        "cudnn64_8.dll",
+        "cufft64_11.dll",
+        "nvToolsExt64_1.dll",
+        "c10.dll"
     ]
 
-    required_dlls = [
-        "cudart64_12.dll", "cublas64_12.dll", "cudnn64_8.dll",
-        "nvToolsExt64_1.dll", "cufft64_11.dll"
-    ]
+    loaded_dlls = {}
 
-    for dll in required_dlls:
-        found = False
-        for path in cuda_paths:
-            dll_path = os.path.join(path, dll)
-            if os.path.exists(dll_path):
-                print(f"✓ {dll}: {dll_path}")
-                found = True
-                break
-        if not found:
-            print(f"❌ {dll}: 未找到")
+    for dll_name in load_order:
+        dll_path = os.path.join(torch_lib_path, dll_name)
+        if os.path.exists(dll_path):
+            try:
+                # 使用LoadLibraryEx避免依赖冲突
+                kernel32 = ctypes.WinDLL('kernel32.dll')
+                handle = kernel32.LoadLibraryExW(dll_path, None, 0x00000800)  # LOAD_WITH_ALTERED_SEARCH_PATH
 
+                if handle:
+                    loaded_dlls[dll_name] = handle
+                    print(f"✓ 预加载: {dll_name}")
+                else:
+                    error_code = ctypes.get_last_error()
+                    print(f"❌ 预加载失败 {dll_name}: 错误代码 {error_code}")
 
-def check_system_environment():
-    """检查系统环境"""
-    print("\n=== 系统环境检查 ===")
-
-    # 检查Visual C++ Redistributable
-    vc_redist_paths = [
-        r"C:\Windows\System32\vcruntime140.dll",
-        r"C:\Windows\System32\vcruntime140_1.dll",
-        r"C:\Windows\System32\msvcp140.dll",
-    ]
-
-    for dll in vc_redist_paths:
-        if os.path.exists(dll):
-            print(f"✓ {os.path.basename(dll)}: 存在")
+            except Exception as e:
+                print(f"❌ 预加载异常 {dll_name}: {e}")
         else:
-            print(f"❌ {os.path.basename(dll)}: 缺失")
+            print(f"❌ 文件不存在: {dll_name}")
+
+    return loaded_dlls
+
+
+def apply_dll_fix_before_import():
+    """在导入任何模块之前应用DLL修复"""
+    print("=== 应用预导入DLL修复 ===")
+
+    # 设置DLL目录（必须在任何导入之前）
+    torch_lib_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib"
+
+    if os.path.exists(torch_lib_path):
+        # 1. 设置进程级DLL目录
+        kernel32 = ctypes.WinDLL('kernel32.dll')
+        kernel32.SetDllDirectoryW(torch_lib_path)
+        print("✓ SetDllDirectoryW 设置成功")
+
+        # 2. 预加载关键DLL（按依赖顺序）
+        dll_load_order = [
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "msvcp140.dll",
+            "cudart64_12.dll",
+            "cublas64_12.dll",
+            "cudnn64_8.dll",
+            "cufft64_11.dll",
+            "c10.dll"
+        ]
+
+        for dll_name in dll_load_order:
+            dll_path = os.path.join(torch_lib_path, dll_name)
+            if os.path.exists(dll_path):
+                try:
+                    kernel32.LoadLibraryW(dll_path)
+                    print(f"✓ 预加载: {dll_name}")
+                except Exception as e:
+                    print(f"⚠️ 预加载失败 {dll_name}: {e}")
+
+    return torch_lib_path
+
+def setup_environment():
+    """设置环境然后启动真正的Python"""
+
+    # 设置DLL路径
+    torch_lib_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib"
+
+    if os.path.exists(torch_lib_path):
+        # 设置环境变量
+        os.environ['PATH'] = torch_lib_path + ';' + os.environ['PATH']
+
+        # 设置DLL目录
+        kernel32 = ctypes.WinDLL('kernel32.dll')
+        kernel32.SetDllDirectoryW(torch_lib_path)
+
+        print(f"✓ 环境设置完成: {torch_lib_path}")
+
+    return True
 
 
 if __name__ == "__main__":
-    check_dll_dependencies()
-    check_cuda_libraries()
-    check_system_environment()
+    # 在导入任何其他模块之前修复
+    lib_path = apply_dll_fix_before_import()
+
+    print("\n=== 现在导入PyTorch ===")
+    try:
+        import torch
+
+
+        print(f"CUDA可用: {torch.cuda.is_available()}")
+
+        if torch.cuda.is_available():
+            print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    except Exception as e:
+        print(f"❌ 导入失败: {e}")
+        input("按Enter退出...")

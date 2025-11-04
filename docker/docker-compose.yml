@@ -1,62 +1,14 @@
 version: '3.8'
 
 services:
-  app:
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-    container_name: fusing-xgb-app
-    restart: unless-stopped
-    volumes:
-      - ./data:/app/data
-      - ./logs:/app/logs
-      - ./outputs:/app/outputs
+  pytorch-app:
+    build: .  # 使用当前目录的Dockerfile构建镜像
+    container_name: my-pytorch-cuda-app  # 容器名称
+    runtime: nvidia  # 使用NVIDIA GPU
     environment:
-      - ENVIRONMENT=production
-      - LOG_LEVEL=INFO
-    ports:
-      - "8000:8000"
-    networks:
-      - fusing-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-
-  nginx:
-    image: nginx:alpine
-    container_name: fusing-xgb-nginx
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
+      - NVIDIA_VISIBLE_DEVICES=all  # 使用所有GPU
     volumes:
-      - ./docker/nginx.conf:/etc/nginx/nginx.conf
-      - ./logs/nginx:/var/log/nginx
-    depends_on:
-      - app
-    networks:
-      - fusing-network
-
-  monitor:
-    image: grafana/grafana:latest
-    container_name: fusing-xgb-monitor
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin123
-    volumes:
-      - ./monitor/grafana:/var/lib/grafana
-    networks:
-      - fusing-network
-
-networks:
-  fusing-network:
-    driver: bridge
-
-volumes:
-  data:
-  logs:
-  outputs:
+      - .:/workspace  # 把当前目录映射到容器内的/workspace
+    working_dir: /workspace  # 设置工作目录
+    stdin_open: true  # 保持标准输入打开
+    tty: true  # 分配伪终端

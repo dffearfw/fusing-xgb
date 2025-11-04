@@ -1,53 +1,15 @@
-FROM python:3.9-slim
+FROM pytorch/pytorch:2.0.1-cuda11.8-cudnn8-runtime
+# 设置工作目录（容器内的文件夹）
+WORKDIR /workspace
 
-# 设置工作目录
-WORKDIR /app
+# 复制你的整个项目到容器中
+COPY . .
 
-# 安装系统依赖
-RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    build-essential \
-    curl \
-    wget \
-    git \
-    && rm -rf /var/lib/apt/lists/*
+# 安装可能需要的其他Python包（如果有的话）
+# RUN pip install pandas scikit-learn matplotlib
 
-# 复制依赖文件
-COPY src/requirements.txt .
+# 设置Python路径，让Python能找到你的代码
+ENV PYTHONPATH=/workspace
 
-# 安装Python依赖
-RUN pip install --no-cache-dir -r requirements.txt
-
-# 复制源代码
-COPY src/ .
-
-# 创建必要的目录
-RUN mkdir -p /app/outputs/combined \
-    /app/outputs/cswe/last \
-    /app/outputs/era5_swe \
-    /app/outputs/era5_temperature \
-    /app/outputs/glsnow \
-    /app/outputs/landcover \
-    /app/outputs/landuse \
-    /app/outputs/snow_depth/temp \
-    /app/outputs/snow_phenology \
-    /app/outputs/terrain_features \
-    /app/outputs/train_results \
-    /app/process/logs \
-    /app/download/logs
-
-# 设置环境变量
-ENV PYTHONPATH=/app
-ENV PYTHONUNBUFFERED=1
-
-# 创建非root用户
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
-USER appuser
-
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-# 启动命令
-CMD ["python", "-m", "process.main"]
+# 运行你的CUDA测试脚本
+CMD ["python", "src/training/check_cuda.py"]
