@@ -1,56 +1,79 @@
 import torch
-import subprocess
+import torch.nn as nn
+import time
 import os
 
+print("=== CPU模式训练 ===")
+print(f"PyTorch版本: {torch.__version__}")
+print(f"设备: CPU")
+print(f"线程数: {torch.get_num_threads()}")
 
-def comprehensive_cuda_check():
-    print("=== 完整CUDA环境检查 ===")
-
-    # 检查环境变量
-    cuda_path = os.environ.get('CUDA_PATH', '未设置')
-    print(f"CUDA_PATH: {cuda_path}")
-
-    # 检查PATH中的CUDA相关路径
-    path = os.environ.get('PATH', '')
-    cuda_in_path = any('cuda' in p.lower() for p in path.split(';'))
-    print(f"CUDAtoolkit在PATH中: {cuda_in_path}")
-
-    # PyTorch CUDA检查
-    print(f"\n=== PyTorch CUDA状态 ===")
-    print(f"PyTorch版本: {torch.__version__}")
-    print(f"CUDA可用: {torch.cuda.is_available()}")
-
-    if torch.cuda.is_available():
-        print(f"CUDA版本: {torch.version.cuda}")
-        print(f"GPU数量: {torch.cuda.device_count()}")
-
-        for i in range(torch.cuda.device_count()):
-            prop = torch.cuda.get_device_properties(i)
-            print(f"GPU {i}: {prop.name}")
-            print(f"  计算能力: {prop.major}.{prop.minor}")
-            print(f"  显存: {prop.total_memory / 1024 ** 3:.1f} GB")
-
-        # CUDA计算测试
-        print("\n=== CUDA性能测试 ===")
-        device = torch.device('cuda')
-        x = torch.randn(5000, 5000, device=device)
-        y = torch.randn(5000, 5000, device=device)
-
-        import time
-        start = time.time()
-        z = x @ y  # 矩阵乘法
-        torch.cuda.synchronize()
-        end = time.time()
-
-        print(f"5000x5000矩阵乘法耗时: {(end - start) * 1000:.2f} ms")
-
-    else:
-        print("\n=== 故障排除建议 ===")
-        print("1. 确认已安装CUDA工具包")
-        print("2. 检查环境变量CUDA_PATH是否正确设置")
-        print("3. 重启命令提示符或IDE")
-        print("4. 重新安装支持CUDA的PyTorch版本")
+# 设置CPU优化
+torch.set_num_threads(min(8, os.cpu_count()))
 
 
-if __name__ == "__main__":
-    comprehensive_cuda_check()
+# 简单的模型
+class SimpleModel(nn.Module):
+    def __init__(self, input_size=100, hidden_size=50, output_size=1):
+        super(SimpleModel, self).__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
+        self.fc3 = nn.Linear(hidden_size // 2, output_size)
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+
+# 创建模型和数据
+device = torch.device('cpu')
+model = SimpleModel().to(device)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+# 生成模拟数据
+batch_size = 64
+x_train = torch.randn(1000, 100)
+y_train = torch.randn(1000, 1)
+
+print(f"\n开始训练...")
+print(f"数据形状: {x_train.shape}")
+
+# 训练循环
+model.train()
+start_time = time.time()
+
+for epoch in range(10):  # 只训练10个epoch测试
+    epoch_loss = 0.0
+
+    for i in range(0, len(x_train), batch_size):
+        batch_x = x_train[i:i + batch_size]
+        batch_y = y_train[i:i + batch_size]
+
+        optimizer.zero_grad()
+        outputs = model(batch_x)
+        loss = criterion(outputs, batch_y)
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item()
+
+    if epoch % 2 == 0:
+        avg_loss = epoch_loss / (len(x_train) // batch_size)
+        print(f"Epoch {epoch}: Loss = {avg_loss:.4f}")
+
+end_time = time.time()
+print(f"\n训练完成! 耗时: {end_time - start_time:.2f}秒")
+
+# 测试推理
+model.eval()
+with torch.no_grad():
+    test_input = torch.randn(10, 100)
+    test_output = model(test_input)
+    print(f"\n推理测试:")
+    print(f"输入: {test_input.shape}")
+    print(f"输出: {test_output.shape}")
+    print("✅ CPU模式运行成功!")
