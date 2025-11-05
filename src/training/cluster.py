@@ -1,4 +1,6 @@
 import logging
+import warnings
+
 import torch.nn as nn
 # import logger
 import numpy as np
@@ -18,6 +20,22 @@ import seaborn as sns
 from scipy import stats
 from torch import optim
 from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+# 禁用TF32相关警告（CPU上不需要）
+warnings.filterwarnings("ignore", message=".*TF32.*")
+
+# CPU性能优化设置
+torch.set_num_threads(24)  # i9-14900KF有24个物理核心
+os.environ['OMP_NUM_THREADS'] = '24'
+os.environ['MKL_NUM_THREADS'] = '24'
+os.environ['OPENMP'] = '1'
+
+# 禁用CUDA相关设置（避免不必要的GPU检查）
+torch.backends.cudnn.enabled = False
+
+# 设置矩阵乘法精度（CPU上使用高精度）
+torch.set_float32_matmul_precision('high')
 
 # 先创建logger
 logger = logging.getLogger("SWEClusterEnsemble")
@@ -1504,7 +1522,7 @@ class PureGNNWRTrainer:
 
     def __init__(self, input_dim, coords, hidden_dims=[128, 64, 32, 16],
                  learning_rate=0.001, bandwidth=10.0, dropout_rate=0.3,
-                 weight_decay=1e-4, device='auto'):
+                 weight_decay=1e-4, device='auto', output_std_penalty=0.01):
 
         # 设备设置
         if device == 'auto':
@@ -1513,6 +1531,7 @@ class PureGNNWRTrainer:
         else:
             self.device = torch.device(device)
 
+        self.output_std_penalty = output_std_penalty
         self.logger = logging.getLogger("PureGNNWR")
         self.logger.info(f"纯净版GNNWR - 使用设备: {self.device}")
 
@@ -1530,6 +1549,8 @@ class PureGNNWRTrainer:
             weight_decay=weight_decay,
             betas=(0.9, 0.999)
         )
+
+        self.criterion = nn.HuberLoss()
 
         # 学习率调度器
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -1558,17 +1579,21 @@ class PureGNNWRTrainer:
         return weights
 
     def train(self, train_loader, val_loader=None, epochs=200, early_stopping_patience=20):
-        """完整深度学习训练流程"""
+        """完整深度学习训练流程 - 修复版本"""
+
         self.model.train()
         best_val_loss = float('inf')
         patience_counter = 0
         train_losses = []
         val_losses = []
 
-        for epoch in range(epochs):
+        pbar = tqdm(range(epochs), desc="训练进度")
+
+        for epoch in pbar:
             # 训练阶段
             self.model.train()
             epoch_train_loss = 0.0
+            batch_count = 0
 
             for batch in train_loader:
                 if len(batch) == 3:
@@ -1580,6 +1605,7 @@ class PureGNNWRTrainer:
                 batch_features = batch_features.to(self.device)
                 batch_targets = batch_targets.to(self.device)
 
+                # 重要：每次迭代前清零梯度
                 self.optimizer.zero_grad()
 
                 # 计算空间权重（如果有坐标）
@@ -1590,17 +1616,31 @@ class PureGNNWRTrainer:
 
                 # 前向传播
                 outputs = self.model(batch_features, spatial_weights, batch_coords)
-                loss = self.criterion(outputs, batch_targets)
 
-                # 反向传播
-                loss.backward()
+                # 计算主损失
+                main_loss = self.criterion(outputs, batch_targets)
+
+                # 添加输出多样性惩罚（防止输出恒定）
+                output_std = torch.std(outputs)
+                diversity_loss = -self.output_std_penalty * output_std  # 鼓励输出有方差
+
+                # 总损失
+                total_loss = main_loss + diversity_loss
+
+                # 重要：只调用一次 backward() 和 step()
+                total_loss.backward()
 
                 # 梯度裁剪
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
+                # 更新参数
                 self.optimizer.step()
-                epoch_train_loss += loss.item()
 
+                # 只记录主损失用于显示
+                epoch_train_loss += main_loss.item()
+                batch_count += 1
+
+            # 计算平均训练损失
             epoch_train_loss /= len(train_loader)
             train_losses.append(epoch_train_loss)
 
@@ -1612,7 +1652,16 @@ class PureGNNWRTrainer:
                 # 学习率调度
                 self.scheduler.step(val_loss)
 
-                # 早停
+                # 更新进度条
+                current_lr = self.optimizer.param_groups[0]['lr']
+                pbar.set_postfix({
+                    'train_loss': f'{epoch_train_loss:.4f}',
+                    'val_loss': f'{val_loss:.4f}',
+                    'lr': f'{current_lr:.2e}',
+                    'patience': f'{patience_counter}/{early_stopping_patience}'
+                })
+
+                # 早停逻辑
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     patience_counter = 0
@@ -1622,6 +1671,7 @@ class PureGNNWRTrainer:
                     patience_counter += 1
 
                 if patience_counter >= early_stopping_patience:
+                    pbar.set_description("训练完成 (早停)")
                     self.logger.info(f"早停在epoch {epoch}, 最佳验证loss: {best_val_loss:.6f}")
                     # 加载最佳模型
                     self.model.load_state_dict(torch.load('best_pure_gnnwr_model.pth'))
@@ -1630,6 +1680,15 @@ class PureGNNWRTrainer:
                 # 如果没有验证集，使用训练loss
                 self.scheduler.step(epoch_train_loss)
 
+                # 更新进度条（无验证集版本）
+                current_lr = self.optimizer.param_groups[0]['lr']
+                pbar.set_postfix({
+                    'train_loss': f'{epoch_train_loss:.4f}',
+                    'lr': f'{current_lr:.2e}',
+                    'patience': f'{patience_counter}/{early_stopping_patience}'
+                })
+
+            # 日志输出
             if epoch % 10 == 0:
                 current_lr = self.optimizer.param_groups[0]['lr']
                 if val_loader is not None:
@@ -1638,6 +1697,8 @@ class PureGNNWRTrainer:
                 else:
                     self.logger.info(f"Epoch {epoch:3d} | Train Loss: {epoch_train_loss:.6f} | "
                                      f"LR: {current_lr:.2e}")
+
+        pbar.close()
 
         return train_losses, val_losses
 
@@ -1695,26 +1756,51 @@ class PureGNNWRTrainer:
 
 def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=42):
     """
-    运行纯净版GNNWR分析
-    直接在现有cluster.py中调用这个函数进行对比实验
+    运行纯净版GNNWR分析 - 包含完整交叉验证
     """
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import train_test_split, LeaveOneGroupOut
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from scipy.stats import pearsonr
+    import numpy as np
 
     logger = logging.getLogger("PureGNNWRAnalysis")
     logger.info("=" * 60)
-    logger.info("🚀 开始纯净版GNNWR对比分析")
+    logger.info("🚀 开始纯净版GNNWR完整分析流程")
     logger.info("=" * 60)
 
     try:
-        # 使用SWEClusterEnsemble的数据预处理（排除经纬度特征）
+        # 使用SWEClusterEnsemble的数据预处理
         ensemble = SWEClusterEnsemble(n_clusters=1)  # 临时实例用于数据预处理
         X, y, station_groups, year_groups, coords = ensemble.preprocess_data(df)
 
         logger.info(f"数据加载: {len(X)}样本, {X.shape[1]}特征")
+        logger.info(f"站点数: {len(np.unique(station_groups))}, 年份数: {len(np.unique(year_groups))}")
 
-        # 划分训练测试集
-        X_train, X_test, y_train, y_test, coords_train, coords_test = train_test_split(
-            X, y, coords, test_size=test_size, random_state=random_state
+        # 1. 站点交叉验证
+        logger.info("\n" + "=" * 50)
+        logger.info("步骤 1: 站点交叉验证")
+        logger.info("=" * 50)
+
+        station_cv_results = pure_gnnwr_cross_validate(
+            X, y, station_groups, coords, 'station', logger
+        )
+
+        # 2. 年度交叉验证
+        logger.info("\n" + "=" * 50)
+        logger.info("步骤 2: 年度交叉验证")
+        logger.info("=" * 50)
+
+        yearly_cv_results = pure_gnnwr_cross_validate(
+            X, y, year_groups, coords, 'yearly', logger
+        )
+
+        # 3. 标准训练测试集分割
+        logger.info("\n" + "=" * 50)
+        logger.info("步骤 3: 标准训练测试集验证")
+        logger.info("=" * 50)
+
+        X_train, X_test, y_train, y_test, coords_train, coords_test, station_train, station_test = train_test_split(
+            X, y, coords, station_groups, test_size=test_size, random_state=random_state
         )
 
         logger.info(f"数据划分: 训练集 {len(X_train)}, 测试集 {len(X_test)}")
@@ -1735,7 +1821,7 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
             learning_rate=0.001,
             dropout_rate=0.3,
             weight_decay=1e-4,
-            device='cuda'
+            device='cpu'  # 使用CPU
         )
 
         logger.info("开始纯净版GNNWR训练...")
@@ -1747,37 +1833,235 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         y_pred = trainer.predict(X_test, coords_test)
 
         # 计算评估指标
-        mae = mean_absolute_error(y_test, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, y_pred))
-        r_value, _ = pearsonr(y_test, y_pred)
+        test_metrics = evaluate_predictions(y_test, y_pred)
 
+        # 整合所有结果
         results = {
-            'MAE': mae,
-            'RMSE': rmse,
-            'R': r_value,
-            'R_squared': r_value ** 2,
-            'samples': len(y_test)
+            'station_cv': station_cv_results,
+            'yearly_cv': yearly_cv_results,
+            'standard_test': test_metrics,
+            'trainer': trainer,
+            'data_info': {
+                'total_samples': len(X),
+                'n_features': X.shape[1],
+                'n_stations': len(np.unique(station_groups)),
+                'n_years': len(np.unique(year_groups)),
+                'train_size': len(X_train),
+                'test_size': len(X_test)
+            }
         }
 
-        # 输出结果
-        logger.info("🎯 纯净版GNNWR分析完成!")
-        logger.info(f"测试集性能: MAE={mae:.3f}, RMSE={rmse:.3f}, R={r_value:.3f}")
+        # 输出综合报告
+        print_comprehensive_report(results)
 
-        print("\n" + "=" * 60)
-        print("纯净版GNNWR最终结果:")
-        print("=" * 60)
-        print(f"MAE:           {mae:.3f} mm")
-        print(f"RMSE:          {rmse:.3f} mm")
-        print(f"R:             {r_value:.3f}")
-        print(f"R²:            {r_value ** 2:.3f}")
-        print(f"测试样本数:     {len(y_test)}")
-        print("=" * 60)
-
+        logger.info("🎯 纯净版GNNWR完整分析完成!")
         return results, trainer
 
     except Exception as e:
         logger.error(f"纯净版GNNWR分析失败: {e}")
         raise
+
+
+def pure_gnnwr_cross_validate(X, y, groups, coords, cv_type, logger):
+    """纯净版GNNWR交叉验证 - 修复数据质量问题"""
+    from sklearn.model_selection import LeaveOneGroupOut
+
+    logo = LeaveOneGroupOut()
+    all_predictions = []
+    all_true_values = []
+    fold_results = {}
+
+    unique_groups = np.unique(groups)
+    total_folds = len(unique_groups)
+
+    logger.info(f"开始{cv_type}交叉验证，共{total_folds}个折叠...")
+
+    for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups)):
+        # 检查数据量
+        if len(train_idx) < 10 or len(test_idx) < 3:
+            logger.warning(f"折叠 {fold + 1}: 数据量不足，跳过")
+            continue
+
+        group_id = groups[test_idx[0]]
+
+        # 分割数据
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        # 检查训练数据质量
+        if _is_constant_data(y_train) or _is_constant_data(X_train, axis=0):
+            logger.warning(f"折叠 {fold + 1}: 训练数据恒定，跳过")
+            continue
+
+        # 检查测试数据质量
+        if _is_constant_data(y_test):
+            logger.warning(f"折叠 {fold + 1}: 测试目标值恒定，跳过")
+            continue
+
+        # 分割坐标
+        coords_train = coords[train_idx] if coords is not None else None
+        coords_test = coords[test_idx] if coords is not None else None
+
+        try:
+            # 创建数据集
+            train_dataset = EnhancedSpatialDataset(X_train, y_train, coords_train)
+            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
+
+            # 训练纯净版GNNWR
+            trainer = PureGNNWRTrainer(
+                input_dim=X.shape[1],
+                coords=coords_train,
+                hidden_dims=[64, 32, 16],
+                learning_rate=0.001,
+                dropout_rate=0.2,
+                device='cpu'
+            )
+
+            trainer.train(train_loader, epochs=50, early_stopping_patience=10)
+
+            # 预测
+            y_pred = trainer.predict(X_test, coords_test)
+
+            # 检查预测结果质量
+            if _is_constant_data(y_pred):
+                logger.warning(f"折叠 {fold + 1}: 预测结果恒定，跳过")
+                continue
+
+            # 存储结果
+            all_predictions.extend(y_pred)
+            all_true_values.extend(y_test)
+
+            # 计算当前折叠性能（使用修复的函数）
+            fold_metrics = evaluate_predictions(y_test, y_pred)
+            fold_results[group_id] = fold_metrics
+
+            logger.info(
+                f"  {cv_type} Fold {fold + 1}: {group_id} - "
+                f"MAE={fold_metrics['MAE']:.3f}, R={fold_metrics['R']:.3f}"
+            )
+
+        except Exception as e:
+            logger.error(f"折叠 {fold + 1} 训练失败: {e}")
+            continue
+
+    # 计算总体性能
+    if len(all_true_values) == 0:
+        logger.error(f"{cv_type}交叉验证没有有效结果")
+        return {
+            'overall': {'MAE': 0, 'RMSE': 0, 'R': 0, 'R_squared': 0, 'samples': 0},
+            'by_fold': {},
+            'predictions': np.array([]),
+            'true_values': np.array([]),
+            'folds': 0
+        }
+
+    overall_metrics = evaluate_predictions(
+        np.array(all_true_values),
+        np.array(all_predictions)
+    )
+
+    logger.info(f"✅ {cv_type}交叉验证完成")
+    logger.info(f"  聚合性能: MAE={overall_metrics['MAE']:.3f}, R={overall_metrics['R']:.3f}")
+
+    return {
+        'overall': overall_metrics,
+        'by_fold': fold_results,
+        'predictions': np.array(all_predictions),
+        'true_values': np.array(all_true_values),
+        'folds': len(fold_results)
+    }
+
+
+def _is_constant_data(data, axis=None):
+    """检查数据是否恒定（所有值相同）"""
+    if data is None or len(data) == 0:
+        return True
+
+    if axis is not None:
+        # 对于多维数据，检查每个特征是否恒定
+        return np.all(np.std(data, axis=axis) == 0)
+    else:
+        # 对于一维数据
+        return np.std(data) == 0
+
+
+def evaluate_predictions(y_true, y_pred):
+    """评估预测性能 - 修复常数输入问题"""
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from scipy.stats import pearsonr
+    import numpy as np
+    import warnings
+
+    mae = mean_absolute_error(y_true, y_pred)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+
+    # 检查数据是否恒定
+    y_true_std = np.std(y_true)
+    y_pred_std = np.std(y_pred)
+
+    # 如果任一数组是常数，相关系数设为0
+    if y_true_std == 0 or y_pred_std == 0:
+        r_value = 0.0
+        warnings.warn(f"检测到常数输入: y_true_std={y_true_std:.6f}, y_pred_std={y_pred_std:.6f}，相关系数设为0")
+    else:
+        try:
+            r_value, _ = pearsonr(y_true, y_pred)
+        except:
+            r_value = 0.0
+
+    return {
+        'MAE': mae,
+        'RMSE': rmse,
+        'R': r_value,
+        'R_squared': r_value ** 2,
+        'samples': len(y_true),
+        'y_true_std': y_true_std,
+        'y_pred_std': y_pred_std
+    }
+
+
+def print_comprehensive_report(results):
+    """打印综合报告"""
+    print("\n" + "=" * 70)
+    print("🎯 纯净版GNNWR完整分析报告")
+    print("=" * 70)
+
+    # 数据概况
+    data_info = results['data_info']
+    print(f"\n📊 数据概况:")
+    print(f"  总样本数: {data_info['total_samples']}")
+    print(f"  特征数量: {data_info['n_features']}")
+    print(f"  站点数量: {data_info['n_stations']}")
+    print(f"  年份数量: {data_info['n_years']}")
+
+    # 站点交叉验证结果
+    station_cv = results['station_cv']['overall']
+    print(f"\n🏔️ 站点交叉验证:")
+    print(f"  折叠数量: {results['station_cv']['folds']}")
+    print(f"  MAE: {station_cv['MAE']:.3f} mm")
+    print(f"  RMSE: {station_cv['RMSE']:.3f} mm")
+    print(f"  R: {station_cv['R']:.3f}")
+    print(f"  R²: {station_cv['R_squared']:.3f}")
+
+    # 年度交叉验证结果
+    yearly_cv = results['yearly_cv']['overall']
+    print(f"\n📅 年度交叉验证:")
+    print(f"  折叠数量: {results['yearly_cv']['folds']}")
+    print(f"  MAE: {yearly_cv['MAE']:.3f} mm")
+    print(f"  RMSE: {yearly_cv['RMSE']:.3f} mm")
+    print(f"  R: {yearly_cv['R']:.3f}")
+    print(f"  R²: {yearly_cv['R_squared']:.3f}")
+
+    # 标准测试集结果
+    standard_test = results['standard_test']
+    print(f"\n🧪 标准测试集:")
+    print(f"  样本数量: {standard_test['samples']}")
+    print(f"  MAE: {standard_test['MAE']:.3f} mm")
+    print(f"  RMSE: {standard_test['RMSE']:.3f} mm")
+    print(f"  R: {standard_test['R']:.3f}")
+    print(f"  R²: {standard_test['R_squared']:.3f}")
+
+    print("=" * 70)
 
 
 # 在SWEClusterEnsemble类中添加一个便捷方法

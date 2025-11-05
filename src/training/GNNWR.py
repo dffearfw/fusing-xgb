@@ -257,7 +257,7 @@ class EnhancedGNNWRTrainer:
         # 使用numpy计算（CPU上更快）
         batch_coords_np = batch_coords.numpy()
         distances = cdist(batch_coords_np, batch_coords_np, metric='euclidean')
-        weights = np.exp(-0.5 * (distances / self.bandwidth) ** 2)
+        weights = np.exp(-0.5 * (distances / self.weight_calculator.bandwidth) ** 2)
 
         # 转换为tensor
         weights_tensor = torch.FloatTensor(weights).to(self.device)
