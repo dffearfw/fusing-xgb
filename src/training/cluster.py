@@ -1851,6 +1851,37 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
             }
         }
 
+        # === 新增：保存结果和生成图表 ===
+        if output_dir is None:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            output_dir = f"./pure_gnnwr_results_{timestamp}"
+
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"保存结果到: {output_dir}")
+
+        # 保存模型
+        model_path = os.path.join(output_dir, 'pure_gnnwr_model.pth')
+        torch.save({
+            'model_state_dict': trainer.model.state_dict(),
+            'config': {
+                'input_dim': X.shape[1],
+                'hidden_dims': [128, 64, 32, 16],
+                'learning_rate': 0.001
+            }
+        }, model_path)
+
+        # 保存结果数据
+        results_path = os.path.join(output_dir, 'pure_gnnwr_results.pkl')
+        joblib.dump(results, results_path)
+
+        # 生成可视化图表
+        create_pure_gnnwr_visualizations(results, output_dir)
+
+        # 生成详细报告
+        report_path = os.path.join(output_dir, 'pure_gnnwr_report.txt')
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(generate_detailed_report(results))
+
         # 输出综合报告
         print_comprehensive_report(results)
 
@@ -1862,14 +1893,199 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         raise
 
 
-def pure_gnnwr_cross_validate(X, y, groups, coords, cv_type, logger):
-    """纯净版GNNWR交叉验证 - 修复数据质量问题"""
+def create_pure_gnnwr_visualizations(results, output_dir):
+    """生成纯净版GNNWR的可视化图表 - 包含测试集大小信息"""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    plt.figure(figsize=(18, 12))
+
+    # 1. 站点交叉验证散点图
+    plt.subplot(2, 4, 1)
+    station_cv = results['station_cv']
+    y_true_station = station_cv['true_values']
+    y_pred_station = station_cv['predictions']
+
+    plt.scatter(y_true_station, y_pred_station, alpha=0.6, s=20, color='blue')
+    plt.plot([y_true_station.min(), y_true_station.max()],
+             [y_true_station.min(), y_true_station.max()], 'r--', alpha=0.8)
+    plt.xlabel('True SWE (mm)')
+    plt.ylabel('Predicted SWE (mm)')
+    plt.title(f'Station CV\nMAE={station_cv["overall"]["MAE"]:.2f}, R={station_cv["overall"]["R"]:.3f}')
+    plt.grid(True, alpha=0.3)
+
+    # 2. 年度交叉验证散点图
+    plt.subplot(2, 4, 2)
+    yearly_cv = results['yearly_cv']
+    y_true_yearly = yearly_cv['true_values']
+    y_pred_yearly = yearly_cv['predictions']
+
+    plt.scatter(y_true_yearly, y_pred_yearly, alpha=0.6, s=20, color='green')
+    plt.plot([y_true_yearly.min(), y_true_yearly.max()],
+             [y_true_yearly.min(), y_true_yearly.max()], 'r--', alpha=0.8)
+    plt.xlabel('True SWE (mm)')
+    plt.ylabel('Predicted SWE (mm)')
+    plt.title(f'Yearly CV\nMAE={yearly_cv["overall"]["MAE"]:.2f}, R={yearly_cv["overall"]["R"]:.3f}')
+    plt.grid(True, alpha=0.3)
+
+    # 3. 测试集大小分布 - 站点
+    plt.subplot(2, 4, 3)
+    station_test_sizes = [info['test_size'] for info in station_cv['by_fold'].values()]
+    plt.hist(station_test_sizes, bins=20, alpha=0.7, color='skyblue')
+    plt.xlabel('测试集大小 (样本数)')
+    plt.ylabel('折叠数量')
+    plt.title(f'站点CV测试集大小分布\n平均={np.mean(station_test_sizes):.1f}')
+
+    # 4. 测试集大小分布 - 年度
+    plt.subplot(2, 4, 4)
+    yearly_test_sizes = [info['test_size'] for info in yearly_cv['by_fold'].values()]
+    plt.hist(yearly_test_sizes, bins=20, alpha=0.7, color='lightgreen')
+    plt.xlabel('测试集大小 (样本数)')
+    plt.ylabel('折叠数量')
+    plt.title(f'年度CV测试集大小分布\n平均={np.mean(yearly_test_sizes):.1f}')
+
+    # 5. 性能对比柱状图
+    plt.subplot(2, 4, 5)
+    methods = ['Station CV', 'Yearly CV', 'Standard Test']
+    mae_values = [
+        station_cv['overall']['MAE'],
+        yearly_cv['overall']['MAE'],
+        results['standard_test']['MAE']
+    ]
+
+    bars = plt.bar(methods, mae_values, color=['skyblue', 'lightgreen', 'lightcoral'])
+    plt.ylabel('MAE (mm)')
+    plt.title('Performance Comparison (MAE)')
+    for bar, value in zip(bars, mae_values):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                 f'{value:.2f}', ha='center', va='bottom')
+
+    # 6. R值对比柱状图
+    plt.subplot(2, 4, 6)
+    r_values = [
+        station_cv['overall']['R'],
+        yearly_cv['overall']['R'],
+        results['standard_test']['R']
+    ]
+
+    bars = plt.bar(methods, r_values, color=['skyblue', 'lightgreen', 'lightcoral'])
+    plt.ylabel('R')
+    plt.title('Performance Comparison (R)')
+    for bar, value in zip(bars, r_values):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                 f'{value:.3f}', ha='center', va='bottom')
+
+    # 7. 折叠统计
+    plt.subplot(2, 4, 7)
+    fold_stats = {
+        '总站点折叠': station_cv['total_folds'],
+        '成功站点折叠': station_cv['folds'],
+        '总年度折叠': yearly_cv['total_folds'],
+        '成功年度折叠': yearly_cv['folds']
+    }
+
+    plt.bar(fold_stats.keys(), fold_stats.values(), color='lightgray')
+    plt.xticks(rotation=45, ha='right')
+    plt.ylabel('数量')
+    plt.title('交叉验证折叠统计')
+
+    # 8. 残差分布
+    plt.subplot(2, 4, 8)
+    residuals = y_true_station - y_pred_station
+    plt.hist(residuals, bins=30, alpha=0.7, color='orange')
+    plt.xlabel('残差 (mm)')
+    plt.ylabel('频率')
+    plt.title('站点CV残差分布')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'pure_gnnwr_comprehensive_analysis.png'),
+                dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"✅ 综合可视化图表已保存")
+
+
+def generate_detailed_report(results):
+    """生成详细的分析报告"""
+    report = []
+    report.append("=" * 80)
+    report.append("🎯 纯净版GNNWR详细分析报告")
+    report.append("=" * 80)
+    report.append("")
+
+    # 数据概况
+    data_info = results['data_info']
+    report.append("📊 数据概况:")
+    report.append(f"  总样本数: {data_info['total_samples']}")
+    report.append(f"  特征数量: {data_info['n_features']}")
+    report.append(f"  站点数量: {data_info['n_stations']}")
+    report.append(f"  年份数量: {data_info['n_years']}")
+    report.append(f"  训练集大小: {data_info['train_size']}")
+    report.append(f"  测试集大小: {data_info['test_size']}")
+    report.append("")
+
+    # 站点交叉验证详细结果
+    station_cv = results['station_cv']
+    station_overall = station_cv['overall']
+    report.append("🏔️ 站点交叉验证详细结果:")
+    report.append(f"  总折叠数: {station_cv['total_folds']}")
+    report.append(f"  成功折叠: {station_cv['folds']}")
+    report.append(f"  跳过折叠: {station_cv.get('skipped_folds', 0)}")
+    report.append(f"  MAE: {station_overall['MAE']:.3f} mm")
+    report.append(f"  RMSE: {station_overall['RMSE']:.3f} mm")
+    report.append(f"  R: {station_overall['R']:.3f}")
+    report.append(f"  R²: {station_overall['R_squared']:.3f}")
+    report.append(f"  样本数: {station_overall['samples']}")
+    report.append("")
+
+    # 年度交叉验证详细结果
+    yearly_cv = results['yearly_cv']
+    yearly_overall = yearly_cv['overall']
+    report.append("📅 年度交叉验证详细结果:")
+    report.append(f"  总折叠数: {yearly_cv['total_folds']}")
+    report.append(f"  成功折叠: {yearly_cv['folds']}")
+    report.append(f"  跳过折叠: {yearly_cv.get('skipped_folds', 0)}")
+    report.append(f"  MAE: {yearly_overall['MAE']:.3f} mm")
+    report.append(f"  RMSE: {yearly_overall['RMSE']:.3f} mm")
+    report.append(f"  R: {yearly_overall['R']:.3f}")
+    report.append(f"  R²: {yearly_overall['R_squared']:.3f}")
+    report.append(f"  样本数: {yearly_overall['samples']}")
+    report.append("")
+
+    # 标准测试集结果
+    standard_test = results['standard_test']
+    report.append("🧪 标准测试集结果:")
+    report.append(f"  MAE: {standard_test['MAE']:.3f} mm")
+    report.append(f"  RMSE: {standard_test['RMSE']:.3f} mm")
+    report.append(f"  R: {standard_test['R']:.3f}")
+    report.append(f"  R²: {standard_test['R_squared']:.3f}")
+    report.append(f"  样本数: {standard_test['samples']}")
+    report.append("")
+
+    # 性能总结
+    report.append("📈 性能总结:")
+    best_mae = min(station_overall['MAE'], yearly_overall['MAE'], standard_test['MAE'])
+    best_r = max(station_overall['R'], yearly_overall['R'], standard_test['R'])
+    report.append(f"  最佳MAE: {best_mae:.3f} mm")
+    report.append(f"  最佳R值: {best_r:.3f}")
+    report.append("")
+
+    report.append("=" * 80)
+    report.append("报告生成时间: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    report.append("=" * 80)
+
+    return "\n".join(report)
+
+
+def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger):
+    """修复的交叉验证 - 正确理解LOGO逻辑"""
     from sklearn.model_selection import LeaveOneGroupOut
 
     logo = LeaveOneGroupOut()
     all_predictions = []
     all_true_values = []
     fold_results = {}
+    skipped_folds = 0
 
     unique_groups = np.unique(groups)
     total_folds = len(unique_groups)
@@ -1877,71 +2093,76 @@ def pure_gnnwr_cross_validate(X, y, groups, coords, cv_type, logger):
     logger.info(f"开始{cv_type}交叉验证，共{total_folds}个折叠...")
 
     for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups)):
-        # 检查数据量
-        if len(train_idx) < 10 or len(test_idx) < 3:
-            logger.warning(f"折叠 {fold + 1}: 数据量不足，跳过")
-            continue
-
         group_id = groups[test_idx[0]]
+        test_size = len(test_idx)
+        train_size = len(train_idx)
+
+        # 训练集应该是很大的（所有其他站点），测试集可能很小
+        logger.info(f"Fold {fold + 1}/{total_folds}: {cv_type} {group_id}, 训练集={train_size}, 测试集={test_size}")
 
         # 分割数据
         X_train, X_test = X[train_idx], X[test_idx]
         y_train, y_test = y[train_idx], y[test_idx]
 
-        # 检查训练数据质量
-        if _is_constant_data(y_train) or _is_constant_data(X_train, axis=0):
-            logger.warning(f"折叠 {fold + 1}: 训练数据恒定，跳过")
-            continue
-
-        # 检查测试数据质量
-        if _is_constant_data(y_test):
-            logger.warning(f"折叠 {fold + 1}: 测试目标值恒定，跳过")
-            continue
-
         # 分割坐标
         coords_train = coords[train_idx] if coords is not None else None
         coords_test = coords[test_idx] if coords is not None else None
 
-        try:
-            # 创建数据集
-            train_dataset = EnhancedSpatialDataset(X_train, y_train, coords_train)
-            train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=2)
+        # 验证数据分割正确性
+        unique_train_groups = len(np.unique(groups[train_idx]))
+        unique_test_groups = len(np.unique(groups[test_idx]))
 
-            # 训练纯净版GNNWR
+        logger.debug(f"  训练集包含 {unique_train_groups} 个{'' if cv_type == 'station' else '年份'}")
+        logger.debug(f"  测试集包含 {unique_test_groups} 个{'' if cv_type == 'station' else '年份'}")
+
+        try:
+            # 使用完整模型（训练集很大，可以用复杂模型）
             trainer = PureGNNWRTrainer(
                 input_dim=X.shape[1],
                 coords=coords_train,
-                hidden_dims=[64, 32, 16],
+                hidden_dims=[128, 64, 32, 16],  # 使用完整模型
                 learning_rate=0.001,
-                dropout_rate=0.2,
-                device='cpu'
+                dropout_rate=0.3,
+                device='cpu',
+                output_std_penalty=0.05  # 防止输出恒定
             )
 
-            trainer.train(train_loader, epochs=50, early_stopping_patience=10)
+            # 创建数据集 - 使用较大的batch_size（训练集大）
+            train_dataset = EnhancedSpatialDataset(X_train, y_train, coords_train)
+            train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4)
+
+            # 训练 - 可以使用更多epoch（训练集大，不容易过拟合）
+            trainer.train(train_loader, epochs=100, early_stopping_patience=15)
 
             # 预测
             y_pred = trainer.predict(X_test, coords_test)
 
             # 检查预测结果质量
-            if _is_constant_data(y_pred):
-                logger.warning(f"折叠 {fold + 1}: 预测结果恒定，跳过")
-                continue
+            if len(test_idx) > 1 and np.std(y_pred) < 1e-6:  # 只有测试集>1时才检查
+                logger.warning(f"折叠 {fold + 1}: 预测结果恒定，可能模型有问题")
+                # 但仍然记录结果
 
             # 存储结果
             all_predictions.extend(y_pred)
             all_true_values.extend(y_test)
 
-            # 计算当前折叠性能（使用修复的函数）
+            # 计算当前折叠性能
             fold_metrics = evaluate_predictions(y_test, y_pred)
-            fold_results[group_id] = fold_metrics
+            fold_results[group_id] = {
+                **fold_metrics,
+                'train_size': train_size,
+                'test_size': test_size
+            }
 
             logger.info(
                 f"  {cv_type} Fold {fold + 1}: {group_id} - "
+                f"Train={train_size}, Test={test_size}, "
                 f"MAE={fold_metrics['MAE']:.3f}, R={fold_metrics['R']:.3f}"
             )
 
         except Exception as e:
             logger.error(f"折叠 {fold + 1} 训练失败: {e}")
+            skipped_folds += 1
             continue
 
     # 计算总体性能
@@ -1952,7 +2173,9 @@ def pure_gnnwr_cross_validate(X, y, groups, coords, cv_type, logger):
             'by_fold': {},
             'predictions': np.array([]),
             'true_values': np.array([]),
-            'folds': 0
+            'folds': 0,
+            'total_folds': total_folds,
+            'skipped_folds': skipped_folds
         }
 
     overall_metrics = evaluate_predictions(
@@ -1960,7 +2183,13 @@ def pure_gnnwr_cross_validate(X, y, groups, coords, cv_type, logger):
         np.array(all_predictions)
     )
 
+    # 分析折叠结果
+    successful_folds = len(fold_results)
+    avg_test_size = np.mean([info['test_size'] for info in fold_results.values()])
+
     logger.info(f"✅ {cv_type}交叉验证完成")
+    logger.info(f"  总折叠数: {total_folds}, 成功: {successful_folds}, 失败: {skipped_folds}")
+    logger.info(f"  平均测试集大小: {avg_test_size:.1f} 样本/折叠")
     logger.info(f"  聚合性能: MAE={overall_metrics['MAE']:.3f}, R={overall_metrics['R']:.3f}")
 
     return {
@@ -1968,7 +2197,10 @@ def pure_gnnwr_cross_validate(X, y, groups, coords, cv_type, logger):
         'by_fold': fold_results,
         'predictions': np.array(all_predictions),
         'true_values': np.array(all_true_values),
-        'folds': len(fold_results)
+        'folds': successful_folds,
+        'total_folds': total_folds,
+        'skipped_folds': skipped_folds,
+        'avg_test_size': avg_test_size
     }
 
 

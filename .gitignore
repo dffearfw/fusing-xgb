@@ -4,6 +4,7 @@ env/
 .venv/
 ENV/
 
+.env
 # Virtual environment specific files
 venv/*
 !venv/.gitkeep

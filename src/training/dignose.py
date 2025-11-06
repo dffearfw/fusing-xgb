@@ -6,7 +6,21 @@ import sys
 
 def set_dll_directory():
     """设置DLL搜索目录优先级"""
-    torch_lib_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib"
+    import sys
+    import os
+
+    # 动态查找torch库路径
+    torch_lib_path = None
+    for path in sys.path:
+        potential_path = os.path.join(path, 'torch', 'lib')
+        if os.path.exists(potential_path):
+            torch_lib_path = potential_path
+            break
+
+    if not torch_lib_path:
+        # 如果找不到，使用环境变量或默认路径
+        torch_lib_path = os.environ.get('TORCH_LIB_PATH',
+                                       os.path.join(os.path.dirname(__file__), '..', '..', 'venv', 'Lib', 'site-packages', 'torch', 'lib'))
 
     # 方法1：使用SetDllDirectory (最高优先级)
     try:
@@ -23,7 +37,7 @@ def set_dll_directory():
 
 def preload_essential_dlls():
     """预加载必需的DLL"""
-    torch_lib_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib"
+    torch_lib_path = set_dll_directory()  # 使用动态查找的路径
 
     print("=== 预加载DLL ===")
 
@@ -70,7 +84,7 @@ def apply_dll_fix_before_import():
     print("=== 应用预导入DLL修复 ===")
 
     # 设置DLL目录（必须在任何导入之前）
-    torch_lib_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib"
+    torch_lib_path = set_dll_directory()  # 使用动态查找的路径
 
     if os.path.exists(torch_lib_path):
         # 1. 设置进程级DLL目录
@@ -105,7 +119,7 @@ def setup_environment():
     """设置环境然后启动真正的Python"""
 
     # 设置DLL路径
-    torch_lib_path = r"E:\pycharmworkspace\.venv\Lib\site-packages\torch\lib"
+    torch_lib_path = set_dll_directory()  # 使用动态查找的路径
 
     if os.path.exists(torch_lib_path):
         # 设置环境变量
