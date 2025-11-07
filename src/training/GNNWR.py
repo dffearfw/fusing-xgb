@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
@@ -136,126 +137,163 @@ class SpatialAutocorrelation:
 class EnhancedSpatialDataset(Dataset):
     """增强的空间数据集"""
 
-    def __init__(self, features, targets, coords, spatial_weights=None):
+    def __init__(self, features, targets, coords=None):
         self.features = torch.FloatTensor(features)
         self.targets = torch.FloatTensor(targets)
-        self.coords = torch.FloatTensor(coords)
-        self.spatial_weights = torch.FloatTensor(spatial_weights) if spatial_weights is not None else None
+
+        if coords is not None:
+            self.coords = torch.FloatTensor(coords)
+        else:
+            self.coords = None
 
     def __len__(self):
         return len(self.features)
 
     def __getitem__(self, idx):
-        if self.spatial_weights is not None:
-            return self.features[idx], self.targets[idx], self.coords[idx], self.spatial_weights[idx]
-        else:
+        if self.coords is not None:
             return self.features[idx], self.targets[idx], self.coords[idx]
+        else:
+            return self.features[idx], self.targets[idx]
 
 
 class EnhancedGNNWRTrainer:
-    """增强的GNNWR训练器 - 内存优化版本"""
+    """增强的GNNWR训练器 - GPU混合精度优化版本"""
 
     def __init__(self, input_dim, coords, hidden_dims=[256, 128, 64, 32],
                  learning_rate=0.001, bandwidth=None, use_spatial_weights=True,
-                 max_samples_for_spatial=20000, device='auto'):
+                 max_samples_for_spatial=20000, device='auto',
+                 mixed_precision=True, cpu_workers=24):
 
         # 添加 logger 初始化
         self.logger = logging.getLogger("EnhancedGNNWRTrainer")
 
+        # 混合精度设置
+        self.mixed_precision = mixed_precision and torch.cuda.is_available()
+        if self.mixed_precision:
+            self.scaler = GradScaler()
+            self.logger.info("启用混合精度训练")
+
         # 自动检测或指定设备
         if device == 'auto':
-            self.device = torch.device('cpu')
-            torch.set_num_threads(16)
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+                # GPU优化设置
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                self.logger.info(f"使用GPU: {torch.cuda.get_device_name()}")
+            else:
+                self.device = torch.device('cpu')
+                torch.set_num_threads(cpu_workers)
+                self.logger.info(f"使用CPU: {cpu_workers}线程")
         else:
             self.device = torch.device(device)
+            if device == 'cpu':
+                torch.set_num_threads(cpu_workers)
 
         self.logger.info(f"使用设备: {self.device}")
 
-        if self.device.type == 'cuda':
-            self.logger.info(f"GPU信息: {torch.cuda.get_device_name()}")
-            self.logger.info(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
-
-        # 初始化模型并移动到设备
-        self.model = EnhancedGNNWRModel(input_dim, hidden_dims).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
-        self.criterion = nn.MSELoss()
-
-
-
-        print(f"=== EnhancedGNNWRTrainer 初始化调试 ===")
-        print(f"输入 coords 类型: {type(coords)}")
-        print(f"输入 coords is None: {coords is None}")
-        print(f"输入 coords id: {id(coords)}")
-
-        self.device = torch.device('cpu')
-        torch.set_num_threads(16)
+        # 坐标处理
         if coords is not None:
             self.coords = coords.copy()  # 创建副本，避免修改原数据
         else:
             self.coords = None
 
-        self.use_spatial_weights = use_spatial_weights
+        self.use_spatial_weights = use_spatial_weights and (self.coords is not None)
 
-        print(f"EnhancedGNNWRTrainer 初始化完成")
-        print(f"保存的 coords id: {id(self.coords)}")
-
-        # # 检查样本数量，如果太多则禁用空间权重
-        # if coords is not None and len(coords) > max_samples_for_spatial:
-        #     self.logger.warning(f"样本数量 {len(coords)} 超过限制 {max_samples_for_spatial}，禁用空间权重")
-        #     self.use_spatial_weights = False
+        # 检查样本数量，如果太多则禁用空间权重
+        if self.coords is not None and len(self.coords) > max_samples_for_spatial:
+            self.logger.warning(f"样本数量 {len(self.coords)} 超过限制 {max_samples_for_spatial}，禁用空间权重")
+            self.use_spatial_weights = False
 
         # 初始化空间权重计算器（仅在需要时）
-        if self.use_spatial_weights and coords is not None:
+        if self.use_spatial_weights:
             self.weight_calculator = SpatialWeightCalculator(bandwidth=bandwidth)
             if bandwidth is None:
                 # 使用较小的k值以减少计算量
-                bandwidth = self.weight_calculator.adaptive_bandwidth(coords, k=5)
+                bandwidth = self.weight_calculator.adaptive_bandwidth(self.coords, k=5)
                 self.weight_calculator.bandwidth = bandwidth
 
             # 计算全局空间权重矩阵（分批计算以避免内存问题）
-            self.global_weights = self._compute_sparse_weights(coords)
+            self.global_weights = self._compute_sparse_weights(self.coords)
         else:
             self.weight_calculator = None
             self.global_weights = None
 
-        # 初始化模型
+        # 初始化模型 - 只初始化一次！
         self.model = EnhancedGNNWRModel(input_dim, hidden_dims).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
-        self.criterion = nn.MSELoss()
+
+        # 优化器 - 针对混合精度优化
+        self.optimizer = optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=1e-5,
+            betas=(0.9, 0.999)
+        )
+
+        # 学习率调度器
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=learning_rate,
+            epochs=200,
+            steps_per_epoch=1000,
+            pct_start=0.1
+        )
+
+        self.criterion = nn.HuberLoss()  # 更稳定的损失函数
 
         self.logger.info(f"EnhancedGNNWR训练器初始化完成，使用空间权重: {self.use_spatial_weights}")
 
+    def create_optimized_dataloader(self, dataset, batch_size=256, pin_memory=True):
+        """创建优化的数据加载器，充分利用14900KF"""
+        num_workers = min(16, os.cpu_count() - 4)  # 为系统保留4个核心
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory and self.device.type == 'cuda',
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None,
+            pin_memory_device=str(self.device) if pin_memory else None
+        )
+
     def _compute_gpu_spatial_weights(self, batch_coords):
-        """在GPU上计算空间权重"""
+        """在GPU上计算空间权重 - 混合精度优化"""
         n_batch = batch_coords.shape[0]
 
         if n_batch <= 1:
-            return torch.ones((n_batch, n_batch), device=self.device)
+            return torch.ones((n_batch, n_batch), device=self.device,
+                              dtype=torch.float16 if self.mixed_precision else torch.float32)
 
-        # 使用PyTorch向量化计算（GPU加速）
-        diff = batch_coords.unsqueeze(1) - batch_coords.unsqueeze(0)
-        distances = torch.sqrt(torch.sum(diff ** 2, dim=2))
+        # 使用混合精度计算
+        with autocast(enabled=self.mixed_precision):
+            # 使用PyTorch向量化计算（GPU加速）
+            diff = batch_coords.unsqueeze(1) - batch_coords.unsqueeze(0)
+            distances = torch.sqrt(torch.sum(diff ** 2, dim=2) + 1e-8)
 
-        # 自适应带宽
-        sorted_distances = torch.sort(distances, dim=1).values
-        bandwidth = torch.mean(sorted_distances[:, 1:6])  # 前5个邻居
+            # 自适应带宽
+            sorted_distances = torch.sort(distances, dim=1).values
+            bandwidth = torch.mean(sorted_distances[:, 1:6])  # 前5个邻居
 
-        # 计算权重
-        weights = torch.exp(-0.5 * (distances / bandwidth) ** 2)
+            # 计算权重
+            weights = torch.exp(-0.5 * (distances / bandwidth) ** 2)
 
-        # 归一化
-        row_sums = torch.sum(weights, dim=1, keepdim=True)
-        weights = weights / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
+            # 归一化
+            row_sums = torch.sum(weights, dim=1, keepdim=True)
+            weights = weights / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
 
         return weights
 
     def _compute_cpu_spatial_weights(self, batch_coords):
+        """CPU版本的空间权重计算"""
         n_batch = batch_coords.shape[0]
         if n_batch <= 1:
             return torch.ones((n_batch, n_batch), device=self.device)
 
         # 使用numpy计算（CPU上更快）
-        batch_coords_np = batch_coords.numpy()
+        batch_coords_np = batch_coords.cpu().numpy()
         distances = cdist(batch_coords_np, batch_coords_np, metric='euclidean')
         weights = np.exp(-0.5 * (distances / self.weight_calculator.bandwidth) ** 2)
 
@@ -267,21 +305,6 @@ class EnhancedGNNWRTrainer:
         normalized_weights = weights_tensor / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
 
         return normalized_weights
-
-    def create_optimized_dataloader(dataset, batch_size=32, num_workers=None, pin_memory=True):
-        """创建优化的数据加载器"""
-        if num_workers is None:
-            # 自动设置工作进程数
-            num_workers = min(12, os.cpu_count() - 4)  # 使用一半的CPU核心
-
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,  # 加速GPU数据传输
-            persistent_workers=True if num_workers > 0 else False  # 保持工作进程
-        )
 
     def _compute_sparse_weights(self, coords, max_neighbors=50):
         """计算稀疏空间权重矩阵以减少内存使用"""
@@ -323,149 +346,271 @@ class EnhancedGNNWRTrainer:
         self.logger.info(f"稀疏权重矩阵创建完成: {sparse_weights.nnz} 个非零元素")
         return sparse_weights
 
-    def train(self, train_loader, epochs=200, patience=20):
-        """训练模型 - 精度优化版本"""
+    def train_epoch_mixed_precision(self, train_loader):
+        """混合精度训练一个epoch"""
         self.model.train()
+        total_loss = 0.0
+
+        for batch_idx, batch in enumerate(train_loader):
+            # 数据移动到设备（异步传输）
+            if len(batch) == 3:
+                features, targets, batch_coords = batch
+                features = features.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+                batch_coords = batch_coords.to(self.device, non_blocking=True) if batch_coords is not None else None
+            else:
+                features, targets = batch
+                features = features.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+                batch_coords = None
+
+            self.optimizer.zero_grad(set_to_none=True)  # 更快的梯度清零
+
+            # 混合精度前向传播
+            with autocast(enabled=self.mixed_precision):
+                if self.use_spatial_weights and batch_coords is not None:
+                    if self.device.type == 'cuda':
+                        batch_weights = self._compute_gpu_spatial_weights(batch_coords)
+                    else:
+                        batch_weights = self._compute_cpu_spatial_weights(batch_coords)
+                    outputs = self.model(features, batch_weights, batch_coords)
+                else:
+                    outputs = self.model(features)
+
+                loss = self.criterion(outputs, targets)
+
+            # 混合精度反向传播
+            if self.mixed_precision:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+            # 学习率调度
+            self.scheduler.step()
+
+            total_loss += loss.item()
+
+            # 每100个batch输出一次进度
+            if batch_idx % 100 == 0:
+                current_lr = self.optimizer.param_groups[0]['lr']
+                self.logger.info(f'Batch {batch_idx}, Loss: {loss.item():.6f}, LR: {current_lr:.2e}')
+
+        return total_loss / len(train_loader)
+
+    def train(self, train_loader, epochs=200, patience=20, val_loader=None):
+        """训练模型 - 混合精度优化版本"""
         best_loss = float('inf')
         patience_counter = 0
         train_losses = []
         val_losses = []
 
-        # 学习率调度器
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=10
-        )
+        # GPU预热
+        if self.device.type == 'cuda':
+            self._warmup_gpu()
 
         for epoch in range(epochs):
-            epoch_loss = 0.0
-            self.model.train()
-
-            for batch in train_loader:
-                if len(batch) == 3:
-                    batch_features, batch_targets, batch_coords = batch
-                else:
-                    batch_features, batch_targets = batch
-                    batch_coords = None
-
-                batch_features = batch_features.to(self.device)
-                batch_targets = batch_targets.to(self.device)
-
-                self.optimizer.zero_grad()
-
-                if self.use_spatial_weights and batch_coords is not None:
-                    batch_coords = batch_coords.to(self.device)
-                    batch_weights = self._compute_cpu_spatial_weights(batch_coords)  # 使用CPU版本
-                    outputs = self.model(batch_features, batch_weights, batch_coords)
-                    loss = self.spatial_weighted_loss(outputs, batch_targets, batch_weights)
-                else:
-                    outputs = self.model(batch_features)
-                    loss = self.criterion(outputs, batch_targets)
-
-                loss.backward()
-
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                self.optimizer.step()
-                epoch_loss += loss.item()
-
-            epoch_loss /= len(train_loader)
+            # 训练阶段
+            epoch_loss = self.train_epoch_mixed_precision(train_loader)
             train_losses.append(epoch_loss)
 
-            # 学习率调度
-            scheduler.step(epoch_loss)
+            # 验证阶段
+            if val_loader is not None:
+                val_loss = self.validate(val_loader)
+                val_losses.append(val_loss)
 
-            # 早停
-            if epoch_loss < best_loss:
-                best_loss = epoch_loss
-                patience_counter = 0
-                # 保存最佳模型
-                torch.save(self.model.state_dict(), 'best_gnnwr_model.pth')
+                self.logger.info(f'Epoch {epoch + 1}/{epochs}, Train Loss: {epoch_loss:.6f}, Val Loss: {val_loss:.6f}')
+
+                # 早停检查
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    patience_counter = 0
+                    torch.save(self.model.state_dict(), 'best_gnnwr_model.pth')
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    self.logger.info(f'早停在epoch {epoch + 1}')
+                    break
             else:
-                patience_counter += 1
+                # 没有验证集的情况
+                self.logger.info(f'Epoch {epoch + 1}/{epochs}, Train Loss: {epoch_loss:.6f}')
 
-            if patience_counter >= patience:
-                self.logger.info(f"早停在epoch {epoch}, 最佳loss: {best_loss:.6f}")
-                # 加载最佳模型
-                self.model.load_state_dict(torch.load('best_gnnwr_model.pth'))
-                break
+                if epoch_loss < best_loss:
+                    best_loss = epoch_loss
+                    patience_counter = 0
+                    torch.save(self.model.state_dict(), 'best_gnnwr_model.pth')
+                else:
+                    patience_counter += 1
 
-            if epoch % 10 == 0:
-                current_lr = self.optimizer.param_groups[0]['lr']
-                self.logger.info(f"Epoch {epoch}, Loss: {epoch_loss:.6f}, LR: {current_lr:.6f}")
+                if patience_counter >= patience:
+                    self.logger.info(f'早停在epoch {epoch + 1}')
+                    break
 
-        return train_losses
+        # 加载最佳模型
+        if os.path.exists('best_gnnwr_model.pth'):
+            self.model.load_state_dict(torch.load('best_gnnwr_model.pth'))
+            self.logger.info("加载最佳模型完成")
 
-    def predict(self, features, coords=None):
-        """预测方法"""
+        return train_losses, val_losses if val_loader is not None else train_losses
+
+    def validate(self, val_loader):
+        """验证阶段 - 混合精度优化"""
         self.model.eval()
+        total_loss = 0.0
+
         with torch.no_grad():
-            features_tensor = torch.FloatTensor(features).to(self.device)
+            for batch in val_loader:
+                # 数据移动到设备
+                if len(batch) == 3:
+                    features, targets, batch_coords = batch
+                    features = features.to(self.device, non_blocking=True)
+                    targets = targets.to(self.device, non_blocking=True)
+                    batch_coords = batch_coords.to(self.device, non_blocking=True) if batch_coords is not None else None
+                else:
+                    features, targets = batch
+                    features = features.to(self.device, non_blocking=True)
+                    targets = targets.to(self.device, non_blocking=True)
+                    batch_coords = None
 
-            if self.use_spatial_weights and coords is not None:
-                # 如果有坐标数据，计算空间权重
-                coords_tensor = torch.FloatTensor(coords).to(self.device)
-                # 计算批次内的空间权重
-                batch_coords_np = coords_tensor.cpu().numpy()
-                batch_weights = self._compute_cpu_spatial_weights(coords_tensor)
+                # 混合精度前向传播
+                with autocast(enabled=self.mixed_precision):
+                    if self.use_spatial_weights and batch_coords is not None:
+                        if self.device.type == 'cuda':
+                            batch_weights = self._compute_gpu_spatial_weights(batch_coords)
+                        else:
+                            batch_weights = self._compute_cpu_spatial_weights(batch_coords)
+                        outputs = self.model(features, batch_weights, batch_coords)
+                    else:
+                        outputs = self.model(features)
 
-                outputs = self.model(features_tensor, batch_weights, coords_tensor)
-            else:
-                # 没有空间权重
-                outputs = self.model(features_tensor)
+                    loss = self.criterion(outputs, targets)
 
-            return outputs.cpu().numpy().flatten()
+                total_loss += loss.item()
+
+        return total_loss / len(val_loader)
+
+    def _warmup_gpu(self):
+        """GPU预热 - 针对5080优化"""
+        if self.device.type == 'cuda':
+            self.logger.info("进行GPU预热...")
+            # 运行一个小的虚拟计算来预热GPU
+            dummy_input = torch.randn(32, self.model.feature_network[0].in_features,
+                                      device=self.device,
+                                      dtype=torch.float16 if self.mixed_precision else torch.float32)
+            dummy_coords = torch.randn(32, 2, device=self.device,
+                                       dtype=torch.float16 if self.mixed_precision else torch.float32)
+
+            with autocast(enabled=self.mixed_precision):
+                for _ in range(10):
+                    if self.use_spatial_weights:
+                        dummy_weights = self._compute_gpu_spatial_weights(dummy_coords)
+                        _ = self.model(dummy_input, dummy_weights, dummy_coords)
+                    else:
+                        _ = self.model(dummy_input)
+
+            torch.cuda.synchronize()
+            self.logger.info("GPU预热完成")
+
+    def predict(self, features, coords=None, batch_size=1024):
+        """批量预测 - 内存和性能优化"""
+        self.model.eval()
+        predictions = []
+
+        # 确定合适的数据类型
+        dtype = torch.float16 if self.mixed_precision else torch.float32
+
+        with torch.no_grad():
+            for i in range(0, len(features), batch_size):
+                # 分批处理避免内存溢出
+                end_idx = min(i + batch_size, len(features))
+                batch_features = torch.tensor(features[i:end_idx], dtype=dtype, device=self.device)
+
+                batch_coords = None
+                if coords is not None:
+                    batch_coords = torch.tensor(coords[i:end_idx], dtype=dtype, device=self.device)
+
+                # 混合精度预测
+                with autocast(enabled=self.mixed_precision):
+                    if self.use_spatial_weights and batch_coords is not None:
+                        if self.device.type == 'cuda':
+                            batch_weights = self._compute_gpu_spatial_weights(batch_coords)
+                        else:
+                            batch_weights = self._compute_cpu_spatial_weights(batch_coords)
+                        batch_pred = self.model(batch_features, batch_weights, batch_coords)
+                    else:
+                        batch_pred = self.model(batch_features)
+
+                predictions.append(batch_pred.cpu().numpy())
+
+        return np.concatenate(predictions)
 
     def spatial_weighted_loss(self, outputs, targets, weights):
         """空间加权损失函数"""
         return (weights * (outputs.squeeze() - targets) ** 2).mean()
 
+    def get_training_info(self):
+        """获取训练信息"""
+        info = {
+            'device': str(self.device),
+            'mixed_precision': self.mixed_precision,
+            'use_spatial_weights': self.use_spatial_weights,
+            'model_parameters': sum(p.numel() for p in self.model.parameters()),
+            'model_layers': len(list(self.model.children()))
+        }
+
+        if self.device.type == 'cuda':
+            info.update({
+                'gpu_name': torch.cuda.get_device_name(),
+                'gpu_memory': f"{torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB",
+                'cudnn_enabled': torch.backends.cudnn.enabled
+            })
+
+        return info
 
 
-class EnhancedSpatialDataset(Dataset):
-    """增强的空间数据集 - 详细调试版本"""
+class DistributedGNNWRTrainer:
+    """分布式训练器 - 多GPU支持"""
 
-    def __init__(self, features, targets, coords=None):
-        print(f"=== EnhancedSpatialDataset 初始化调试 ===")
-        print(f"输入 coords 类型: {type(coords)}")
-        print(f"输入 coords is None: {coords is None}")
-        print(f"输入 coords id: {id(coords)}")
+    def __init__(self, input_dim, coords, hidden_dims=[256, 128, 64, 32],
+                 learning_rate=0.001, bandwidth=None, use_spatial_weights=True,
+                 mixed_precision=True):
+        self.logger = logging.getLogger("DistributedGNNWRTrainer")
 
-        if coords is not None:
-            print(f"输入 coords 形状: {coords.shape}")
-            print(f"输入 coords 数据类型: {coords.dtype}")
-        else:
-            print("❌ 输入 coords 为 None!")
+        # 分布式设置
+        self.rank = int(os.environ.get('RANK', 0))
+        self.world_size = int(os.environ.get('WORLD_SIZE', 1))
+        self.local_rank = int(os.environ.get('LOCAL_RANK', 0))
 
-        self.features = torch.FloatTensor(features)
-        self.targets = torch.FloatTensor(targets)
+        torch.cuda.set_device(self.local_rank)
+        self.device = torch.device(f'cuda:{self.local_rank}')
 
-        print(f"特征转换后 coords 状态: {coords is None}")
+        # 混合精度
+        self.mixed_precision = mixed_precision
+        if self.mixed_precision:
+            self.scaler = GradScaler()
 
-        # 直接转换，不添加任何虚拟坐标逻辑
-        if coords is not None:
-            print("开始坐标转换...")
-            self.coords = torch.FloatTensor(coords)
-            print("坐标转换成功")
-        else:
-            # 如果coords为None，直接抛出错误
-            raise ValueError("坐标数据不能为None")
+        # 模型初始化
+        self.model = EnhancedGNNWRModel(input_dim, hidden_dims).to(self.device)
+        self.model = torch.nn.parallel.DistributedDataParallel(self.model, device_ids=[self.local_rank])
 
-        print(f"EnhancedSpatialDataset 初始化完成")
-        print(f"最终 coords 形状: {self.coords.shape}")
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        self.criterion = nn.HuberLoss()
 
-    def __len__(self):
-        return len(self.features)
-
-    def __getitem__(self, idx):
-        return self.features[idx], self.targets[idx], self.coords[idx]
+        self.logger.info(f"分布式训练器初始化完成 - Rank: {self.rank}, GPU: {self.local_rank}")
 
 
-# 使用示例
-def example_usage():
+# 使用示例和测试函数
+def optimized_example_usage():
+    """优化后的使用示例"""
     # 生成示例数据
-    n_samples = 1000
-    n_features = 10
+    n_samples = 10000
+    n_features = 20
 
     # 生成空间坐标（模拟地理分布）
     coords = np.random.uniform(0, 100, (n_samples, 2))
@@ -480,30 +625,161 @@ def example_usage():
 
     # 创建数据集
     dataset = EnhancedSpatialDataset(features, targets, coords)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    # 训练模型
+    # 创建优化训练器 - 针对5080 + 14900KF优化
     trainer = EnhancedGNNWRTrainer(
         input_dim=n_features,
         coords=coords,
-        hidden_dims=[64, 32, 16],
-        bandwidth=10.0,  # 带宽参数
-        use_spatial_weights=True
+        hidden_dims=[512, 256, 128, 64],  # 更大的模型充分利用5080
+        learning_rate=0.001,
+        bandwidth=10.0,
+        use_spatial_weights=True,
+        device='cuda',  # 使用GPU
+        mixed_precision=True,  # 启用混合精度
+        cpu_workers=24,  # 充分利用14900KF
+        max_samples_for_spatial=50000  # 提高样本限制
     )
 
-    # 训练
-    trainer.train(dataloader, epochs=100, patience=15)
+    # 显示训练信息
+    training_info = trainer.get_training_info()
+    print("=== 训练配置信息 ===")
+    for key, value in training_info.items():
+        print(f"{key}: {value}")
+
+    # 创建优化的数据加载器
+    train_loader = trainer.create_optimized_dataloader(
+        dataset,
+        batch_size=512,  # 5080可以处理更大的批次
+        pin_memory=True
+    )
+
+    # 开始训练
+    train_losses, val_losses = trainer.train(
+        train_loader,
+        epochs=200,
+        patience=20
+    )
 
     # 预测
-    predictions = trainer.predict(features, coords)
+    predictions = trainer.predict(features, coords, batch_size=2048)  # 更大的批次预测
 
-    # 计算最终的空间自相关性
-    residuals = targets - predictions
-    final_moran = trainer.spatial_analyzer.morans_i(residuals, trainer.global_weights)
-    print(f"Final Moran's I of residuals: {final_moran:.4f}")
+    # 计算性能指标
+    from sklearn.metrics import mean_absolute_error, mean_squared_error
+    from scipy.stats import pearsonr
+
+    mae = mean_absolute_error(targets, predictions)
+    rmse = np.sqrt(mean_squared_error(targets, predictions))
+    r_value, _ = pearsonr(targets, predictions)
+
+    print(f"\n=== 模型性能 ===")
+    print(f"MAE: {mae:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"R: {r_value:.4f}")
 
     return trainer, predictions
 
 
+def benchmark_training():
+    """训练性能基准测试"""
+    import time
+    from tqdm import tqdm
+
+    # 测试数据
+    n_samples = 5000
+    n_features = 50
+    coords = np.random.uniform(0, 100, (n_samples, 2))
+    features = np.random.randn(n_samples, n_features)
+    targets = np.random.randn(n_samples)
+
+    dataset = EnhancedSpatialDataset(features, targets, coords)
+
+    # 测试不同配置
+    configs = [
+        {'device': 'cpu', 'mixed_precision': False, 'batch_size': 128},
+        {'device': 'cuda', 'mixed_precision': False, 'batch_size': 512},
+        {'device': 'cuda', 'mixed_precision': True, 'batch_size': 512}
+    ]
+
+    results = {}
+
+    for config in configs:
+        print(f"\n测试配置: {config}")
+
+        trainer = EnhancedGNNWRTrainer(
+            input_dim=n_features,
+            coords=coords,
+            device=config['device'],
+            mixed_precision=config['mixed_precision']
+        )
+
+        train_loader = trainer.create_optimized_dataloader(
+            dataset,
+            batch_size=config['batch_size']
+        )
+
+        # 预热
+        if config['device'] == 'cuda':
+            trainer._warmup_gpu()
+
+        # 基准测试
+        start_time = time.time()
+
+        trainer.model.train()
+        for batch in tqdm(train_loader, desc=f"Training {config['device']}"):
+            if len(batch) == 3:
+                features, targets, batch_coords = batch
+                features = features.to(trainer.device)
+                targets = targets.to(trainer.device)
+                batch_coords = batch_coords.to(trainer.device)
+            else:
+                features, targets = batch
+                features = features.to(trainer.device)
+                targets = targets.to(trainer.device)
+                batch_coords = None
+
+            trainer.optimizer.zero_grad()
+
+            with autocast(enabled=config['mixed_precision']):
+                if trainer.use_spatial_weights and batch_coords is not None:
+                    batch_weights = trainer._compute_gpu_spatial_weights(batch_coords)
+                    outputs = trainer.model(features, batch_weights, batch_coords)
+                else:
+                    outputs = trainer.model(features)
+
+                loss = trainer.criterion(outputs, targets)
+
+            if config['mixed_precision']:
+                trainer.scaler.scale(loss).backward()
+                trainer.scaler.step(trainer.optimizer)
+                trainer.scaler.update()
+            else:
+                loss.backward()
+                trainer.optimizer.step()
+
+        end_time = time.time()
+        results[str(config)] = end_time - start_time
+        print(f"训练时间: {end_time - start_time:.2f}秒")
+
+    print("\n=== 性能对比 ===")
+    for config, time_taken in results.items():
+        print(f"{config}: {time_taken:.2f}秒")
+
+    return results
+
+
 if __name__ == "__main__":
-    trainer, predictions = example_usage()
+    # 配置日志
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+
+    print("=== GNNWR GPU混合精度训练测试 ===")
+
+    # 运行优化示例
+    trainer, predictions = optimized_example_usage()
+
+    # 运行性能基准测试
+    benchmark_results = benchmark_training()
+
+    print("测试完成！")

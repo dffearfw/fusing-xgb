@@ -32,7 +32,7 @@ os.environ['MKL_NUM_THREADS'] = '24'
 os.environ['OPENMP'] = '1'
 
 # 禁用CUDA相关设置（避免不必要的GPU检查）
-torch.backends.cudnn.enabled = False
+torch.backends.cudnn.enabled = True
 
 # 设置矩阵乘法精度（CPU上使用高精度）
 torch.set_float32_matmul_precision('high')
@@ -131,7 +131,9 @@ class SWEClusterEnsemble:
         'eval_metric': 'rmse'
     }
 
-    def __init__(self, n_clusters=4, params=None, gnnwr_params=None, use_enhanced_gnnwr=True, use_rf=False, device='auto'):
+    def __init__(self, n_clusters=4, params=None, gnnwr_params=None,
+                 use_enhanced_gnnwr=True, use_rf=False, device='auto',
+                 mixed_precision=True, cpu_workers=24):
         """初始化聚类集成回归器
 
         Args:
@@ -139,8 +141,29 @@ class SWEClusterEnsemble:
             params (dict): XGBoost参数
             gnnwr_params (dict): GNNWR参数
             use_enhanced_gnnwr (bool): 是否使用增强版GNNWR
+            device (str): 设备类型 'auto', 'cuda', 'cpu'
+            mixed_precision (bool): 是否使用混合精度
+            cpu_workers (int): CPU工作线程数
         """
         self.logger = logging.getLogger("SWEClusterEnsemble")
+
+        # 设备配置
+        if device == 'auto':
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+                torch.backends.cudnn.benchmark = True
+                self.logger.info(f"自动选择GPU: {torch.cuda.get_device_name()}")
+            else:
+                self.device = torch.device('cpu')
+                torch.set_num_threads(cpu_workers)
+                self.logger.info(f"使用CPU: {cpu_workers}线程")
+        else:
+            self.device = torch.device(device)
+            if device == 'cpu':
+                torch.set_num_threads(cpu_workers)
+
+        self.mixed_precision = mixed_precision and self.device.type == 'cuda'
+        self.cpu_workers = cpu_workers
 
         self.n_clusters = n_clusters
         self.kmeans = None
@@ -150,51 +173,57 @@ class SWEClusterEnsemble:
         self.feature_columns = None
         self.target_column = 'swe'
         self.use_enhanced_gnnwr = use_enhanced_gnnwr and HAS_ENHANCED_GNNWR
-        self.device = device
         self.use_rf = use_rf
 
         # 关键修复：确保params不为None
         if params is None:
-            params = {}  # 确保params至少是空字典
+            params = {}
 
         if use_rf:
-            # RF参数
+            # RF参数 - 优化CPU使用
             self.rf_params = {
                 'n_estimators': params.get('n_estimators', 100),
                 'max_depth': params.get('max_depth', None),
                 'min_samples_split': 2,
                 'min_samples_leaf': 1,
                 'random_state': 42,
-                'n_jobs': -1
+                'n_jobs': min(16, cpu_workers)  # 优化CPU使用
             }
             self.params = params if params else self.DEFAULT_PARAMS.copy()
         else:
-            # 原有的XGB参数
+            # XGB参数 - 如果使用GPU训练XGBoost
             self.params = self.DEFAULT_PARAMS.copy()
             if params:
                 self.params.update(params)
 
+            # 如果使用GPU且安装了支持GPU的XGBoost
+            if self.device.type == 'cuda' and not use_rf:
+                self.params['tree_method'] = 'gpu_hist'
+                self.params['predictor'] = 'gpu_predictor'
+                self.logger.info("XGBoost使用GPU加速")
 
-        # GNNWR参数
+        # GNNWR参数 - 添加GPU和混合精度支持
         self.gnnwr_params = {
-            'hidden_dims': [128, 64, 32, 16],
+            'hidden_dims': [256, 128, 64, 32],  # 更大的模型充分利用GPU
             'learning_rate': 0.001,
             'epochs': 200,
-            'batch_size': 64,
+            'batch_size': 512,  # 更大的批次大小
             'patience': 20,
-            'bandwidth':5.0,
+            'bandwidth': 5.0,
             'use_spatial_weights': True,
-            'device': device,  # 传递设备参数
-            'dropout_rate': 0.3,  # 添加dropout
-            'weight_decay': 1e-4,  # 权重衰减
-            'num_workers': min(6, os.cpu_count() // 2)
+            'device': self.device,  # 传递设备参数
+            'mixed_precision': self.mixed_precision,  # 混合精度
+            'cpu_workers': self.cpu_workers,  # CPU工作线程
+            'dropout_rate': 0.3,
+            'weight_decay': 1e-4,
+            'num_workers': min(12, self.cpu_workers // 2)  # 优化数据加载
         }
         if gnnwr_params:
             self.gnnwr_params.update(gnnwr_params)
 
         self.logger.info(f"初始化SWE聚类集成回归器，聚类数: {n_clusters}")
-        self.logger.info(f"使用{'增强版' if self.use_enhanced_gnnwr else '基础版'}GNNWR")
-        self.logger.info(f"GNNWR参数: {self.gnnwr_params}")
+        self.logger.info(f"使用设备: {self.device}")
+        self.logger.info(f"混合精度: {self.mixed_precision}")
 
     def preprocess_data(self, df):
         """数据预处理 - 完整调试版本"""
@@ -338,44 +367,93 @@ class SWEClusterEnsemble:
         return cluster_assignments
 
     def train_cluster_models(self, X, y, cluster_labels):
-        """为每个聚类训练XGBoost模型
-
-        Args:
-            X (np.array): 特征数据
-            y (np.array): 目标变量
-            cluster_labels (np.array): 聚类标签
-        """
-        self.logger.info("训练各聚类XGBoost模型...")
+        """为每个聚类训练模型 - 优化版本"""
+        self.logger.info("训练各聚类模型...")
         self.cluster_models = {}
 
+        # 使用多进程并行训练聚类模型
+        if self.use_rf and len(np.unique(cluster_labels)) > 1:
+            # 对于随机森林，使用多进程
+            self._train_cluster_models_parallel(X, y, cluster_labels)
+        else:
+            # 顺序训练
+            for cluster_id in range(self.n_clusters):
+                self._train_single_cluster_model(X, y, cluster_labels, cluster_id)
+
+    def _train_single_cluster_model(self, X, y, cluster_labels, cluster_id):
+        """训练单个聚类模型"""
+        cluster_mask = cluster_labels == cluster_id
+        cluster_size = np.sum(cluster_mask)
+
+        if cluster_size < 5:
+            self.logger.warning(f"聚类 {cluster_id} 样本数过少 ({cluster_size})，跳过训练")
+            return
+
+        X_cluster = X[cluster_mask]
+        y_cluster = y[cluster_mask]
+
+        if self.use_rf:
+            from sklearn.ensemble import RandomForestRegressor
+            model = RandomForestRegressor(**self.rf_params)
+        else:
+            import xgboost as xgb
+            model = xgb.XGBRegressor(**self.params)
+
+        model.fit(X_cluster, y_cluster)
+        self.cluster_models[cluster_id] = model
+
+        y_pred_cluster = model.predict(X_cluster)
+        cluster_mae = mean_absolute_error(y_cluster, y_pred_cluster)
+        cluster_rmse = np.sqrt(mean_squared_error(y_cluster, y_pred_cluster))
+
+        self.logger.info(f"  聚类 {cluster_id}: {cluster_size}样本, MAE={cluster_mae:.3f}, RMSE={cluster_rmse:.3f}")
+
+    def _train_cluster_models_parallel(self, X, y, cluster_labels):
+        """并行训练聚类模型 - 充分利用14900KF"""
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        self.logger.info("使用多进程并行训练聚类模型...")
+
+        def train_single_cluster(args):
+            """单个聚类的训练函数"""
+            cluster_id, X_cluster, y_cluster, use_rf, params, rf_params = args
+
+            if use_rf:
+                from sklearn.ensemble import RandomForestRegressor
+                model = RandomForestRegressor(**rf_params)
+            else:
+                import xgboost as xgb
+                model = xgb.XGBRegressor(**params)
+
+            model.fit(X_cluster, y_cluster)
+            return cluster_id, model
+
+        # 准备训练任务
+        tasks = []
         for cluster_id in range(self.n_clusters):
             cluster_mask = cluster_labels == cluster_id
             cluster_size = np.sum(cluster_mask)
 
-            if cluster_size < 5:
-                self.logger.warning(f"聚类 {cluster_id} 样本数过少 ({cluster_size})，跳过训练")
-                continue
+            if cluster_size >= 5:  # 只训练有足够样本的聚类
+                X_cluster = X[cluster_mask]
+                y_cluster = y[cluster_mask]
 
-            X_cluster = X[cluster_mask]
-            y_cluster = y[cluster_mask]
+                tasks.append((
+                    cluster_id, X_cluster, y_cluster,
+                    self.use_rf, self.params, self.rf_params
+                ))
 
-            if self.use_rf:
-                from sklearn.ensemble import RandomForestRegressor
-                model = RandomForestRegressor(**self.rf_params)
-            else:
-                import xgboost as xgb
-                model = xgb.XGBRegressor(**self.params)
+        # 使用进程池并行训练
+        with ProcessPoolExecutor(max_workers=min(self.cpu_workers, len(tasks))) as executor:
+            futures = [executor.submit(train_single_cluster, task) for task in tasks]
 
-            model.fit(X_cluster, y_cluster)
-
-            self.cluster_models[cluster_id] = model
-
-            # 评估聚类模型性能
-            y_pred_cluster = model.predict(X_cluster)
-            cluster_mae = mean_absolute_error(y_cluster, y_pred_cluster)
-            cluster_rmse = np.sqrt(mean_squared_error(y_cluster, y_pred_cluster))
-
-            self.logger.info(f"  聚类 {cluster_id}: {cluster_size}样本, MAE={cluster_mae:.3f}, RMSE={cluster_rmse:.3f}")
+            for future in as_completed(futures):
+                try:
+                    cluster_id, model = future.result()
+                    self.cluster_models[cluster_id] = model
+                    self.logger.info(f"  完成聚类 {cluster_id} 训练")
+                except Exception as e:
+                    self.logger.error(f"聚类训练失败: {e}")
 
     def _get_cluster_predictions(self, X, cluster_labels):
         """获取各聚类模型的预测结果
@@ -398,20 +476,15 @@ class SWEClusterEnsemble:
         return cluster_predictions
 
     def train_gnnwr_model(self, X, y, cluster_predictions, coords=None):
-        """训练GNNWR集成模型 - 内存优化版本"""
-        self.logger.info("=== train_gnnwr_method详细调试 ===")
-        self.logger.info(f"输入参数ID检查:")
-        self.logger.info(f"  coords id: {id(coords)}")
-        self.logger.info(f"  coords is None: {coords is None}")
+        """训练GNNWR集成模型 - GPU优化版本"""
+        self.logger.info("=== train_gnnwr_method GPU优化版本 ===")
+        self.logger.info(f"使用设备: {self.device}")
+        self.logger.info(f"混合精度: {self.mixed_precision}")
 
         # 立即检查坐标数据
         if coords is None:
             self.logger.error("❌ 坐标数据在方法入口处就为None!")
             raise ValueError("坐标数据在方法入口处就为None")
-
-        self.logger.info(f"  coords类型: {type(coords)}")
-        self.logger.info(f"  coords形状: {coords.shape if hasattr(coords, 'shape') else 'No shape'}")
-        self.logger.info(f"  coords长度: {len(coords) if hasattr(coords, '__len__') else 'No length'}")
 
         self.logger.info("训练GNNWR集成模型...")
 
@@ -426,7 +499,7 @@ class SWEClusterEnsemble:
 
         # 关键修复：创建坐标数据的副本，避免被其他方法修改
         if coords is not None:
-            coords_copy = coords.copy()  # 创建副本
+            coords_copy = coords.copy()
             self.logger.info(f"创建坐标副本，原id: {id(coords)}, 副本id: {id(coords_copy)}")
         else:
             coords_copy = None
@@ -442,60 +515,54 @@ class SWEClusterEnsemble:
             gnnwr_features_imputed = gnnwr_features
             self.gnnwr_imputer = None
 
-        # 添加处理后的维度调试
-        self.logger.info(f"处理后特征维度: {gnnwr_features_imputed.shape}")
-
-        # 根据数据大小自动调整参数（统一设置）
+        # 根据数据大小自动调整参数
         n_samples = len(gnnwr_features_imputed)
-        batch_size = min(128, max(32, n_samples // 100))  # 自适应批次大小
-        num_workers = min(6, os.cpu_count() // 2)  # 使用一半CPU核心
+        batch_size = min(512, max(64, n_samples // 50))  # 自适应批次大小，充分利用GPU
 
-        self.logger.info(f"数据加载器配置: batch_size={batch_size}, workers={num_workers}")
+        self.logger.info(f"数据加载器配置: batch_size={batch_size}")
 
         if self.use_enhanced_gnnwr:
             # 使用增强版GNNWR
             self.logger.info("使用增强版GNNWR训练器")
 
             # 检查样本数量，如果太多则使用简化模式
-            # 关键修复：使用 coords_copy 而不是 coords
             use_spatial = self.gnnwr_params['use_spatial_weights'] and coords_copy is not None
 
             if not use_spatial:
                 self.logger.warning(f"样本数量较大 ({n_samples}) 或坐标不可用，禁用空间权重计算")
-                # 即使禁用空间权重，也要传递坐标数据
                 dataset = EnhancedSpatialDataset(
                     features=gnnwr_features_imputed,
                     targets=y,
-                    coords=coords_copy  # 仍然传递坐标，只是训练器不使用
+                    coords=coords_copy
                 )
             else:
-                # 正常模式
                 dataset = EnhancedSpatialDataset(
                     features=gnnwr_features_imputed,
                     targets=y,
                     coords=coords_copy
                 )
 
-            train_loader = DataLoader(
+            # 使用优化的数据加载器
+            train_loader = self.create_optimized_dataloader(
                 dataset,
-                batch_size=batch_size,  # 修复：使用自适应批次大小
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=False,  # 如果使用GPU则启用
-                persistent_workers=num_workers > 0
+                batch_size=batch_size,
+                shuffle=True
             )
 
-            # 初始化增强版GNNWR训练器
+            # 初始化增强版GNNWR训练器 - 使用优化参数
             input_dim = gnnwr_features_imputed.shape[1]
             self.logger.info(f"初始化GNNWR训练器，输入维度: {input_dim}")
 
             self.gnnwr_trainer = EnhancedGNNWRTrainer(
                 input_dim=input_dim,
-                coords=coords_copy if use_spatial else None,  # 关键修复：使用副本
+                coords=coords_copy if use_spatial else None,
                 hidden_dims=self.gnnwr_params['hidden_dims'],
                 learning_rate=self.gnnwr_params['learning_rate'],
                 bandwidth=self.gnnwr_params['bandwidth'],
-                use_spatial_weights=use_spatial
+                use_spatial_weights=use_spatial,
+                device=self.device,  # 传递设备
+                mixed_precision=self.mixed_precision,  # 混合精度
+                cpu_workers=self.cpu_workers  # CPU工作线程
             )
 
             # 训练模型
@@ -506,11 +573,15 @@ class SWEClusterEnsemble:
                     epochs=self.gnnwr_params['epochs'],
                     patience=self.gnnwr_params['patience']
                 )
-            except MemoryError as e:
-                self.logger.error(f"内存不足: {e}，回退到基础版GNNWR")
-                self.use_enhanced_gnnwr = False
-                self.train_gnnwr_model(X, y, cluster_predictions, coords)
-                return
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    self.logger.error("GPU内存不足，尝试减小批次大小")
+                    # 重新尝试较小的批次
+                    self.gnnwr_params['batch_size'] = self.gnnwr_params['batch_size'] // 2
+                    self.train_gnnwr_model(X, y, cluster_predictions, coords)
+                    return
+                else:
+                    raise e
         else:
             # 使用基础版GNNWR（无空间权重，内存友好）
             self.logger.info("使用基础版GNNWR训练器")
@@ -518,14 +589,11 @@ class SWEClusterEnsemble:
             # 创建数据集
             dataset = SpatialDataset(gnnwr_features_imputed, y)
 
-            # 修复：基础版也使用优化配置
-            train_loader = DataLoader(
+            # 使用优化的数据加载器
+            train_loader = self.create_optimized_dataloader(
                 dataset,
-                batch_size=batch_size,  # 使用自适应批次大小
-                shuffle=True,
-                num_workers=num_workers,  # 添加多线程支持
-                pin_memory=False,
-                persistent_workers=num_workers > 0
+                batch_size=batch_size,
+                shuffle=True
             )
 
             # 初始化基础版GNNWR训练器
@@ -533,7 +601,8 @@ class SWEClusterEnsemble:
             self.gnnwr_trainer = GNNWRTrainer(
                 input_dim=input_dim,
                 hidden_dims=self.gnnwr_params['hidden_dims'],
-                learning_rate=self.gnnwr_params['learning_rate']
+                learning_rate=self.gnnwr_params['learning_rate'],
+                device=self.device  # 传递设备
             )
 
             # 训练模型
@@ -545,7 +614,6 @@ class SWEClusterEnsemble:
             )
 
         # 计算训练集性能
-        # 关键修复：使用 coords_copy 而不是 coords
         y_pred = self.predict_with_gnnwr(gnnwr_features_imputed, None, coords_copy)
         mae = mean_absolute_error(y, y_pred)
         rmse = np.sqrt(mean_squared_error(y, y_pred))
@@ -553,94 +621,8 @@ class SWEClusterEnsemble:
 
         self.logger.info(f"GNNWR模型训练完成: MAE={mae:.3f}, RMSE={rmse:.3f}, R={r_value:.3f}")
 
-    def predict_with_gnnwr(self, X, cluster_predictions=None, coords=None):
-        """使用GNNWR进行预测 - 修复版本"""
-        if self.gnnwr_trainer is None:
-            raise ValueError("GNNWR模型尚未训练")
-
-        self.logger.info(f"预测时特征维度调试:")
-        self.logger.info(f"  X形状: {X.shape}")
-
-        # 关键修复：如果传入了cluster_predictions，说明X已经是原始特征
-        # 需要重新合并特征，但要确保维度一致
-        if cluster_predictions is not None:
-            self.logger.info(f"  需要合并cluster_predictions: {cluster_predictions.shape}")
-
-            # 检查X的维度是否已经包含了聚类预测
-            expected_original_dim = X.shape[1] - self.n_clusters
-            if X.shape[1] == expected_original_dim + self.n_clusters:
-                # X已经包含了聚类预测，直接使用
-                gnnwr_features = X
-                self.logger.info(f"  X已经包含聚类预测，直接使用")
-            else:
-                # 需要合并
-                gnnwr_features = np.hstack([X, cluster_predictions])
-                self.logger.info(f"  合并后特征维度: {gnnwr_features.shape}")
-        else:
-            # 如果cluster_predictions为None，说明X已经是合并后的特征
-            self.logger.info(f"  X已经是合并后的特征")
-            gnnwr_features = X
-
-        # 处理缺失值
-        if self.gnnwr_imputer is not None:
-            gnnwr_features_imputed = self.gnnwr_imputer.transform(gnnwr_features)
-        else:
-            gnnwr_features_imputed = gnnwr_features
-
-        # 维度验证
-        expected_dim = self.gnnwr_trainer.model.feature_network[0].in_features
-        actual_dim = gnnwr_features_imputed.shape[1]
-
-        if actual_dim != expected_dim:
-            self.logger.error(f"维度不匹配: 输入特征{actual_dim}维, 模型期望{expected_dim}维")
-            raise ValueError(f"特征维度不匹配: 输入{actual_dim} vs 模型{expected_dim}")
-
-        # 预测
-        if self.use_enhanced_gnnwr:
-            return self.gnnwr_trainer.predict(gnnwr_features_imputed, coords)
-        else:
-            return self.gnnwr_trainer.predict(gnnwr_features_imputed)
-
-    def validate_feature_dimensions(self, features, stage="training"):
-        """验证特征维度一致性"""
-        if self.gnnwr_trainer is None:
-            return True
-
-        # 获取模型期望的输入维度
-        if hasattr(self.gnnwr_trainer.model, 'feature_network'):
-            expected_dim = self.gnnwr_trainer.model.feature_network[0].in_features
-            actual_dim = features.shape[1]
-
-            if actual_dim != expected_dim:
-                self.logger.error(f"{stage}阶段维度不匹配: 实际{actual_dim}维, 期望{expected_dim}维")
-                return False
-
-        return True
-
-    def evaluate_predictions(self, y_true, y_pred):
-        """评估预测性能
-
-        Args:
-            y_true (np.array): 真实值
-            y_pred (np.array): 预测值
-
-        Returns:
-            dict: 评估指标
-        """
-        mae = mean_absolute_error(y_true, y_pred)
-        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-        r_value, p_value = pearsonr(y_true, y_pred)
-
-        return {
-            'MAE': mae,
-            'RMSE': rmse,
-            'R': r_value,
-            'R_squared': r_value ** 2,
-            'samples': len(y_true)
-        }
-
     def cross_validate(self, X, y, groups, coords=None, cv_type='station'):
-        """执行交叉验证 - 详细坐标调试"""
+        """执行交叉验证 - GPU优化版本"""
         from sklearn.model_selection import LeaveOneGroupOut
         logo = LeaveOneGroupOut()
 
@@ -652,7 +634,7 @@ class SWEClusterEnsemble:
         total_folds = len(unique_groups)
 
         self.logger.info(f"开始{cv_type}交叉验证，共{total_folds}个折叠...")
-        self.logger.info(f"初始坐标状态: {'可用' if coords is not None else '不可用'}")
+        self.logger.info(f"使用设备: {self.device}")
 
         # 在整个数据集上按站点进行一次聚类
         self.logger.info("在整个数据集上按站点进行聚类分配...")
@@ -663,7 +645,7 @@ class SWEClusterEnsemble:
             test_size = len(test_idx)
             train_size = len(train_idx)
 
-            self.logger.info(f"=== Fold {fold + 1} 详细调试 ===")
+            self.logger.info(f"=== Fold {fold + 1} ===")
             self.logger.info(f"训练集大小: {train_size}, 测试集大小: {test_size}")
 
             # 分割数据
@@ -671,25 +653,11 @@ class SWEClusterEnsemble:
             y_train, y_test = y[train_idx], y[test_idx]
             groups_train, groups_test = groups[train_idx], groups[test_idx]
 
-            # 分割坐标 - 详细检查
+            # 分割坐标
             if coords is not None:
                 coords_train = coords[train_idx]
                 coords_test = coords[test_idx]
-
-                self.logger.info(f"坐标分割结果:")
-                self.logger.info(f"  coords_train类型: {type(coords_train)}")
-                self.logger.info(f"  coords_train形状: {coords_train.shape}")
-                self.logger.info(f"  coords_test类型: {type(coords_test)}")
-                self.logger.info(f"  coords_test形状: {coords_test.shape}")
-
-                # 检查是否有空数组
-                if len(coords_train) == 0:
-                    self.logger.error(f"⚠️  Fold {fold + 1}: coords_train为空数组!")
-                if len(coords_test) == 0:
-                    self.logger.error(f"⚠️  Fold {fold + 1}: coords_test为空数组!")
-
             else:
-                self.logger.error(f"❌ Fold {fold + 1}: 初始coords为None!")
                 coords_train = None
                 coords_test = None
 
@@ -699,28 +667,26 @@ class SWEClusterEnsemble:
 
             # 训练聚类集成模型
             try:
-                # 第一步：为每个聚类训练模型
+                # 第一步：为每个聚类训练模型 - 使用多线程
                 self.train_cluster_models(X_train, y_train, train_cluster_labels)
 
                 # 第二步：获取训练集上的聚类预测
                 cluster_predictions_train = self._get_cluster_predictions(X_train, train_cluster_labels)
 
-                # 第三步：训练GNNWR集成模型 - 添加前置检查
+                # 第三步：训练GNNWR集成模型
                 if coords_train is None:
                     raise ValueError(f"Fold {fold + 1}: coords_train为None，无法训练GNNWR")
-                if len(coords_train) == 0:
-                    raise ValueError(f"Fold {fold + 1}: coords_train为空数组，无法训练GNNWR")
 
                 self.train_gnnwr_model(X_train, y_train, cluster_predictions_train, coords_train)
 
-                # 第四步：预测测试集 - 关键修复
+                # 第四步：预测测试集
                 cluster_predictions_test = self._get_cluster_predictions(X_test, test_cluster_labels)
 
                 # 关键修复：测试集特征也需要与聚类预测合并
                 test_features_combined = np.hstack([X_test, cluster_predictions_test])
                 self.logger.info(f"测试集合并特征形状: {test_features_combined.shape}")
 
-                y_pred = self.predict_with_gnnwr(test_features_combined, None, coords_test)  # 第二个参数传None
+                y_pred = self.predict_with_gnnwr(test_features_combined, None, coords_test)
 
                 # 存储结果
                 all_predictions.extend(y_pred)
@@ -760,19 +726,118 @@ class SWEClusterEnsemble:
             'cluster_assignments': self.cluster_assignments
         }
 
-    def run_complete_analysis(self, df, output_dir=None):
-        """运行完整分析流程
+    def predict_with_gnnwr(self, X, cluster_predictions=None, coords=None):
+        """使用GNNWR进行预测 - GPU优化版本"""
+        if self.gnnwr_trainer is None:
+            raise ValueError("GNNWR模型尚未训练")
+
+        self.logger.info(f"预测时特征维度调试:")
+        self.logger.info(f"  X形状: {X.shape}")
+
+        # 关键修复：如果传入了cluster_predictions，说明X已经是原始特征
+        if cluster_predictions is not None:
+            self.logger.info(f"  需要合并cluster_predictions: {cluster_predictions.shape}")
+
+            # 检查X的维度是否已经包含了聚类预测
+            expected_original_dim = X.shape[1] - self.n_clusters
+            if X.shape[1] == expected_original_dim + self.n_clusters:
+                # X已经包含了聚类预测，直接使用
+                gnnwr_features = X
+                self.logger.info(f"  X已经包含聚类预测，直接使用")
+            else:
+                # 需要合并
+                gnnwr_features = np.hstack([X, cluster_predictions])
+                self.logger.info(f"  合并后特征维度: {gnnwr_features.shape}")
+        else:
+            # 如果cluster_predictions为None，说明X已经是合并后的特征
+            self.logger.info(f"  X已经是合并后的特征")
+            gnnwr_features = X
+
+        # 处理缺失值
+        if self.gnnwr_imputer is not None:
+            gnnwr_features_imputed = self.gnnwr_imputer.transform(gnnwr_features)
+        else:
+            gnnwr_features_imputed = gnnwr_features
+
+        # 使用优化的批次大小进行预测
+        batch_size = 2048 if self.device.type == 'cuda' else 1024
+
+        # 分批预测以避免内存问题
+        predictions = []
+        for i in range(0, len(gnnwr_features_imputed), batch_size):
+            end_idx = min(i + batch_size, len(gnnwr_features_imputed))
+            batch_features = gnnwr_features_imputed[i:end_idx]
+            batch_coords = coords[i:end_idx] if coords is not None else None
+
+            batch_pred = self.gnnwr_trainer.predict(batch_features, batch_coords)
+            predictions.append(batch_pred)
+
+        return np.concatenate(predictions)
+
+    def validate_feature_dimensions(self, features, stage="training"):
+        """验证特征维度一致性"""
+        if self.gnnwr_trainer is None:
+            return True
+
+        # 获取模型期望的输入维度
+        if hasattr(self.gnnwr_trainer.model, 'feature_network'):
+            expected_dim = self.gnnwr_trainer.model.feature_network[0].in_features
+            actual_dim = features.shape[1]
+
+            if actual_dim != expected_dim:
+                self.logger.error(f"{stage}阶段维度不匹配: 实际{actual_dim}维, 期望{expected_dim}维")
+                return False
+
+        return True
+
+    def evaluate_predictions(self, y_true, y_pred):
+        """评估预测性能
 
         Args:
-            df (pd.DataFrame): 输入数据
-            output_dir (str, optional): 输出目录路径
+            y_true (np.array): 真实值
+            y_pred (np.array): 预测值
 
         Returns:
-            dict: 分析结果
+            dict: 评估指标
         """
+        mae = mean_absolute_error(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        r_value, p_value = pearsonr(y_true, y_pred)
+
+        return {
+            'MAE': mae,
+            'RMSE': rmse,
+            'R': r_value,
+            'R_squared': r_value ** 2,
+            'samples': len(y_true)
+        }
+
+    def create_optimized_dataloader(self, dataset, batch_size=512, shuffle=True):
+        """创建优化的数据加载器"""
+        num_workers = min(12, self.cpu_workers // 2)  # 充分利用14900KF
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=self.device.type == 'cuda',
+            persistent_workers=num_workers > 0,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
+
+    def run_complete_analysis(self, df, output_dir=None):
+        """运行完整分析流程 - GPU优化版本"""
         self.logger.info("=" * 70)
-        self.logger.info("🚀 开始SWE聚类集成回归完整分析流程")
+        self.logger.info("🚀 开始SWE聚类集成回归完整分析流程 (GPU优化版)")
         self.logger.info("=" * 70)
+
+        # 显示硬件信息
+        if self.device.type == 'cuda':
+            gpu_info = f"GPU: {torch.cuda.get_device_name()}, 内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB"
+            self.logger.info(f"硬件配置: {gpu_info}, CPU线程: {self.cpu_workers}")
+        else:
+            self.logger.info(f"硬件配置: CPU模式, {self.cpu_workers}线程")
 
         # 创建输出目录
         if output_dir is None:
@@ -797,7 +862,9 @@ class SWEClusterEnsemble:
                     'stations': len(np.unique(station_groups)),
                     'years': len(np.unique(year_groups)),
                     'n_clusters': self.n_clusters,
-                    'has_coords': coords is not None
+                    'has_coords': coords is not None,
+                    'device': str(self.device),
+                    'mixed_precision': self.mixed_precision
                 }
             }
 
@@ -809,23 +876,16 @@ class SWEClusterEnsemble:
             self.cluster_assignments = self.perform_clustering(X, station_groups)
             results['cluster_assignments'] = self.cluster_assignments
 
-            # # 3. 站点交叉验证（使用固定聚类）
-            # self.logger.info("\n" + "=" * 50)
-            # self.logger.info("步骤 3: 站点交叉验证")
-            # self.logger.info("=" * 50)
-            #
-            # results['station_cv'] = self.cross_validate(X, y, station_groups, coords, 'station')
-
-            # 4. 年度交叉验证（使用固定聚类）
+            # 3. 年度交叉验证（使用固定聚类）
             self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 4: 年度交叉验证")
+            self.logger.info("步骤 3: 年度交叉验证")
             self.logger.info("=" * 50)
 
             results['yearly_cv'] = self.cross_validate(X, y, year_groups, coords, 'yearly')
 
-            # 5. 训练最终模型
+            # 4. 训练最终模型
             self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 5: 训练最终模型")
+            self.logger.info("步骤 4: 训练最终模型")
             self.logger.info("=" * 50)
 
             self.fit(X, y, station_groups, coords)
@@ -835,17 +895,22 @@ class SWEClusterEnsemble:
                 'cluster_models': self.cluster_models,
                 'gnnwr_trainer': self.gnnwr_trainer,
                 'cluster_assignments': self.cluster_assignments,
-                'feature_columns': self.feature_columns
+                'feature_columns': self.feature_columns,
+                'training_config': {
+                    'device': str(self.device),
+                    'mixed_precision': self.mixed_precision,
+                    'cpu_workers': self.cpu_workers
+                }
             }
 
-            # 6. 保存结果
+            # 5. 保存结果
             self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 6: 保存结果")
+            self.logger.info("步骤 5: 保存结果")
             self.logger.info("=" * 50)
 
             self._save_results(results, output_dir)
 
-            # 7. 生成报告
+            # 6. 生成报告
             report = self._generate_report(results)
             print(report)
             self.logger.info("🎯 聚类集成分析完成！")
@@ -854,6 +919,7 @@ class SWEClusterEnsemble:
         except Exception as e:
             self.logger.error(f"❌ 分析流程失败: {str(e)}")
             raise
+
 
     def fit(self, X, y, station_groups, coords=None):
         """在整个数据集上训练模型
@@ -949,10 +1015,10 @@ class SWEClusterEnsemble:
         self.logger.info(f"结果已保存到: {output_dir}")
 
     def _generate_report(self, results):
-        """生成分析报告 - 修复版本：处理缺失的station_cv"""
+        """生成分析报告 - 包含GPU信息"""
         report = []
         report.append("=" * 70)
-        report.append("❄️ SWE聚类集成回归分析报告")
+        report.append("❄️ SWE聚类集成回归分析报告 (GPU优化版)")
         report.append("=" * 70)
         report.append("")
 
@@ -965,23 +1031,10 @@ class SWEClusterEnsemble:
         report.append(f"  年份数量: {preprocessing['years']}")
         report.append(f"  聚类数量: {preprocessing['n_clusters']}")
         report.append(f"  使用坐标: {'是' if preprocessing['has_coords'] else '否'}")
+        report.append(f"  训练设备: {preprocessing['device']}")
+        report.append(f"  混合精度: {'是' if preprocessing['mixed_precision'] else '否'}")
         report.append(f"  GNNWR版本: {'增强版' if self.use_enhanced_gnnwr else '基础版'}")
         report.append("")
-
-        # 站点交叉验证结果（如果存在）
-        if 'station_cv' in results:
-            station_cv = results['station_cv']
-            station_overall = station_cv['overall']
-            report.append("🏔️ 站点交叉验证结果:")
-            report.append(f"  折叠数量: {station_cv['folds']}")
-            report.append(f"  MAE: {station_overall['MAE']:.3f} mm")
-            report.append(f"  RMSE: {station_overall['RMSE']:.3f} mm")
-            report.append(f"  R: {station_overall['R']:.3f}")
-            report.append(f"  R²: {station_overall['R_squared']:.3f}")
-            report.append("")
-        else:
-            report.append("🏔️ 站点交叉验证: 已跳过")
-            report.append("")
 
         # 年度交叉验证结果
         yearly_cv = results['yearly_cv']
@@ -1004,6 +1057,8 @@ class SWEClusterEnsemble:
 
         report.append("🎯 模型配置:")
         report.append(f"  基础模型: {'随机森林' if self.use_rf else 'XGBoost'}")
+        report.append(f"  设备配置: {self.device}")
+        report.append(f"  CPU线程: {self.cpu_workers}")
         if hasattr(self, 'params') and self.params:
             report.append(f"  模型参数: {self.params}")
         report.append(f"  GNNWR参数: {self.gnnwr_params}")
@@ -1376,8 +1431,9 @@ def compare_with_baseline(self, df, output_dir):
 
 # 便捷使用函数
 def train_swe_cluster_ensemble(data_df, output_dir=None, n_clusters=4, params=None, use_rf=False,
-                               use_enhanced_gnnwr=True, gnnwr_params=None, device='auto'):
-    """便捷函数：训练SWE聚类集成模型
+                               use_enhanced_gnnwr=True, gnnwr_params=None, device='auto',
+                               mixed_precision=True, cpu_workers=24):
+    """便捷函数：训练SWE聚类集成模型 - GPU优化版本
 
     Args:
         data_df (pd.DataFrame): 包含特征和SWE的数据
@@ -1386,19 +1442,23 @@ def train_swe_cluster_ensemble(data_df, output_dir=None, n_clusters=4, params=No
         params (dict, optional): XGBoost参数
         use_enhanced_gnnwr (bool): 是否使用增强版GNNWR
         gnnwr_params (dict): GNNWR参数
-
-    Returns:
-        dict: 包含所有训练结果的字典
+        device (str): 训练设备
+        mixed_precision (bool): 是否使用混合精度
+        cpu_workers (int): CPU工作线程数
     """
     trainer = SWEClusterEnsemble(
         n_clusters=n_clusters,
         params=params,
         gnnwr_params=gnnwr_params,
         use_enhanced_gnnwr=use_enhanced_gnnwr,
-        use_rf = use_rf, # 传递这个参数
-        device = device  # 添加device参数
+        use_rf=use_rf,
+        device=device,
+        mixed_precision=mixed_precision,
+        cpu_workers=cpu_workers
     )
     return trainer.run_complete_analysis(data_df, output_dir)
+
+
 
 
 def load_swe_cluster_ensemble(model_path):
@@ -1526,7 +1586,7 @@ class PureGNNWRTrainer:
 
         # 设备设置
         if device == 'auto':
-            self.device = torch.device('cpu')
+            self.device = torch.device('gpu')
             torch.set_num_threads(16)
         else:
             self.device = torch.device(device)
