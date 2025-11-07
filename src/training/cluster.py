@@ -1781,7 +1781,7 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         logger.info("步骤 1: 站点交叉验证")
         logger.info("=" * 50)
 
-        station_cv_results = pure_gnnwr_cross_validate(
+        station_cv_results = pure_gnnwr_cross_validate_fixed(
             X, y, station_groups, coords, 'station', logger
         )
 
@@ -1790,7 +1790,7 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         logger.info("步骤 2: 年度交叉验证")
         logger.info("=" * 50)
 
-        yearly_cv_results = pure_gnnwr_cross_validate(
+        yearly_cv_results = pure_gnnwr_cross_validate_fixed(
             X, y, year_groups, coords, 'yearly', logger
         )
 
