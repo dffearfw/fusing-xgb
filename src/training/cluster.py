@@ -19,8 +19,11 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy import stats
 from torch import optim
+from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from GNNWR import EnhancedGNNWRTrainer
+
 
 # 禁用TF32相关警告（CPU上不需要）
 warnings.filterwarnings("ignore", message=".*TF32.*")
@@ -1530,13 +1533,15 @@ def test_cluster_ensemble():
 
 
 class PureGNNWRModel(nn.Module):
-    """纯净版GNNWR模型 - 直接特征输入，专注深度学习优化"""
+    """纯净版GNNWR模型 - GPU优化版本"""
 
-    def __init__(self, input_dim, hidden_dims=[128, 64, 32, 16], output_dim=1,
-                 dropout_rate=0.3, use_batch_norm=True):
+    def __init__(self, input_dim, hidden_dims=[512, 256, 128, 64], output_dim=1,
+                 dropout_rate=0.3, use_batch_norm=True, use_attention=True):
         super(PureGNNWRModel, self).__init__()
 
-        # 深度特征提取网络
+        self.use_attention = use_attention
+
+        # 深度特征提取网络 - 更大的模型充分利用GPU
         layers = []
         prev_dim = input_dim
 
@@ -1560,6 +1565,18 @@ class PureGNNWRModel(nn.Module):
             nn.Linear(prev_dim // 2, output_dim)
         )
 
+        # 增强的空间注意力机制
+        if use_attention:
+            self.spatial_attention = nn.Sequential(
+                nn.Linear(2, 128),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Linear(64, 1),
+                nn.Sigmoid()
+            )
+
     def forward(self, x, spatial_weights=None, coords=None):
         # 特征提取
         features = self.feature_network(x)
@@ -1578,22 +1595,47 @@ class PureGNNWRModel(nn.Module):
 
 
 class PureGNNWRTrainer:
-    """纯净版GNNWR训练器 - 全套深度学习优化"""
+    """纯净版GNNWR训练器 - 修复autocast错误版本"""
 
-    def __init__(self, input_dim, coords, hidden_dims=[128, 64, 32, 16],
+    def __init__(self, input_dim, coords, hidden_dims=[512, 256, 128, 64],
                  learning_rate=0.001, bandwidth=10.0, dropout_rate=0.3,
-                 weight_decay=1e-4, device='auto', output_std_penalty=0.01):
+                 weight_decay=1e-4, device='auto', output_std_penalty=0.01,
+                 mixed_precision=True, cpu_workers=24):
+
+        # 首先初始化logger - 这是关键修复！
+        self.logger = logging.getLogger("PureGNNWRTrainer")
 
         # 设备设置
         if device == 'auto':
-            self.device = torch.device('gpu')
-            torch.set_num_threads(16)
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+                # GPU优化设置
+                torch.backends.cudnn.benchmark = True
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+                self.device_type = 'cuda'
+            else:
+                self.device = torch.device('cpu')
+                torch.set_num_threads(cpu_workers)
+                self.device_type = 'cpu'
         else:
             self.device = torch.device(device)
+            self.device_type = 'cuda' if device == 'cuda' else 'cpu'
+            if device == 'cpu':
+                torch.set_num_threads(cpu_workers)
+
+        # 混合精度训练 - 修复：只在CUDA设备上启用
+        self.mixed_precision = mixed_precision and self.device_type == 'cuda'
+        if self.mixed_precision:
+            self.scaler = GradScaler()
+            self.logger.info(f"启用混合精度训练，设备类型: {self.device_type}")
+        else:
+            self.logger.info(f"禁用混合精度训练，设备类型: {self.device_type}")
 
         self.output_std_penalty = output_std_penalty
         self.logger = logging.getLogger("PureGNNWR")
         self.logger.info(f"纯净版GNNWR - 使用设备: {self.device}")
+        self.logger.info(f"混合精度: {self.mixed_precision}")
 
         # 模型初始化
         self.model = PureGNNWRModel(
@@ -1602,7 +1644,7 @@ class PureGNNWRTrainer:
             dropout_rate=dropout_rate
         ).to(self.device)
 
-        # 优化器 - 使用AdamW
+        # 优化器 - 使用AdamW，针对混合精度优化
         self.optimizer = optim.AdamW(
             self.model.parameters(),
             lr=learning_rate,
@@ -1610,11 +1652,13 @@ class PureGNNWRTrainer:
             betas=(0.9, 0.999)
         )
 
-        self.criterion = nn.HuberLoss()
-
-        # 学习率调度器
-        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode='min', factor=0.5, patience=10
+        # 学习率调度器 - OneCycle策略
+        self.scheduler = optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=learning_rate,
+            epochs=200,
+            steps_per_epoch=1000,
+            pct_start=0.1
         )
 
         self.criterion = nn.HuberLoss()  # 使用HuberLoss更稳定
@@ -1623,147 +1667,254 @@ class PureGNNWRTrainer:
         self.coords = coords.copy() if coords is not None else None
         self.bandwidth = bandwidth
 
+        # CPU工作线程配置
+        self.cpu_workers = cpu_workers
+
+    def debug_model_output(self, X_sample, y_sample, coords_sample=None):
+        """调试模型输出"""
+        self.model.eval()
+        with torch.no_grad():
+            # 测试不同输入
+            outputs = []
+            print("=== 模型输出调试 ===")
+
+            for i in range(min(5, len(X_sample))):
+                x = torch.tensor(X_sample[i:i + 1], dtype=torch.float32, device=self.device)
+                c = torch.tensor(coords_sample[i:i + 1], dtype=torch.float32,
+                                 device=self.device) if coords_sample is not None else None
+
+                if self.mixed_precision:
+                    with autocast(device_type=self.device_type):
+                        output = self.model(x, None, c)
+                else:
+                    output = self.model(x, None, c)
+
+                outputs.append(output.item())
+                print(f"样本 {i}: 输入均值为 {x.mean().item():.3f}, 输出为 {output.item():.3f}")
+
+            print(f"模型输出范围: [{min(outputs):.3f}, {max(outputs):.3f}]")
+            print(f"模型输出标准差: {np.std(outputs):.6f}")
+            print("===================")
+
     def _compute_spatial_weights(self, batch_coords):
-        """计算空间权重矩阵"""
+        """计算空间权重矩阵 - 修复autocast版本"""
         n_batch = batch_coords.shape[0]
         if n_batch <= 1:
-            return torch.ones((n_batch, n_batch), device=self.device)
+            return torch.ones((n_batch, n_batch), device=self.device,
+                              dtype=torch.float16 if self.mixed_precision else torch.float32)
 
-        # 计算欧氏距离
-        diff = batch_coords.unsqueeze(1) - batch_coords.unsqueeze(0)
-        distances = torch.sqrt(torch.sum(diff ** 2, dim=2) + 1e-8)
+        # 修复：正确使用autocast
+        if self.mixed_precision:
+            with autocast(device_type=self.device_type):
+                # 计算欧氏距离
+                diff = batch_coords.unsqueeze(1) - batch_coords.unsqueeze(0)
+                distances = torch.sqrt(torch.sum(diff ** 2, dim=2) + 1e-8)
 
-        # 高斯核函数
-        weights = torch.exp(-0.5 * (distances / self.bandwidth) ** 2)
+                # 高斯核函数
+                weights = torch.exp(-0.5 * (distances / self.bandwidth) ** 2)
+        else:
+            # 非混合精度版本
+            diff = batch_coords.unsqueeze(1) - batch_coords.unsqueeze(0)
+            distances = torch.sqrt(torch.sum(diff ** 2, dim=2) + 1e-8)
+            weights = torch.exp(-0.5 * (distances / self.bandwidth) ** 2)
 
         return weights
 
-    def train(self, train_loader, val_loader=None, epochs=200, early_stopping_patience=20):
-        """完整深度学习训练流程 - 修复版本"""
+    def train_epoch_mixed_precision(self, train_loader):
+        """修复学习率调度顺序的训练epoch"""
+        self.model.train()
+        epoch_train_loss = 0.0
+        batch_count = 0
 
+        for batch_idx, batch in enumerate(train_loader):
+            try:
+                if len(batch) == 3:
+                    batch_features, batch_targets, batch_coords = batch
+                    batch_features = batch_features.to(self.device, non_blocking=True)
+                    batch_targets = batch_targets.to(self.device, non_blocking=True)
+                    batch_coords = batch_coords.to(self.device, non_blocking=True) if batch_coords is not None else None
+                else:
+                    batch_features, batch_targets = batch
+                    batch_features = batch_features.to(self.device, non_blocking=True)
+                    batch_targets = batch_targets.to(self.device, non_blocking=True)
+                    batch_coords = None
+
+                self.optimizer.zero_grad(set_to_none=True)
+
+                # 计算空间权重
+                spatial_weights = None
+                if batch_coords is not None:
+                    spatial_weights = self._compute_spatial_weights(batch_coords)
+
+                # 简化前向传播
+                if self.mixed_precision:
+                    with autocast(device_type=self.device_type):
+                        outputs = self.model(batch_features, spatial_weights, batch_coords)
+                        loss = self.criterion(outputs, batch_targets)
+
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)  # 先执行优化器
+                    self.scaler.update()
+                    self.scheduler.step()  # 后执行学习率调度
+
+                else:
+                    outputs = self.model(batch_features, spatial_weights, batch_coords)
+                    loss = self.criterion(outputs, batch_targets)
+
+                    loss.backward()
+                    self.optimizer.step()  # 先执行优化器
+                    self.scheduler.step()  # 后执行学习率调度
+
+                epoch_train_loss += loss.item()
+                batch_count += 1
+
+                # 监控输出变化
+                if batch_idx % 10 == 0:
+                    output_std = torch.std(outputs).item()
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    self.logger.info(
+                        f'Batch {batch_idx}, Loss: {loss.item():.6f}, Output STD: {output_std:.6f}, LR: {current_lr:.2e}')
+
+            except Exception as e:
+                self.logger.error(f"Batch {batch_idx} 失败: {e}")
+                continue
+
+        return epoch_train_loss / max(batch_count, 1)
+
+    def _has_valid_gradients(self):
+        """检查是否存在有效梯度"""
+        has_valid_grad = False
+        for param in self.model.parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    self.logger.warning("检测到无效梯度，清零")
+                    param.grad.zero_()
+                elif torch.sum(torch.abs(param.grad)) > 0:
+                    has_valid_grad = True
+
+        return has_valid_grad
+
+    def _check_and_clip_gradients(self):
+        """检查并裁剪梯度"""
+        # 检查梯度是否存在
+        has_valid_grad = False
+        for param in self.model.parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    self.logger.warning("检测到无效梯度，清零")
+                    param.grad.zero_()
+                else:
+                    has_valid_grad = True
+
+        if not has_valid_grad:
+            self.logger.warning("没有有效梯度")
+            return False
+
+        # 梯度裁剪
+        torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(),
+            max_norm=self.gradient_clip,
+            norm_type=2
+        )
+
+        return True
+
+    def train(self, train_loader, val_loader=None, epochs=200, early_stopping_patience=20):
+        """完整深度学习训练流程"""
         self.model.train()
         best_val_loss = float('inf')
         patience_counter = 0
         train_losses = []
         val_losses = []
 
-        pbar = tqdm(range(epochs), desc="训练进度")
+        # GPU预热
+        if self.device_type == 'cuda':
+            self._warmup_gpu()
 
-        for epoch in pbar:
+        self.logger.info(f"开始训练，总轮次: {epochs}，早停耐心: {early_stopping_patience}")
+
+        for epoch in range(epochs):
             # 训练阶段
-            self.model.train()
-            epoch_train_loss = 0.0
-            batch_count = 0
-
-            for batch in train_loader:
-                if len(batch) == 3:
-                    batch_features, batch_targets, batch_coords = batch
-                else:
-                    batch_features, batch_targets = batch
-                    batch_coords = None
-
-                batch_features = batch_features.to(self.device)
-                batch_targets = batch_targets.to(self.device)
-
-                # 重要：每次迭代前清零梯度
-                self.optimizer.zero_grad()
-
-                # 计算空间权重（如果有坐标）
-                spatial_weights = None
-                if batch_coords is not None:
-                    batch_coords = batch_coords.to(self.device)
-                    spatial_weights = self._compute_spatial_weights(batch_coords)
-
-                # 前向传播
-                outputs = self.model(batch_features, spatial_weights, batch_coords)
-
-                # 计算主损失
-                main_loss = self.criterion(outputs, batch_targets)
-
-                # 添加输出多样性惩罚（防止输出恒定）
-                output_std = torch.std(outputs)
-                diversity_loss = -self.output_std_penalty * output_std  # 鼓励输出有方差
-
-                # 总损失
-                total_loss = main_loss + diversity_loss
-
-                # 重要：只调用一次 backward() 和 step()
-                total_loss.backward()
-
-                # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                # 更新参数
-                self.optimizer.step()
-
-                # 只记录主损失用于显示
-                epoch_train_loss += main_loss.item()
-                batch_count += 1
-
-            # 计算平均训练损失
-            epoch_train_loss /= len(train_loader)
-            train_losses.append(epoch_train_loss)
+            try:
+                train_loss = self.train_epoch_mixed_precision(train_loader)
+                train_losses.append(train_loss)
+            except Exception as e:
+                self.logger.error(f"Epoch {epoch} 训练失败: {e}")
+                break
 
             # 验证阶段
             if val_loader is not None:
-                val_loss = self.validate(val_loader)
-                val_losses.append(val_loss)
+                try:
+                    val_loss = self.validate(val_loader)
+                    val_losses.append(val_loss)
 
-                # 学习率调度
-                self.scheduler.step(val_loss)
+                    # 早停逻辑
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        patience_counter = 0
+                        # 保存最佳模型
+                        torch.save(self.model.state_dict(), 'best_pure_gnnwr_model.pth')
+                        self.logger.info(f"Epoch {epoch}: 保存最佳模型，验证损失: {val_loss:.6f}")
+                    else:
+                        patience_counter += 1
 
-                # 更新进度条
-                current_lr = self.optimizer.param_groups[0]['lr']
-                pbar.set_postfix({
-                    'train_loss': f'{epoch_train_loss:.4f}',
-                    'val_loss': f'{val_loss:.4f}',
-                    'lr': f'{current_lr:.2e}',
-                    'patience': f'{patience_counter}/{early_stopping_patience}'
-                })
-
-                # 早停逻辑
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                    if patience_counter >= early_stopping_patience:
+                        self.logger.info(f"早停在epoch {epoch}, 最佳验证loss: {best_val_loss:.6f}")
+                        # 加载最佳模型
+                        if os.path.exists('best_pure_gnnwr_model.pth'):
+                            self.model.load_state_dict(torch.load('best_pure_gnnwr_model.pth'))
+                        break
+                except Exception as e:
+                    self.logger.error(f"Epoch {epoch} 验证失败: {e}")
+                    val_losses.append(float('inf'))
+            else:
+                # 如果没有验证集，使用训练loss
+                if train_loss < best_val_loss:
+                    best_val_loss = train_loss
                     patience_counter = 0
-                    # 保存最佳模型
                     torch.save(self.model.state_dict(), 'best_pure_gnnwr_model.pth')
                 else:
                     patience_counter += 1
 
                 if patience_counter >= early_stopping_patience:
-                    pbar.set_description("训练完成 (早停)")
-                    self.logger.info(f"早停在epoch {epoch}, 最佳验证loss: {best_val_loss:.6f}")
-                    # 加载最佳模型
-                    self.model.load_state_dict(torch.load('best_pure_gnnwr_model.pth'))
+                    self.logger.info(f"早停在epoch {epoch}, 最佳训练loss: {best_val_loss:.6f}")
                     break
-            else:
-                # 如果没有验证集，使用训练loss
-                self.scheduler.step(epoch_train_loss)
-
-                # 更新进度条（无验证集版本）
-                current_lr = self.optimizer.param_groups[0]['lr']
-                pbar.set_postfix({
-                    'train_loss': f'{epoch_train_loss:.4f}',
-                    'lr': f'{current_lr:.2e}',
-                    'patience': f'{patience_counter}/{early_stopping_patience}'
-                })
 
             # 日志输出
             if epoch % 10 == 0:
                 current_lr = self.optimizer.param_groups[0]['lr']
-                if val_loader is not None:
-                    self.logger.info(f"Epoch {epoch:3d} | Train Loss: {epoch_train_loss:.6f} | "
-                                     f"Val Loss: {val_loss:.6f} | LR: {current_lr:.2e}")
+                if val_loader is not None and len(val_losses) > epoch:
+                    self.logger.info(f"Epoch {epoch:3d} | Train Loss: {train_loss:.6f} | "
+                                     f"Val Loss: {val_losses[epoch]:.6f} | LR: {current_lr:.2e}")
                 else:
-                    self.logger.info(f"Epoch {epoch:3d} | Train Loss: {epoch_train_loss:.6f} | "
+                    self.logger.info(f"Epoch {epoch:3d} | Train Loss: {train_loss:.6f} | "
                                      f"LR: {current_lr:.2e}")
 
-        pbar.close()
+        # 最终加载最佳模型
+        if os.path.exists('best_pure_gnnwr_model.pth'):
+            self.model.load_state_dict(torch.load('best_pure_gnnwr_model.pth'))
+            self.logger.info("加载最终最佳模型")
 
-        return train_losses, val_losses
+        return train_losses, val_losses if val_loader is not None else train_losses
+
+    def create_optimized_dataloader(self, dataset, batch_size=512, shuffle=True, is_train=True):
+        """创建优化的数据加载器"""
+        num_workers = min(16, self.cpu_workers // 2) if is_train else min(8, self.cpu_workers // 4)
+
+        self.logger.info(f"创建数据加载器 - 批次大小: {batch_size}, 工作进程: {num_workers}")
+
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=self.device.type == 'cuda',
+            persistent_workers=num_workers > 0 and is_train,
+            prefetch_factor=2 if num_workers > 0 else None
+        )
 
     def validate(self, val_loader):
-        """验证集评估"""
+        """验证集评估 - 修复版本"""
         self.model.eval()
         val_loss = 0.0
 
@@ -1771,52 +1922,134 @@ class PureGNNWRTrainer:
             for batch in val_loader:
                 if len(batch) == 3:
                     batch_features, batch_targets, batch_coords = batch
+                    batch_features = batch_features.to(self.device, non_blocking=True)
+                    batch_targets = batch_targets.to(self.device, non_blocking=True)
+                    batch_coords = batch_coords.to(self.device, non_blocking=True) if batch_coords is not None else None
                 else:
                     batch_features, batch_targets = batch
+                    batch_features = batch_features.to(self.device, non_blocking=True)
+                    batch_targets = batch_targets.to(self.device, non_blocking=True)
                     batch_coords = None
-
-                batch_features = batch_features.to(self.device)
-                batch_targets = batch_targets.to(self.device)
 
                 spatial_weights = None
                 if batch_coords is not None:
-                    batch_coords = batch_coords.to(self.device)
                     spatial_weights = self._compute_spatial_weights(batch_coords)
 
-                outputs = self.model(batch_features, spatial_weights, batch_coords)
-                loss = self.criterion(outputs, batch_targets)
+                # 修复：正确使用autocast
+                if self.mixed_precision:
+                    with autocast(device_type=self.device_type):
+                        outputs = self.model(batch_features, spatial_weights, batch_coords)
+                        loss = self.criterion(outputs, batch_targets)
+                else:
+                    outputs = self.model(batch_features, spatial_weights, batch_coords)
+                    loss = self.criterion(outputs, batch_targets)
+
                 val_loss += loss.item()
 
         return val_loss / len(val_loader)
 
-    def predict(self, features, coords=None):
-        """预测"""
+    def predict(self, features, coords=None, batch_size=2048):
+        """预测方法 - 添加调试"""
         self.model.eval()
+        predictions = []
+
+        dtype = torch.float16 if self.mixed_precision else torch.float32
+
+        self.logger.info("=== 预测模式调试 ===")
 
         with torch.no_grad():
-            features_tensor = torch.FloatTensor(features).to(self.device)
-
-            # 分批预测避免内存溢出
-            batch_size = 1024
-            predictions = []
-
             for i in range(0, len(features), batch_size):
-                batch_features = features_tensor[i:i + batch_size]
+                try:
+                    end_idx = min(i + batch_size, len(features))
+                    batch_features = torch.tensor(features[i:end_idx], dtype=dtype, device=self.device)
 
-                spatial_weights = None
-                if coords is not None:
-                    batch_coords = torch.FloatTensor(coords[i:i + batch_size]).to(self.device)
-                    spatial_weights = self._compute_spatial_weights(batch_coords)
+                    batch_coords = None
+                    if coords is not None:
+                        batch_coords = torch.tensor(coords[i:end_idx], dtype=dtype, device=self.device)
 
-                batch_pred = self.model(batch_features, spatial_weights, batch_coords)
-                predictions.append(batch_pred.cpu().numpy())
+                    # 调试：检查预测时的输出
+                    if i == 0:  # 只对第一个batch调试
+                        sample_outputs = []
+                        for j in range(min(3, len(batch_features))):
+                            if self.mixed_precision:
+                                with autocast(device_type=self.device_type):
+                                    spatial_weights = None
+                                    if batch_coords is not None:
+                                        spatial_weights = self._compute_spatial_weights(batch_coords[j:j + 1])
+                                    sample_output = self.model(batch_features[j:j + 1], spatial_weights, batch_coords[
+                                                                                                         j:j + 1] if batch_coords is not None else None)
+                            else:
+                                spatial_weights = None
+                                if batch_coords is not None:
+                                    spatial_weights = self._compute_spatial_weights(batch_coords[j:j + 1])
+                                sample_output = self.model(batch_features[j:j + 1], spatial_weights,
+                                                           batch_coords[j:j + 1] if batch_coords is not None else None)
 
-            return np.concatenate(predictions)
+                            sample_outputs.append(sample_output.item())
+                            self.logger.info(f"预测样本 {j}: 输出 = {sample_output.item():.6f}")
+
+                        pred_std = np.std(sample_outputs)
+                        self.logger.info(f"预测输出标准差: {pred_std:.6f}")
+
+                    if self.mixed_precision:
+                        with autocast(device_type=self.device_type):
+                            spatial_weights = None
+                            if batch_coords is not None:
+                                spatial_weights = self._compute_spatial_weights(batch_coords)
+
+                            batch_pred = self.model(batch_features, spatial_weights, batch_coords)
+                    else:
+                        spatial_weights = None
+                        if batch_coords is not None:
+                            spatial_weights = self._compute_spatial_weights(batch_coords)
+
+                        batch_pred = self.model(batch_features, spatial_weights, batch_coords)
+
+                    predictions.append(batch_pred.cpu().numpy())
+
+                except Exception as e:
+                    self.logger.error(f"预测批次 {i} 失败: {e}")
+                    continue
+
+        if len(predictions) == 0:
+            self.logger.error("没有有效的预测结果")
+            return np.array([])
+
+        final_predictions = np.concatenate(predictions)
+        self.logger.info(f"最终预测标准差: {np.std(final_predictions):.6f}")
+
+        return final_predictions
+
+    def _warmup_gpu(self):
+        """GPU预热 - 修复版本"""
+        if self.device_type == 'cuda':
+            self.logger.info("进行GPU预热...")
+            # 运行一个小的虚拟计算来预热GPU
+            dummy_input = torch.randn(64, self.model.feature_network[0].in_features,
+                                      device=self.device,
+                                      dtype=torch.float16 if self.mixed_precision else torch.float32)
+            dummy_coords = torch.randn(64, 2, device=self.device,
+                                       dtype=torch.float16 if self.mixed_precision else torch.float32)
+
+            # 修复：正确使用autocast
+            if self.mixed_precision:
+                with autocast(device_type=self.device_type):
+                    for _ in range(20):
+                        spatial_weights = self._compute_spatial_weights(dummy_coords)
+                        _ = self.model(dummy_input, spatial_weights, dummy_coords)
+            else:
+                for _ in range(20):
+                    spatial_weights = self._compute_spatial_weights(dummy_coords)
+                    _ = self.model(dummy_input, spatial_weights, dummy_coords)
+
+            torch.cuda.synchronize()
+            self.logger.info("GPU预热完成")
 
 
-def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=42):
+def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=42,
+                                      device='auto', mixed_precision=True, cpu_workers=24):
     """
-    运行纯净版GNNWR分析 - 包含完整交叉验证
+    运行纯净版GNNWR分析 - GPU优化版本
     """
     from sklearn.model_selection import train_test_split, LeaveOneGroupOut
     from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -1825,7 +2058,7 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
 
     logger = logging.getLogger("PureGNNWRAnalysis")
     logger.info("=" * 60)
-    logger.info("🚀 开始纯净版GNNWR完整分析流程")
+    logger.info("🚀 开始纯净版GNNWR完整分析流程 (GPU优化版)")
     logger.info("=" * 60)
 
     try:
@@ -1836,13 +2069,18 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         logger.info(f"数据加载: {len(X)}样本, {X.shape[1]}特征")
         logger.info(f"站点数: {len(np.unique(station_groups))}, 年份数: {len(np.unique(year_groups))}")
 
+        # 显示硬件信息
+        if device == 'auto' and torch.cuda.is_available():
+            logger.info(f"使用GPU: {torch.cuda.get_device_name()}")
+        logger.info(f"混合精度: {mixed_precision}, CPU线程: {cpu_workers}")
         # 1. 站点交叉验证
         logger.info("\n" + "=" * 50)
         logger.info("步骤 1: 站点交叉验证")
         logger.info("=" * 50)
 
         station_cv_results = pure_gnnwr_cross_validate_fixed(
-            X, y, station_groups, coords, 'station', logger
+            X, y, station_groups, coords, 'station', logger,
+            device=device, mixed_precision=mixed_precision, cpu_workers=cpu_workers
         )
 
         # 2. 年度交叉验证
@@ -1851,7 +2089,8 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         logger.info("=" * 50)
 
         yearly_cv_results = pure_gnnwr_cross_validate_fixed(
-            X, y, year_groups, coords, 'yearly', logger
+            X, y, year_groups, coords, 'yearly', logger,
+            device=device, mixed_precision=mixed_precision, cpu_workers=cpu_workers
         )
 
         # 3. 标准训练测试集分割
@@ -1869,19 +2108,25 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         train_dataset = EnhancedSpatialDataset(X_train, y_train, coords_train)
         test_dataset = EnhancedSpatialDataset(X_test, y_test, coords_test)
 
-        # 数据加载器
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
-        test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False, num_workers=4)
-
-        # 训练纯净版GNNWR
+        # 创建优化训练器
         trainer = PureGNNWRTrainer(
             input_dim=X.shape[1],
             coords=coords_train,
-            hidden_dims=[128, 64, 32, 16],
+            hidden_dims=[512, 256, 128, 64],  # 更大的模型
             learning_rate=0.001,
             dropout_rate=0.3,
             weight_decay=1e-4,
-            device='cpu'  # 使用CPU
+            device=device,
+            mixed_precision=mixed_precision,
+            cpu_workers=cpu_workers
+        )
+
+        # 创建优化的数据加载器
+        train_loader = trainer.create_optimized_dataloader(
+            train_dataset, batch_size=512, shuffle=True, is_train=True
+        )
+        test_loader = trainer.create_optimized_dataloader(
+            test_dataset, batch_size=1024, shuffle=False, is_train=False
         )
 
         logger.info("开始纯净版GNNWR训练...")
@@ -1890,7 +2135,7 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         train_losses, val_losses = trainer.train(train_loader, test_loader, epochs=200)
 
         # 最终评估
-        y_pred = trainer.predict(X_test, coords_test)
+        y_pred = trainer.predict(X_test, coords_test, batch_size=2048)
 
         # 计算评估指标
         test_metrics = evaluate_predictions(y_test, y_pred)
@@ -1901,49 +2146,55 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
             'yearly_cv': yearly_cv_results,
             'standard_test': test_metrics,
             'trainer': trainer,
+            'training_info': trainer.get_training_info(),
             'data_info': {
                 'total_samples': len(X),
                 'n_features': X.shape[1],
                 'n_stations': len(np.unique(station_groups)),
                 'n_years': len(np.unique(year_groups)),
                 'train_size': len(X_train),
-                'test_size': len(X_test)
+                'test_size': len(X_test),
+                'device': str(trainer.device),
+                'mixed_precision': mixed_precision
             }
         }
 
-        # === 新增：保存结果和生成图表 ===
+        # 保存结果和生成图表
         if output_dir is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_dir = f"./pure_gnnwr_results_{timestamp}"
+            output_dir = f"./pure_gnnwr_results_optimized_{timestamp}"
 
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"保存结果到: {output_dir}")
 
         # 保存模型
-        model_path = os.path.join(output_dir, 'pure_gnnwr_model.pth')
+        model_path = os.path.join(output_dir, 'pure_gnnwr_model_optimized.pth')
         torch.save({
             'model_state_dict': trainer.model.state_dict(),
             'config': {
                 'input_dim': X.shape[1],
-                'hidden_dims': [128, 64, 32, 16],
-                'learning_rate': 0.001
-            }
+                'hidden_dims': [512, 256, 128, 64],
+                'learning_rate': 0.001,
+                'device': str(trainer.device),
+                'mixed_precision': mixed_precision
+            },
+            'training_info': trainer.get_training_info()
         }, model_path)
 
         # 保存结果数据
-        results_path = os.path.join(output_dir, 'pure_gnnwr_results.pkl')
+        results_path = os.path.join(output_dir, 'pure_gnnwr_results_optimized.pkl')
         joblib.dump(results, results_path)
 
         # 生成可视化图表
-        create_pure_gnnwr_visualizations(results, output_dir)
+        create_pure_gnnwr_visualizations_optimized(results, output_dir)
 
         # 生成详细报告
-        report_path = os.path.join(output_dir, 'pure_gnnwr_report.txt')
+        report_path = os.path.join(output_dir, 'pure_gnnwr_report_optimized.txt')
         with open(report_path, 'w', encoding='utf-8') as f:
-            f.write(generate_detailed_report(results))
+            f.write(generate_detailed_report_optimized(results))
 
         # 输出综合报告
-        print_comprehensive_report(results)
+        print_comprehensive_report_optimized(results)
 
         logger.info("🎯 纯净版GNNWR完整分析完成!")
         return results, trainer
@@ -1953,15 +2204,29 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         raise
 
 
-def create_pure_gnnwr_visualizations(results, output_dir):
-    """生成纯净版GNNWR的可视化图表 - 包含测试集大小信息"""
+def create_pure_gnnwr_visualizations_optimized(results, output_dir):
+    """生成纯净版GNNWR的优化可视化图表"""
     import matplotlib.pyplot as plt
     import seaborn as sns
 
-    plt.figure(figsize=(18, 12))
+    plt.figure(figsize=(20, 15))
 
-    # 1. 站点交叉验证散点图
-    plt.subplot(2, 4, 1)
+    # 1. 训练信息展示
+    plt.subplot(3, 4, 1)
+    training_info = results['training_info']
+    info_text = f"设备: {training_info['device']}\n"
+    info_text += f"混合精度: {training_info['mixed_precision']}\n"
+    info_text += f"模型参数: {training_info['model_parameters']:,}\n"
+    if 'gpu_name' in training_info:
+        info_text += f"GPU: {training_info['gpu_name']}\n"
+        info_text += f"GPU内存: {training_info['gpu_memory']}"
+
+    plt.text(0.1, 0.5, info_text, fontsize=10, verticalalignment='center')
+    plt.axis('off')
+    plt.title('训练配置信息', fontsize=12, fontweight='bold')
+
+    # 2. 站点交叉验证散点图
+    plt.subplot(3, 4, 2)
     station_cv = results['station_cv']
     y_true_station = station_cv['true_values']
     y_pred_station = station_cv['predictions']
@@ -1974,8 +2239,8 @@ def create_pure_gnnwr_visualizations(results, output_dir):
     plt.title(f'Station CV\nMAE={station_cv["overall"]["MAE"]:.2f}, R={station_cv["overall"]["R"]:.3f}')
     plt.grid(True, alpha=0.3)
 
-    # 2. 年度交叉验证散点图
-    plt.subplot(2, 4, 2)
+    # 3. 年度交叉验证散点图
+    plt.subplot(3, 4, 3)
     yearly_cv = results['yearly_cv']
     y_true_yearly = yearly_cv['true_values']
     y_pred_yearly = yearly_cv['predictions']
@@ -1988,24 +2253,8 @@ def create_pure_gnnwr_visualizations(results, output_dir):
     plt.title(f'Yearly CV\nMAE={yearly_cv["overall"]["MAE"]:.2f}, R={yearly_cv["overall"]["R"]:.3f}')
     plt.grid(True, alpha=0.3)
 
-    # 3. 测试集大小分布 - 站点
-    plt.subplot(2, 4, 3)
-    station_test_sizes = [info['test_size'] for info in station_cv['by_fold'].values()]
-    plt.hist(station_test_sizes, bins=20, alpha=0.7, color='skyblue')
-    plt.xlabel('测试集大小 (样本数)')
-    plt.ylabel('折叠数量')
-    plt.title(f'站点CV测试集大小分布\n平均={np.mean(station_test_sizes):.1f}')
-
-    # 4. 测试集大小分布 - 年度
-    plt.subplot(2, 4, 4)
-    yearly_test_sizes = [info['test_size'] for info in yearly_cv['by_fold'].values()]
-    plt.hist(yearly_test_sizes, bins=20, alpha=0.7, color='lightgreen')
-    plt.xlabel('测试集大小 (样本数)')
-    plt.ylabel('折叠数量')
-    plt.title(f'年度CV测试集大小分布\n平均={np.mean(yearly_test_sizes):.1f}')
-
-    # 5. 性能对比柱状图
-    plt.subplot(2, 4, 5)
+    # 4. 性能对比柱状图
+    plt.subplot(3, 4, 4)
     methods = ['Station CV', 'Yearly CV', 'Standard Test']
     mae_values = [
         station_cv['overall']['MAE'],
@@ -2020,8 +2269,8 @@ def create_pure_gnnwr_visualizations(results, output_dir):
         plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
                  f'{value:.2f}', ha='center', va='bottom')
 
-    # 6. R值对比柱状图
-    plt.subplot(2, 4, 6)
+    # 5. R值对比柱状图
+    plt.subplot(3, 4, 5)
     r_values = [
         station_cv['overall']['R'],
         yearly_cv['overall']['R'],
@@ -2035,8 +2284,8 @@ def create_pure_gnnwr_visualizations(results, output_dir):
         plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
                  f'{value:.3f}', ha='center', va='bottom')
 
-    # 7. 折叠统计
-    plt.subplot(2, 4, 7)
+    # 6. 折叠统计
+    plt.subplot(3, 4, 6)
     fold_stats = {
         '总站点折叠': station_cv['total_folds'],
         '成功站点折叠': station_cv['folds'],
@@ -2049,20 +2298,131 @@ def create_pure_gnnwr_visualizations(results, output_dir):
     plt.ylabel('数量')
     plt.title('交叉验证折叠统计')
 
+    # 7. 数据概况
+    plt.subplot(3, 4, 7)
+    data_info = results['data_info']
+    data_text = f"总样本: {data_info['total_samples']}\n"
+    data_text += f"特征数: {data_info['n_features']}\n"
+    data_text += f"站点数: {data_info['n_stations']}\n"
+    data_text += f"年份数: {data_info['n_years']}\n"
+    data_text += f"训练集: {data_info['train_size']}\n"
+    data_text += f"测试集: {data_info['test_size']}"
+
+    plt.text(0.1, 0.5, data_text, fontsize=10, verticalalignment='center')
+    plt.axis('off')
+    plt.title('数据概况', fontsize=12, fontweight='bold')
+
     # 8. 残差分布
-    plt.subplot(2, 4, 8)
+    plt.subplot(3, 4, 8)
     residuals = y_true_station - y_pred_station
-    plt.hist(residuals, bins=30, alpha=0.7, color='orange')
+    plt.hist(residuals, bins=30, alpha=0.7, color='orange', density=True)
     plt.xlabel('残差 (mm)')
-    plt.ylabel('频率')
+    plt.ylabel('密度')
     plt.title('站点CV残差分布')
 
+    # 添加正态分布曲线
+    from scipy.stats import norm
+    mu, std = norm.fit(residuals)
+    x = np.linspace(residuals.min(), residuals.max(), 100)
+    p = norm.pdf(x, mu, std)
+    plt.plot(x, p, 'k', linewidth=2)
+
     plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'pure_gnnwr_comprehensive_analysis.png'),
+    plt.savefig(os.path.join(output_dir, 'pure_gnnwr_comprehensive_analysis_optimized.png'),
                 dpi=300, bbox_inches='tight')
     plt.close()
 
-    print(f"✅ 综合可视化图表已保存")
+    print(f"✅ 优化版可视化图表已保存")
+
+
+def generate_detailed_report_optimized(results):
+    """生成优化的详细分析报告"""
+    report = []
+    report.append("=" * 80)
+    report.append("🎯 纯净版GNNWR详细分析报告 (GPU优化版)")
+    report.append("=" * 80)
+    report.append("")
+
+    # 训练配置信息
+    training_info = results['training_info']
+    report.append("⚙️ 训练配置:")
+    report.append(f"  设备: {training_info['device']}")
+    report.append(f"  混合精度: {'是' if training_info['mixed_precision'] else '否'}")
+    report.append(f"  模型参数: {training_info['model_parameters']:,}")
+    report.append(f"  CPU工作线程: {training_info.get('cpu_workers', 'N/A')}")
+    if 'gpu_name' in training_info:
+        report.append(f"  GPU: {training_info['gpu_name']}")
+        report.append(f"  GPU内存: {training_info['gpu_memory']}")
+    report.append("")
+
+    # 数据概况
+    data_info = results['data_info']
+    report.append("📊 数据概况:")
+    report.append(f"  总样本数: {data_info['total_samples']}")
+    report.append(f"  特征数量: {data_info['n_features']}")
+    report.append(f"  站点数量: {data_info['n_stations']}")
+    report.append(f"  年份数量: {data_info['n_years']}")
+    report.append(f"  训练集大小: {data_info['train_size']}")
+    report.append(f"  测试集大小: {data_info['test_size']}")
+    report.append("")
+
+    # 站点交叉验证详细结果
+    station_cv = results['station_cv']
+    station_overall = station_cv['overall']
+    report.append("🏔️ 站点交叉验证详细结果:")
+    report.append(f"  总折叠数: {station_cv['total_folds']}")
+    report.append(f"  成功折叠: {station_cv['folds']}")
+    report.append(f"  跳过折叠: {station_cv.get('skipped_folds', 0)}")
+    report.append(f"  MAE: {station_overall['MAE']:.3f} mm")
+    report.append(f"  RMSE: {station_overall['RMSE']:.3f} mm")
+    report.append(f"  R: {station_overall['R']:.3f}")
+    report.append(f"  R²: {station_overall['R_squared']:.3f}")
+    report.append(f"  样本数: {station_overall['samples']}")
+    report.append("")
+
+    # 年度交叉验证详细结果
+    yearly_cv = results['yearly_cv']
+    yearly_overall = yearly_cv['overall']
+    report.append("📅 年度交叉验证详细结果:")
+    report.append(f"  总折叠数: {yearly_cv['total_folds']}")
+    report.append(f"  成功折叠: {yearly_cv['folds']}")
+    report.append(f"  跳过折叠: {yearly_cv.get('skipped_folds', 0)}")
+    report.append(f"  MAE: {yearly_overall['MAE']:.3f} mm")
+    report.append(f"  RMSE: {yearly_overall['RMSE']:.3f} mm")
+    report.append(f"  R: {yearly_overall['R']:.3f}")
+    report.append(f"  R²: {yearly_overall['R_squared']:.3f}")
+    report.append(f"  样本数: {yearly_overall['samples']}")
+    report.append("")
+
+    # 标准测试集结果
+    standard_test = results['standard_test']
+    report.append("🧪 标准测试集结果:")
+    report.append(f"  MAE: {standard_test['MAE']:.3f} mm")
+    report.append(f"  RMSE: {standard_test['RMSE']:.3f} mm")
+    report.append(f"  R: {standard_test['R']:.3f}")
+    report.append(f"  R²: {standard_test['R_squared']:.3f}")
+    report.append(f"  样本数: {standard_test['samples']}")
+    report.append("")
+
+    # 性能总结
+    report.append("📈 性能总结:")
+    best_mae = min(station_overall['MAE'], yearly_overall['MAE'], standard_test['MAE'])
+    best_r = max(station_overall['R'], yearly_overall['R'], standard_test['R'])
+    report.append(f"  最佳MAE: {best_mae:.3f} mm")
+    report.append(f"  最佳R值: {best_r:.3f}")
+
+    # 计算性能提升（如果有基线）
+    if 'baseline' in results:
+        baseline_mae = results['baseline']['MAE']
+        improvement = (baseline_mae - best_mae) / baseline_mae * 100
+        report.append(f"  相比基线提升: {improvement:.1f}%")
+    report.append("")
+
+    report.append("=" * 80)
+    report.append("报告生成时间: " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    report.append("=" * 80)
+
+    return "\n".join(report)
 
 
 def generate_detailed_report(results):
@@ -2137,8 +2497,9 @@ def generate_detailed_report(results):
     return "\n".join(report)
 
 
-def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger):
-    """修复的交叉验证 - 正确理解LOGO逻辑"""
+def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger,
+                                    device='auto', mixed_precision=True, cpu_workers=24):
+    """优化的交叉验证 - GPU版本"""
     from sklearn.model_selection import LeaveOneGroupOut
 
     logo = LeaveOneGroupOut()
@@ -2151,6 +2512,7 @@ def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger):
     total_folds = len(unique_groups)
 
     logger.info(f"开始{cv_type}交叉验证，共{total_folds}个折叠...")
+    logger.info(f"设备: {device}, 混合精度: {mixed_precision}")
 
     for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups)):
         group_id = groups[test_idx[0]]
@@ -2168,39 +2530,65 @@ def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger):
         coords_train = coords[train_idx] if coords is not None else None
         coords_test = coords[test_idx] if coords is not None else None
 
-        # 验证数据分割正确性
-        unique_train_groups = len(np.unique(groups[train_idx]))
-        unique_test_groups = len(np.unique(groups[test_idx]))
-
-        logger.debug(f"  训练集包含 {unique_train_groups} 个{'' if cv_type == 'station' else '年份'}")
-        logger.debug(f"  测试集包含 {unique_test_groups} 个{'' if cv_type == 'station' else '年份'}")
-
         try:
-            # 使用完整模型（训练集很大，可以用复杂模型）
+            # 使用优化配置的训练器
             trainer = PureGNNWRTrainer(
                 input_dim=X.shape[1],
                 coords=coords_train,
-                hidden_dims=[128, 64, 32, 16],  # 使用完整模型
+                hidden_dims=[512, 256, 128, 64],  # 使用完整模型
                 learning_rate=0.001,
                 dropout_rate=0.3,
-                device='cpu',
+                device=device,
+                mixed_precision=mixed_precision,
+                cpu_workers=cpu_workers,
                 output_std_penalty=0.05  # 防止输出恒定
             )
 
-            # 创建数据集 - 使用较大的batch_size（训练集大）
+            # 🔴 添加调试代码：检查模型初始输出
+            logger.info("=== 调试模型初始输出 ===")
+            trainer.model.eval()
+            with torch.no_grad():
+                sample_outputs = []
+                for i in range(min(5, len(X_train))):
+                    x = torch.tensor(X_train[i:i + 1], dtype=torch.float32, device=trainer.device)
+                    c = torch.tensor(coords_train[i:i + 1], dtype=torch.float32,
+                                     device=trainer.device) if coords_train is not None else None
+
+                    if trainer.mixed_precision:
+                        with autocast(device_type=trainer.device_type):
+                            output = trainer.model(x, None, c)
+                    else:
+                        output = trainer.model(x, None, c)
+
+                    sample_outputs.append(output.item())
+                    logger.info(
+                        f"样本 {i}: 输入范围[{x.min().item():.3f}, {x.max().item():.3f}], 输出={output.item():.6f}")
+
+                output_std = np.std(sample_outputs)
+                logger.info(f"初始输出标准差: {output_std:.6f}")
+                if output_std < 1e-6:
+                    logger.error("🚨 模型输出恒定！检查：")
+                    logger.error("1. 模型权重初始化")
+                    logger.error("2. 数据预处理")
+                    logger.error("3. 学习率配置")
+                else:
+                    logger.info(f"✅ 模型输出正常，标准差: {output_std:.6f}")
+
+            # 创建优化的数据加载器
             train_dataset = EnhancedSpatialDataset(X_train, y_train, coords_train)
-            train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True, num_workers=4)
+            train_loader = trainer.create_optimized_dataloader(
+                train_dataset, batch_size=512, shuffle=True, is_train=True
+            )
 
             # 训练 - 可以使用更多epoch（训练集大，不容易过拟合）
             trainer.train(train_loader, epochs=100, early_stopping_patience=15)
 
             # 预测
-            y_pred = trainer.predict(X_test, coords_test)
+            y_pred = trainer.predict(X_test, coords_test, batch_size=1024)
 
             # 检查预测结果质量
-            if len(test_idx) > 1 and np.std(y_pred) < 1e-6:  # 只有测试集>1时才检查
+            if len(test_idx) > 1 and np.std(y_pred) < 1e-6:
                 logger.warning(f"折叠 {fold + 1}: 预测结果恒定，可能模型有问题")
-                # 但仍然记录结果
 
             # 存储结果
             all_predictions.extend(y_pred)
@@ -2211,7 +2599,8 @@ def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger):
             fold_results[group_id] = {
                 **fold_metrics,
                 'train_size': train_size,
-                'test_size': test_size
+                'test_size': test_size,
+                'device': str(trainer.device)
             }
 
             logger.info(
@@ -2264,6 +2653,7 @@ def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger):
     }
 
 
+
 def _is_constant_data(data, axis=None):
     """检查数据是否恒定（所有值相同）"""
     if data is None or len(data) == 0:
@@ -2312,11 +2702,19 @@ def evaluate_predictions(y_true, y_pred):
     }
 
 
-def print_comprehensive_report(results):
-    """打印综合报告"""
+def print_comprehensive_report_optimized(results):
+    """打印优化的综合报告"""
     print("\n" + "=" * 70)
-    print("🎯 纯净版GNNWR完整分析报告")
+    print("🎯 纯净版GNNWR完整分析报告 (GPU优化版)")
     print("=" * 70)
+
+    # 训练配置
+    training_info = results['training_info']
+    print(f"\n⚙️ 训练配置:")
+    print(f"  设备: {training_info['device']}")
+    print(f"  混合精度: {'是' if training_info['mixed_precision'] else '否'}")
+    if 'gpu_name' in training_info:
+        print(f"  GPU: {training_info['gpu_name']}")
 
     # 数据概况
     data_info = results['data_info']
@@ -2356,13 +2754,19 @@ def print_comprehensive_report(results):
     print("=" * 70)
 
 
+
 # 在SWEClusterEnsemble类中添加一个便捷方法
-def SWEClusterEnsemble_run_pure_comparison(self, df):
+def SWEClusterEnsemble_run_pure_comparison_optimized(self, df, device='auto', mixed_precision=True, cpu_workers=24):
     """
     在SWEClusterEnsemble类中添加的方法
-    用于快速运行纯净版对比实验
+    用于快速运行纯净版对比实验 - 优化版本
     """
-    return train_pure_gnnwr_analysis(df)
+    return train_pure_gnnwr_analysis(
+        df,
+        device=device,
+        mixed_precision=mixed_precision,
+        cpu_workers=cpu_workers
+    )
 
 
 
