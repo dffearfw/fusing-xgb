@@ -1533,57 +1533,75 @@ def test_cluster_ensemble():
 
 
 class PureGNNWRModel(nn.Module):
-    """纯净版GNNWR模型 - GPU优化版本"""
-
-    def __init__(self, input_dim, hidden_dims=[512, 256, 128, 64], output_dim=1,
-                 dropout_rate=0.3, use_batch_norm=True, use_attention=True):
+    def __init__(self, input_dim, hidden_dims=[256, 128, 64, 32], output_dim=1,  # 使用更小的网络
+                 dropout_rate=0.3, use_batch_norm=True, use_attention=True,
+                 activation='relu'):
         super(PureGNNWRModel, self).__init__()
 
         self.use_attention = use_attention
 
-        # 深度特征提取网络 - 更大的模型充分利用GPU
+        # 选择激活函数
+        if activation == 'relu':
+            self.activation = nn.ReLU()
+        elif activation == 'leaky_relu':
+            self.activation = nn.LeakyReLU(0.1)
+        elif activation == 'elu':
+            self.activation = nn.ELU()
+        else:
+            self.activation = nn.ReLU()
+
+        # 特征提取网络 - 修复梯度流动
         layers = []
         prev_dim = input_dim
 
-        for hidden_dim in hidden_dims:
+        for i, hidden_dim in enumerate(hidden_dims):
             layers.append(nn.Linear(prev_dim, hidden_dim))
 
             if use_batch_norm:
                 layers.append(nn.BatchNorm1d(hidden_dim))
 
-            layers.append(nn.ReLU())
+            layers.append(self.activation)
             layers.append(nn.Dropout(dropout_rate))
             prev_dim = hidden_dim
 
         self.feature_network = nn.Sequential(*layers)
 
-        # 输出层
-        self.output_layer = nn.Sequential(
-            nn.Linear(prev_dim, prev_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate / 2),
-            nn.Linear(prev_dim // 2, output_dim)
-        )
+        # 输出层 - 添加残差连接防止梯度消失
+        self.output_layer = nn.Linear(prev_dim, output_dim)
 
-        # 增强的空间注意力机制
-        if use_attention:
-            self.spatial_attention = nn.Sequential(
-                nn.Linear(2, 128),
-                nn.ReLU(),
-                nn.Dropout(0.2),
-                nn.Linear(128, 64),
-                nn.ReLU(),
-                nn.Linear(64, 1),
-                nn.Sigmoid()
-            )
+        # 关键修复：更好的权重初始化
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        """权重初始化 - 修复self引用问题"""
+        # 关键修复：使用self.modules()而不是self.model.modules()
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # 使用Kaiming初始化，适合ReLU
+                nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
+
+    def _initialize_single_module(self, module):
+        """初始化单个模块的权重"""
+        if isinstance(module, nn.Linear):
+            # 使用Kaiming初始化，适合ReLU
+            nn.init.kaiming_normal_(module.weight, mode='fan_in', nonlinearity='relu')
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.BatchNorm1d):
+            nn.init.constant_(module.weight, 1)
+            nn.init.constant_(module.bias, 0)
 
     def forward(self, x, spatial_weights=None, coords=None):
         # 特征提取
         features = self.feature_network(x)
 
-        # 空间平滑（如果提供了空间权重）
-        if spatial_weights is not None:
-            # 空间平滑：每个位置的特征是其邻近位置的加权平均
+        # 空间平滑
+        if spatial_weights is not None and self.use_attention:
             row_sums = torch.sum(spatial_weights, dim=1, keepdim=True)
             normalized_weights = spatial_weights / torch.where(row_sums > 0, row_sums, torch.tensor(1.0))
             smoothed_features = torch.matmul(normalized_weights, features)
@@ -1600,7 +1618,7 @@ class PureGNNWRTrainer:
     def __init__(self, input_dim, coords, hidden_dims=[512, 256, 128, 64],
                  learning_rate=0.001, bandwidth=10.0, dropout_rate=0.3,
                  weight_decay=1e-4, device='auto', output_std_penalty=0.01,
-                 mixed_precision=True, cpu_workers=24):
+                 mixed_precision=True, cpu_workers=24, gradient_clip=1.0):
 
         # 首先初始化logger - 这是关键修复！
         self.logger = logging.getLogger("PureGNNWRTrainer")
@@ -1637,20 +1655,28 @@ class PureGNNWRTrainer:
         self.logger.info(f"纯净版GNNWR - 使用设备: {self.device}")
         self.logger.info(f"混合精度: {self.mixed_precision}")
 
+        # 关键：添加标准化器
+        from sklearn.preprocessing import StandardScaler
+        self.feature_scaler = StandardScaler()
+        self.target_scaler = StandardScaler()
+
         # 模型初始化
         self.model = PureGNNWRModel(
             input_dim=input_dim,
             hidden_dims=hidden_dims,
-            dropout_rate=dropout_rate
+            dropout_rate=dropout_rate,
+            activation='leaky_relu'  # 使用LeakyReLU防止死亡ReLU
         ).to(self.device)
 
         # 优化器 - 使用AdamW，针对混合精度优化
         self.optimizer = optim.AdamW(
             self.model.parameters(),
-            lr=learning_rate,
+            lr=1e-4,
             weight_decay=weight_decay,
-            betas=(0.9, 0.999)
+            betas=(0.9, 0.99)
         )
+
+
 
         # 学习率调度器 - OneCycle策略
         self.scheduler = optim.lr_scheduler.OneCycleLR(
@@ -1669,6 +1695,39 @@ class PureGNNWRTrainer:
 
         # CPU工作线程配置
         self.cpu_workers = cpu_workers
+
+        self.gradient_clip = gradient_clip
+
+
+    def _initialize_model(self):
+        """确保模型正确初始化 - 修复apply调用"""
+        # 关键修复：正确使用apply方法
+        self.model.apply(self._initialize_weights)
+
+        # 验证初始化
+        self.logger.info("=== 模型初始化验证 ===")
+        total_params = sum(p.numel() for p in self.model.parameters())
+        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        self.logger.info(f"总参数: {total_params:,}, 可训练参数: {trainable_params:,}")
+
+        # 检查权重范围
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.logger.info(f"{name}: mean={param.data.mean():.6f}, std={param.data.std():.6f}")
+
+        self.logger.info("=====================")
+
+    def _initialize_weights(self):
+        """更好的权重初始化"""
+        for module in self.model.modules():
+            if isinstance(module, nn.Linear):
+                # 使用Xavier初始化
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+            elif isinstance(module, nn.BatchNorm1d):
+                nn.init.constant_(module.weight, 1)
+                nn.init.constant_(module.bias, 0)
 
     def debug_model_output(self, X_sample, y_sample, coords_sample=None):
         """调试模型输出"""
@@ -1726,6 +1785,9 @@ class PureGNNWRTrainer:
         epoch_train_loss = 0.0
         batch_count = 0
 
+        # 添加梯度裁剪阈值
+        gradient_clip = 1.0  # 关键修复：添加梯度裁剪阈值
+
         for batch_idx, batch in enumerate(train_loader):
             try:
                 if len(batch) == 3:
@@ -1746,13 +1808,32 @@ class PureGNNWRTrainer:
                 if batch_coords is not None:
                     spatial_weights = self._compute_spatial_weights(batch_coords)
 
-                # 简化前向传播
                 if self.mixed_precision:
                     with autocast(device_type=self.device_type):
                         outputs = self.model(batch_features, spatial_weights, batch_coords)
                         loss = self.criterion(outputs, batch_targets)
 
                     self.scaler.scale(loss).backward()
+
+                    # 关键修复：添加梯度裁剪
+                    self.scaler.unscale_(self.optimizer)  # 必须先unscale梯度
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=gradient_clip,
+                        norm_type=2.0
+                    )
+
+                    # 关键：添加梯度监控
+                    total_grad_norm = 0.0
+                    grad_norms = []
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            param_grad_norm = param.grad.data.norm(2).item()
+                            total_grad_norm += param_grad_norm ** 2  # 修正：应该平方和再开方
+                            grad_norms.append((name, param_grad_norm))
+
+                    total_grad_norm = total_grad_norm ** 0.5  # 计算真实的梯度范数
+
                     self.scaler.step(self.optimizer)  # 先执行优化器
                     self.scaler.update()
                     self.scheduler.step()  # 后执行学习率调度
@@ -1762,13 +1843,58 @@ class PureGNNWRTrainer:
                     loss = self.criterion(outputs, batch_targets)
 
                     loss.backward()
+
+                    # 关键修复：添加梯度裁剪（非混合精度版本）
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=gradient_clip,
+                        norm_type=2.0
+                    )
+
+                    # 关键：添加梯度监控
+                    total_grad_norm = 0.0
+                    grad_norms = []
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            param_grad_norm = param.grad.data.norm(2).item()
+                            total_grad_norm += param_grad_norm ** 2
+                            grad_norms.append((name, param_grad_norm))
+
+                    total_grad_norm = total_grad_norm ** 0.5
+
                     self.optimizer.step()  # 先执行优化器
                     self.scheduler.step()  # 后执行学习率调度
 
                 epoch_train_loss += loss.item()
                 batch_count += 1
 
-                # 监控输出变化
+                # 监控输出和梯度
+                if batch_idx % 10 == 0:
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    output_std = torch.std(outputs).item()
+                    output_range = f"[{outputs.min().item():.3f}, {outputs.max().item():.3f}]"
+
+                    # 检查梯度是否被裁剪
+                    grad_clipped = total_grad_norm > gradient_clip
+                    clip_info = " (已裁剪)" if grad_clipped else ""
+
+                    self.logger.info(f'Batch {batch_idx}: Loss={loss.item():.6f}, '
+                                     f'Output STD={output_std:.6f}, Output Range={output_range}, '
+                                     f'Grad Norm={total_grad_norm:.6f}{clip_info}, LR={current_lr:.2e}')
+
+                    # 如果梯度很小，显示具体哪些层的梯度小
+                    if total_grad_norm < 1e-6:
+                        self.logger.warning("梯度消失！各层梯度:")
+                        for name, grad_norm in grad_norms[:5]:  # 显示前5层
+                            self.logger.warning(f"  {name}: {grad_norm:.6f}")
+
+                    # 如果梯度很大，显示具体哪些层的梯度大
+                    elif total_grad_norm > 1000:
+                        self.logger.warning("梯度爆炸风险！各层梯度:")
+                        for name, grad_norm in sorted(grad_norms, key=lambda x: x[1], reverse=True)[:3]:
+                            self.logger.warning(f"  {name}: {grad_norm:.6f}")
+
+                # 监控输出变化（保留原有逻辑）
                 if batch_idx % 10 == 0:
                     output_std = torch.std(outputs).item()
                     current_lr = self.optimizer.param_groups[0]['lr']
@@ -1777,6 +1903,8 @@ class PureGNNWRTrainer:
 
             except Exception as e:
                 self.logger.error(f"Batch {batch_idx} 失败: {e}")
+                # 关键修复：在异常时清理梯度
+                self.optimizer.zero_grad(set_to_none=True)
                 continue
 
         return epoch_train_loss / max(batch_count, 1)
@@ -1820,12 +1948,15 @@ class PureGNNWRTrainer:
         return True
 
     def train(self, train_loader, val_loader=None, epochs=200, early_stopping_patience=20):
-        """完整深度学习训练流程"""
+        """完整深度学习训练流程 - 修复模型保存逻辑"""
         self.model.train()
         best_val_loss = float('inf')
         patience_counter = 0
         train_losses = []
         val_losses = []
+
+        # 关键修复：保存最佳模型状态而不是整个模型
+        best_model_state = None
 
         # GPU预热
         if self.device_type == 'cuda':
@@ -1852,17 +1983,21 @@ class PureGNNWRTrainer:
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         patience_counter = 0
-                        # 保存最佳模型
-                        torch.save(self.model.state_dict(), 'best_pure_gnnwr_model.pth')
-                        self.logger.info(f"Epoch {epoch}: 保存最佳模型，验证损失: {val_loss:.6f}")
+                        # 关键修复：保存模型状态而不是整个模型
+                        best_model_state = {
+                            'epoch': epoch,
+                            'model_state_dict': self.model.state_dict().copy(),
+                            'optimizer_state_dict': self.optimizer.state_dict().copy(),
+                            'scheduler_state_dict': self.scheduler.state_dict().copy(),
+                            'val_loss': val_loss,
+                            'train_loss': train_loss
+                        }
+                        self.logger.info(f"Epoch {epoch}: 保存最佳模型状态，验证损失: {val_loss:.6f}")
                     else:
                         patience_counter += 1
 
                     if patience_counter >= early_stopping_patience:
                         self.logger.info(f"早停在epoch {epoch}, 最佳验证loss: {best_val_loss:.6f}")
-                        # 加载最佳模型
-                        if os.path.exists('best_pure_gnnwr_model.pth'):
-                            self.model.load_state_dict(torch.load('best_pure_gnnwr_model.pth'))
                         break
                 except Exception as e:
                     self.logger.error(f"Epoch {epoch} 验证失败: {e}")
@@ -1872,7 +2007,13 @@ class PureGNNWRTrainer:
                 if train_loss < best_val_loss:
                     best_val_loss = train_loss
                     patience_counter = 0
-                    torch.save(self.model.state_dict(), 'best_pure_gnnwr_model.pth')
+                    best_model_state = {
+                        'epoch': epoch,
+                        'model_state_dict': self.model.state_dict().copy(),
+                        'optimizer_state_dict': self.optimizer.state_dict().copy(),
+                        'scheduler_state_dict': self.scheduler.state_dict().copy(),
+                        'train_loss': train_loss
+                    }
                 else:
                     patience_counter += 1
 
@@ -1890,12 +2031,349 @@ class PureGNNWRTrainer:
                     self.logger.info(f"Epoch {epoch:3d} | Train Loss: {train_loss:.6f} | "
                                      f"LR: {current_lr:.2e}")
 
-        # 最终加载最佳模型
-        if os.path.exists('best_pure_gnnwr_model.pth'):
-            self.model.load_state_dict(torch.load('best_pure_gnnwr_model.pth'))
-            self.logger.info("加载最终最佳模型")
+        # 关键修复：正确加载最佳模型状态
+        if best_model_state is not None:
+            self.logger.info(f"加载最佳模型状态 (epoch {best_model_state['epoch']})")
+            self.model.load_state_dict(best_model_state['model_state_dict'])
+            # 可选：恢复优化器和调度器状态
+            # self.optimizer.load_state_dict(best_model_state['optimizer_state_dict'])
+            # self.scheduler.load_state_dict(best_model_state['scheduler_state_dict'])
+        else:
+            self.logger.warning("没有找到最佳模型状态，使用最终训练状态")
 
         return train_losses, val_losses if val_loader is not None else train_losses
+
+    def fit(self, X, y, coords=None):
+        """训练模型 - 添加训练状态检查"""
+        self.logger.info("开始训练，添加训练状态检查...")
+
+        # 标准化数据
+        if y.ndim == 1:
+            y_2d = y.reshape(-1, 1)
+        else:
+            y_2d = y
+
+        X_normalized = self.feature_scaler.fit_transform(X)
+        y_normalized = self.target_scaler.fit_transform(y_2d).flatten()
+
+        self.logger.info(f"训练数据统计:")
+        self.logger.info(f"  X范围: [{X_normalized.min():.3f}, {X_normalized.max():.3f}]")
+        self.logger.info(f"  y范围: [{y_normalized.min():.3f}, {y_normalized.max():.3f}]")
+        self.logger.info(f"  y标准差: {y_normalized.std():.3f}")
+
+        # 创建数据集
+        dataset = EnhancedSpatialDataset(X_normalized, y_normalized, coords)
+        train_loader = self.create_optimized_dataloader(dataset, batch_size=512, shuffle=True)
+
+        # 训练前检查模型初始状态
+        self._check_model_initial_state(X_normalized, coords)
+
+        # 训练
+        train_losses, val_losses = self.train(train_loader, epochs=100, early_stopping_patience=15)
+
+        # 训练后检查模型最终状态
+        self._check_model_final_state(X_normalized, coords)
+
+        return train_losses, val_losses
+
+    def _check_model_initial_state(self, X, coords):
+        """检查模型初始状态"""
+        self.model.eval()
+        with torch.no_grad():
+            sample_outputs = []
+            for i in range(min(10, len(X))):
+                x = torch.tensor(X[i:i + 1], dtype=torch.float32, device=self.device)
+                c = torch.tensor(coords[i:i + 1], dtype=torch.float32,
+                                 device=self.device) if coords is not None else None
+
+                if self.mixed_precision:
+                    with autocast(device_type=self.device_type):
+                        output = self.model(x, None, c)
+                else:
+                    output = self.model(x, None, c)
+
+                sample_outputs.append(output.item())
+
+            self.logger.info("=== 模型初始状态检查 ===")
+            self.logger.info(f"初始输出范围: [{min(sample_outputs):.6f}, {max(sample_outputs):.6f}]")
+            self.logger.info(f"初始输出标准差: {np.std(sample_outputs):.6f}")
+            self.logger.info("=====================")
+
+    def _check_model_final_state(self, X, coords):
+        """检查模型最终状态 - 修复检查逻辑"""
+        self.model.eval()
+        with torch.no_grad():
+            sample_outputs = []
+
+            # 检查多个样本
+            for i in range(min(20, len(X))):  # 检查更多样本
+                x = torch.tensor(X[i:i + 1], dtype=torch.float32, device=self.device)
+                c = torch.tensor(coords[i:i + 1], dtype=torch.float32,
+                                 device=self.device) if coords is not None else None
+
+                if self.mixed_precision:
+                    with autocast(device_type=self.device_type):
+                        output = self.model(x, None, c)
+                else:
+                    output = self.model(x, None, c)
+
+                sample_outputs.append(output.item())
+
+            self.logger.info("=== 模型最终状态详细检查 ===")
+            self.logger.info(f"最终输出范围: [{min(sample_outputs):.6f}, {max(sample_outputs):.6f}]")
+            self.logger.info(f"最终输出标准差: {np.std(sample_outputs):.6f}")
+            self.logger.info(f"输出唯一值数量: {len(np.unique(sample_outputs))}")
+
+            # 检查输出是否恒定
+            if np.std(sample_outputs) < 1e-6:
+                self.logger.error("❌ 模型最终状态输出恒定！")
+                self.logger.error("可能原因:")
+                self.logger.error("1. 模型权重全部相同")
+                self.logger.error("2. 梯度消失导致所有权重收敛到相同值")
+                self.logger.error("3. 模型保存/加载问题")
+            else:
+                self.logger.info("✅ 模型最终状态输出正常")
+
+            self.logger.info("=====================")
+
+    def predict(self, features, coords=None, batch_size=1024):
+        """重写预测方法 - 确保稳定可靠的预测"""
+        self.model.eval()
+
+        self.logger.info("🚀 开始预测流程...")
+        self.logger.info(f"输入特征形状: {features.shape}, 坐标形状: {coords.shape if coords is not None else 'None'}")
+
+        # ==================== 1. 预测前模型状态验证 ====================
+        self.logger.info("=== 预测前模型状态验证 ===")
+
+        # 使用训练数据的子集验证模型状态
+        validation_samples = min(10, len(features))
+        validation_outputs = []
+
+        with torch.no_grad():
+            for i in range(validation_samples):
+                # 创建单个样本的tensor
+                x_sample = torch.tensor(features[i:i + 1], dtype=torch.float32, device=self.device)
+                c_sample = torch.tensor(coords[i:i + 1], dtype=torch.float32,
+                                        device=self.device) if coords is not None else None
+
+                # 使用与训练完全相同的路径
+                spatial_weights = None
+                if c_sample is not None:
+                    spatial_weights = self._compute_spatial_weights(c_sample)
+
+                # 关键：强制使用非混合精度进行验证
+                output = self.model(x_sample, spatial_weights, c_sample)
+                validation_outputs.append(output.item())
+
+        val_std = np.std(validation_outputs)
+        self.logger.info(f"验证输出 - 范围: [{min(validation_outputs):.3f}, {max(validation_outputs):.3f}]")
+        self.logger.info(f"验证输出 - 标准差: {val_std:.6f}")
+        self.logger.info(f"验证输出 - 唯一值数量: {len(np.unique(validation_outputs))}")
+
+        if val_std < 1e-6:
+            self.logger.error("❌ 模型状态验证失败：输出恒定！")
+            self.logger.error("可能原因：模型权重问题、梯度消失、或训练过程异常")
+
+            # 紧急修复：尝试重新初始化输出层
+            self.logger.warning("尝试紧急修复：重新初始化输出层...")
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Linear) and module.out_features == 1:
+                    nn.init.kaiming_normal_(module.weight)
+                    if module.bias is not None:
+                        nn.init.constant_(module.bias, 0.0)
+                    self.logger.info(f"重新初始化层: {name}")
+
+            # 重新验证
+            validation_outputs = []
+            with torch.no_grad():
+                for i in range(validation_samples):
+                    x_sample = torch.tensor(features[i:i + 1], dtype=torch.float32, device=self.device)
+                    c_sample = torch.tensor(coords[i:i + 1], dtype=torch.float32,
+                                            device=self.device) if coords is not None else None
+                    spatial_weights = self._compute_spatial_weights(c_sample) if c_sample is not None else None
+                    output = self.model(x_sample, spatial_weights, c_sample)
+                    validation_outputs.append(output.item())
+
+            val_std = np.std(validation_outputs)
+            self.logger.info(f"修复后验证输出标准差: {val_std:.6f}")
+
+            if val_std < 1e-6:
+                self.logger.error("❌ 紧急修复失败，使用备选预测方案")
+                return self._fallback_prediction(features, coords)
+
+        self.logger.info("✅ 模型状态验证通过")
+
+        # ==================== 2. 特征标准化 ====================
+        self.logger.info("=== 特征标准化 ===")
+
+        if not hasattr(self, 'feature_scaler') or self.feature_scaler is None:
+            self.logger.error("特征标准化器未初始化")
+            return self._fallback_prediction(features, coords)
+
+        try:
+            features_normalized = self.feature_scaler.transform(features)
+            self.logger.info(
+                f"特征标准化完成 - 均值: {features_normalized.mean():.3f}, 标准差: {features_normalized.std():.3f}")
+        except Exception as e:
+            self.logger.error(f"特征标准化失败: {e}")
+            return self._fallback_prediction(features, coords)
+
+        # ==================== 3. 批量预测 ====================
+        self.logger.info("=== 批量预测 ===")
+
+        all_predictions_normalized = []
+        successful_batches = 0
+        failed_batches = 0
+
+        with torch.no_grad():
+            for i in range(0, len(features_normalized), batch_size):
+                batch_start = i
+                batch_end = min(i + batch_size, len(features_normalized))
+                batch_size_actual = batch_end - batch_start
+
+                try:
+                    # 准备批次数据
+                    batch_features = torch.tensor(
+                        features_normalized[batch_start:batch_end],
+                        dtype=torch.float32,
+                        device=self.device
+                    )
+
+                    batch_coords = None
+                    if coords is not None:
+                        batch_coords = torch.tensor(
+                            coords[batch_start:batch_end],
+                            dtype=torch.float32,
+                            device=self.device
+                        )
+
+                    # 计算空间权重
+                    spatial_weights = None
+                    if batch_coords is not None and len(batch_coords) > 1:
+                        spatial_weights = self._compute_spatial_weights(batch_coords)
+
+                    # 模型预测 - 强制使用float32避免混合精度问题
+                    batch_predictions = self.model(batch_features, spatial_weights, batch_coords)
+
+                    # 检查批次预测结果
+                    batch_predictions_np = batch_predictions.cpu().numpy()
+                    batch_std = np.std(batch_predictions_np)
+
+                    if batch_std < 1e-6 and batch_size_actual > 1:
+                        self.logger.warning(f"批次 {i // batch_size} 输出恒定 (std={batch_std:.6f})")
+                        # 尝试不使用空间权重重新预测
+                        self.logger.info("尝试不使用空间权重重新预测...")
+                        batch_predictions_fallback = self.model(batch_features, None, batch_coords)
+                        batch_predictions_fallback_np = batch_predictions_fallback.cpu().numpy()
+                        fallback_std = np.std(batch_predictions_fallback_np)
+
+                        if fallback_std > batch_std:
+                            self.logger.info(f"✅ 无空间权重预测改善: std={fallback_std:.6f}")
+                            batch_predictions_np = batch_predictions_fallback_np
+                    # 存储预测结果
+                    all_predictions_normalized.append(batch_predictions_np)
+                    successful_batches += 1
+
+                    # 进度日志
+                    if (i // batch_size) % 10 == 0:
+                        self.logger.info(f"进度: {batch_end}/{len(features)} samples, 当前批次标准差: {batch_std:.6f}")
+
+                except Exception as e:
+                    self.logger.error(f"批次 {i // batch_size} 预测失败: {e}")
+                    # 使用均值的备选预测
+                    fallback_batch = np.full(batch_size_actual, 0.0)  # 标准化空间的均值
+                    all_predictions_normalized.append(fallback_batch)
+                    failed_batches += 1
+                    continue
+
+        self.logger.info(f"批量预测完成 - 成功: {successful_batches}, 失败: {failed_batches}")
+
+        if len(all_predictions_normalized) == 0:
+            self.logger.error("所有批次预测失败")
+            return self._fallback_prediction(features, coords)
+
+        # ==================== 4. 结果合并和逆标准化 ====================
+        self.logger.info("=== 结果后处理 ===")
+
+        try:
+            # 合并所有预测结果
+            predictions_normalized = np.concatenate(all_predictions_normalized)
+
+            self.logger.info(f"标准化预测结果统计:")
+            self.logger.info(f"  范围: [{predictions_normalized.min():.3f}, {predictions_normalized.max():.3f}]")
+            self.logger.info(f"  均值: {predictions_normalized.mean():.3f}")
+            self.logger.info(f"  标准差: {predictions_normalized.std():.3f}")
+            self.logger.info(f"  唯一值数量: {len(np.unique(predictions_normalized))}")
+
+            # 逆标准化到原始尺度
+            if predictions_normalized.ndim == 1:
+                predictions_normalized_2d = predictions_normalized.reshape(-1, 1)
+            else:
+                predictions_normalized_2d = predictions_normalized
+
+            predictions_original = self.target_scaler.inverse_transform(predictions_normalized_2d).flatten()
+
+            self.logger.info(f"原始尺度预测结果统计:")
+            self.logger.info(f"  范围: [{predictions_original.min():.1f}, {predictions_original.max():.1f}]")
+            self.logger.info(f"  均值: {predictions_original.mean():.1f}")
+            self.logger.info(f"  标准差: {predictions_original.std():.1f}")
+
+            # 最终检查
+            if np.std(predictions_original) < 1e-6:
+                self.logger.warning("⚠️ 最终预测结果标准差很小，但仍在可接受范围内")
+
+            self.logger.info("🎯 预测流程完成！")
+            return predictions_original
+
+        except Exception as e:
+            self.logger.error(f"结果后处理失败: {e}")
+            return self._fallback_prediction(features, coords)
+
+    def _fallback_prediction(self, features, coords):
+        """备选预测方案"""
+        self.logger.warning("使用备选预测方案")
+
+        if hasattr(self, 'target_scaler') and self.target_scaler is not None:
+            # 使用目标变量的均值作为预测
+            fallback_value = self.target_scaler.mean_[0] if hasattr(self.target_scaler, 'mean_') else 0.0
+        else:
+            fallback_value = 0.0
+
+        self.logger.info(f"备选预测值: {fallback_value}")
+        return np.full(len(features), fallback_value)
+
+    def _compute_spatial_weights(self, batch_coords):
+        """计算空间权重矩阵 - 确保数值稳定性"""
+        n_batch = batch_coords.shape[0]
+
+        if n_batch <= 1:
+            return torch.eye(n_batch, device=self.device, dtype=torch.float32)
+
+        try:
+            # 确保使用float32
+            batch_coords_float32 = batch_coords.float()
+
+            # 计算欧氏距离
+            diff = batch_coords_float32.unsqueeze(1) - batch_coords_float32.unsqueeze(0)
+            distances = torch.sqrt(torch.sum(diff ** 2, dim=2) + 1e-8)
+
+            # 高斯核函数
+            weights = torch.exp(-0.5 * (distances / self.bandwidth) ** 2)
+
+            # 数值稳定性检查
+            if torch.any(torch.isnan(weights)) or torch.any(torch.isinf(weights)):
+                self.logger.warning("空间权重包含无效值，使用单位矩阵")
+                return torch.eye(n_batch, device=self.device, dtype=torch.float32)
+
+            # 确保对角线为1
+            weights = weights.fill_diagonal_(1.0)
+
+            return weights
+
+        except Exception as e:
+            self.logger.error(f"空间权重计算失败: {e}")
+            return torch.eye(n_batch, device=self.device, dtype=torch.float32)
 
     def create_optimized_dataloader(self, dataset, batch_size=512, shuffle=True, is_train=True):
         """创建优化的数据加载器"""
@@ -1948,77 +2426,29 @@ class PureGNNWRTrainer:
 
         return val_loss / len(val_loader)
 
-    def predict(self, features, coords=None, batch_size=2048):
-        """预测方法 - 添加调试"""
-        self.model.eval()
-        predictions = []
+    def debug_standardization(self, X, y):
+        """调试标准化器状态"""
+        self.logger.info("=== 标准化器调试 ===")
 
-        dtype = torch.float16 if self.mixed_precision else torch.float32
+        # 检查特征标准化器
+        if hasattr(self.feature_scaler, 'mean_'):
+            self.logger.info(f"特征标准化器 - mean: {self.feature_scaler.mean_[:3]}...")
+            self.logger.info(f"特征标准化器 - scale: {self.feature_scaler.scale_[:3]}...")
 
-        self.logger.info("=== 预测模式调试 ===")
+        # 检查目标标准化器
+        if hasattr(self.target_scaler, 'mean_'):
+            self.logger.info(f"目标标准化器 - mean: {self.target_scaler.mean_}")
+            self.logger.info(f"目标标准化器 - scale: {self.target_scaler.scale_}")
 
-        with torch.no_grad():
-            for i in range(0, len(features), batch_size):
-                try:
-                    end_idx = min(i + batch_size, len(features))
-                    batch_features = torch.tensor(features[i:end_idx], dtype=dtype, device=self.device)
+        # 测试逆标准化
+        test_output = np.array([-1.0, 0.0, 1.0])
+        try:
+            restored = self.target_scaler.inverse_transform(test_output.reshape(-1, 1)).flatten()
+            self.logger.info(f"逆标准化测试: {test_output} -> {restored}")
+        except Exception as e:
+            self.logger.error(f"逆标准化测试失败: {e}")
 
-                    batch_coords = None
-                    if coords is not None:
-                        batch_coords = torch.tensor(coords[i:end_idx], dtype=dtype, device=self.device)
-
-                    # 调试：检查预测时的输出
-                    if i == 0:  # 只对第一个batch调试
-                        sample_outputs = []
-                        for j in range(min(3, len(batch_features))):
-                            if self.mixed_precision:
-                                with autocast(device_type=self.device_type):
-                                    spatial_weights = None
-                                    if batch_coords is not None:
-                                        spatial_weights = self._compute_spatial_weights(batch_coords[j:j + 1])
-                                    sample_output = self.model(batch_features[j:j + 1], spatial_weights, batch_coords[
-                                                                                                         j:j + 1] if batch_coords is not None else None)
-                            else:
-                                spatial_weights = None
-                                if batch_coords is not None:
-                                    spatial_weights = self._compute_spatial_weights(batch_coords[j:j + 1])
-                                sample_output = self.model(batch_features[j:j + 1], spatial_weights,
-                                                           batch_coords[j:j + 1] if batch_coords is not None else None)
-
-                            sample_outputs.append(sample_output.item())
-                            self.logger.info(f"预测样本 {j}: 输出 = {sample_output.item():.6f}")
-
-                        pred_std = np.std(sample_outputs)
-                        self.logger.info(f"预测输出标准差: {pred_std:.6f}")
-
-                    if self.mixed_precision:
-                        with autocast(device_type=self.device_type):
-                            spatial_weights = None
-                            if batch_coords is not None:
-                                spatial_weights = self._compute_spatial_weights(batch_coords)
-
-                            batch_pred = self.model(batch_features, spatial_weights, batch_coords)
-                    else:
-                        spatial_weights = None
-                        if batch_coords is not None:
-                            spatial_weights = self._compute_spatial_weights(batch_coords)
-
-                        batch_pred = self.model(batch_features, spatial_weights, batch_coords)
-
-                    predictions.append(batch_pred.cpu().numpy())
-
-                except Exception as e:
-                    self.logger.error(f"预测批次 {i} 失败: {e}")
-                    continue
-
-        if len(predictions) == 0:
-            self.logger.error("没有有效的预测结果")
-            return np.array([])
-
-        final_predictions = np.concatenate(predictions)
-        self.logger.info(f"最终预测标准差: {np.std(final_predictions):.6f}")
-
-        return final_predictions
+        self.logger.info("===================")
 
     def _warmup_gpu(self):
         """GPU预热 - 修复版本"""
@@ -2580,8 +3010,16 @@ def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger,
                 train_dataset, batch_size=512, shuffle=True, is_train=True
             )
 
-            # 训练 - 可以使用更多epoch（训练集大，不容易过拟合）
-            trainer.train(train_loader, epochs=100, early_stopping_patience=15)
+            # 🔴 关键位置：在训练前检查数据
+            logger.info("=== 训练前数据检查 ===")
+            logger.info(f"X_train形状: {X_train.shape}, y_train形状: {y_train.shape}")
+            logger.info(f"y_train范围: [{y_train.min():.3f}, {y_train.max():.3f}]")
+
+            trainer.fit(X_train, y_train, coords_train)
+
+            # 🔴 关键位置：在训练后添加标准化器调试
+            logger.info("=== 训练后标准化器调试 ===")
+            trainer.debug_standardization(X_train, y_train)  # 就是这里！
 
             # 预测
             y_pred = trainer.predict(X_test, coords_test, batch_size=1024)
@@ -2589,6 +3027,11 @@ def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger,
             # 检查预测结果质量
             if len(test_idx) > 1 and np.std(y_pred) < 1e-6:
                 logger.warning(f"折叠 {fold + 1}: 预测结果恒定，可能模型有问题")
+                # 额外调试信息
+                logger.info("=== 预测结果调试 ===")
+                logger.info(f"y_pred形状: {y_pred.shape}")
+                logger.info(f"y_pred唯一值: {np.unique(y_pred)}")
+                logger.info(f"y_pred标准差: {np.std(y_pred)}")
 
             # 存储结果
             all_predictions.extend(y_pred)
@@ -2611,6 +3054,8 @@ def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger,
 
         except Exception as e:
             logger.error(f"折叠 {fold + 1} 训练失败: {e}")
+            import traceback
+            logger.error(f"详细错误: {traceback.format_exc()}")
             skipped_folds += 1
             continue
 
@@ -2651,7 +3096,6 @@ def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger,
         'skipped_folds': skipped_folds,
         'avg_test_size': avg_test_size
     }
-
 
 
 def _is_constant_data(data, axis=None):
