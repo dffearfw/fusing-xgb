@@ -2343,6 +2343,19 @@ class PureGNNWRTrainer:
         self.logger.info(f"备选预测值: {fallback_value}")
         return np.full(len(features), fallback_value)
 
+    def debug_output_range(self, batch_features, batch_targets):
+        """调试输出范围问题"""
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(batch_features, None, None)
+
+            self.logger.info("=== 输出范围诊断 ===")
+            self.logger.info(f"输入特征范围: [{batch_features.min():.3f}, {batch_features.max():.3f}]")
+            self.logger.info(f"目标值范围: [{batch_targets.min():.3f}, {batch_targets.max():.3f}]")
+            self.logger.info(f"模型输出范围: [{outputs.min():.3f}, {outputs.max():.3f}]")
+            self.logger.info(f"输出/目标比例: {outputs.std() / batch_targets.std():.3f}")
+            self.logger.info("===================")
+
     def _compute_spatial_weights(self, batch_coords):
         """计算空间权重矩阵 - 确保数值稳定性"""
         n_batch = batch_coords.shape[0]
