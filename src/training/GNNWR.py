@@ -641,7 +641,15 @@ def optimized_example_usage():
     )
 
     # 显示训练信息
-    training_info = trainer.get_training_info()
+    if hasattr(trainer, 'get_training_info'):
+        training_info = trainer.get_training_info()
+    else:
+        # 提供默认值或使用其他方法获取信息
+        training_info = {
+            'status': 'training_in_progress',
+            'message': 'Training info not available'
+        }
+
     print("=== 训练配置信息 ===")
     for key, value in training_info.items():
         print(f"{key}: {value}")

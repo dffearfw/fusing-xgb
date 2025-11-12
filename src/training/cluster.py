@@ -1,4 +1,5 @@
 import logging
+import unittest
 import warnings
 
 import torch.nn as nn
@@ -1698,6 +1699,30 @@ class PureGNNWRTrainer:
 
         self.gradient_clip = gradient_clip
 
+    def get_training_info(self):
+        """获取训练信息"""
+        return {
+            'model_state': self.model.state_dict() if hasattr(self, 'model') else None,
+            'training_loss': getattr(self, 'training_loss', []),
+            'validation_loss': getattr(self, 'validation_loss', []),
+            'epochs_completed': getattr(self, 'epochs_completed', 0),
+            'current_learning_rate': getattr(self, 'current_lr', 0.0)
+        }
+
+    def safe_get_training_info(trainer):
+        """安全地获取训练信息"""
+        try:
+            if hasattr(trainer, 'get_training_info'):
+                return trainer.get_training_info()
+            else:
+                # 尝试从trainer的其他属性中提取信息
+                info = {}
+                for attr in ['model', 'training_loss', 'validation_loss', 'epoch']:
+                    if hasattr(trainer, attr):
+                        info[attr] = getattr(trainer, attr)
+                return info
+        except Exception as e:
+            return {'error': f'Failed to get training info: {str(e)}'}
 
     def _initialize_model(self):
         """确保模型正确初始化 - 修复apply调用"""
@@ -2516,15 +2541,7 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         if device == 'auto' and torch.cuda.is_available():
             logger.info(f"使用GPU: {torch.cuda.get_device_name()}")
         logger.info(f"混合精度: {mixed_precision}, CPU线程: {cpu_workers}")
-        # 1. 站点交叉验证
-        logger.info("\n" + "=" * 50)
-        logger.info("步骤 1: 站点交叉验证")
-        logger.info("=" * 50)
 
-        station_cv_results = pure_gnnwr_cross_validate_fixed(
-            X, y, station_groups, coords, 'station', logger,
-            device=device, mixed_precision=mixed_precision, cpu_workers=cpu_workers
-        )
 
         # 2. 年度交叉验证
         logger.info("\n" + "=" * 50)
@@ -2535,6 +2552,18 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
             X, y, year_groups, coords, 'yearly', logger,
             device=device, mixed_precision=mixed_precision, cpu_workers=cpu_workers
         )
+
+        # 1. 站点交叉验证
+        logger.info("\n" + "=" * 50)
+        logger.info("步骤 1: 站点交叉验证")
+        logger.info("=" * 50)
+
+        station_cv_results = pure_gnnwr_cross_validate_fixed(
+            X, y, station_groups, coords, 'station', logger,
+            device=device, mixed_precision=mixed_precision, cpu_workers=cpu_workers
+        )
+
+
 
         # 3. 标准训练测试集分割
         logger.info("\n" + "=" * 50)
@@ -3237,6 +3266,7 @@ if __name__ == "__main__":
     )
 
     print("测试聚类集成模型...")
+
 
     # 直接运行纯净版对比（需要先有数据文件）
     try:
