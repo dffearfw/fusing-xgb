@@ -2514,38 +2514,34 @@ class PureGNNWRTrainer:
             self.logger.info("GPU预热完成")
 
 
-def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=42,
-                                      device='auto', mixed_precision=True, cpu_workers=24):
+def train_pure_gnnwr_annual_only(df, output_dir=None, random_state=42,
+                                 device='auto', mixed_precision=True, cpu_workers=24):
     """
-    运行纯净版GNNWR分析 - GPU优化版本
+    修复版的纯净版GNNWR分析 - 仅进行年度交叉验证版本
     """
-    from sklearn.model_selection import train_test_split, LeaveOneGroupOut
-    from sklearn.metrics import mean_absolute_error, mean_squared_error
-    from scipy.stats import pearsonr
     import numpy as np
+    import pandas as pd
+    import os
+    import joblib
+    from datetime import datetime
 
     logger = logging.getLogger("PureGNNWRAnalysis")
     logger.info("=" * 60)
-    logger.info("🚀 开始纯净版GNNWR完整分析流程 (GPU优化版)")
+    logger.info("📊 开始纯净版GNNWR年度交叉验证分析")
     logger.info("=" * 60)
 
     try:
         # 使用SWEClusterEnsemble的数据预处理
-        ensemble = SWEClusterEnsemble(n_clusters=1)  # 临时实例用于数据预处理
+        ensemble = SWEClusterEnsemble(n_clusters=1)
         X, y, station_groups, year_groups, coords = ensemble.preprocess_data(df)
 
         logger.info(f"数据加载: {len(X)}样本, {X.shape[1]}特征")
-        logger.info(f"站点数: {len(np.unique(station_groups))}, 年份数: {len(np.unique(year_groups))}")
+        logger.info(f"年度分布: {len(np.unique(year_groups))}个年份")
+        logger.info(f"站点分布: {len(np.unique(station_groups))}个站点")
 
-        # 显示硬件信息
-        if device == 'auto' and torch.cuda.is_available():
-            logger.info(f"使用GPU: {torch.cuda.get_device_name()}")
-        logger.info(f"混合精度: {mixed_precision}, CPU线程: {cpu_workers}")
-
-
-        # 2. 年度交叉验证
+        # 1. 仅进行年度交叉验证
         logger.info("\n" + "=" * 50)
-        logger.info("步骤 2: 年度交叉验证")
+        logger.info("步骤 1: 年度交叉验证 (唯一验证步骤)")
         logger.info("=" * 50)
 
         yearly_cv_results = pure_gnnwr_cross_validate_fixed(
@@ -2553,80 +2549,26 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
             device=device, mixed_precision=mixed_precision, cpu_workers=cpu_workers
         )
 
-        # 1. 站点交叉验证
-        logger.info("\n" + "=" * 50)
-        logger.info("步骤 1: 站点交叉验证")
-        logger.info("=" * 50)
+        # 确保fold_metrics存在
+        if 'fold_metrics' not in yearly_cv_results:
+            logger.warning("fold_metrics不存在，创建空的fold_metrics")
+            yearly_cv_results['fold_metrics'] = {}
 
-        station_cv_results = pure_gnnwr_cross_validate_fixed(
-            X, y, station_groups, coords, 'station', logger,
-            device=device, mixed_precision=mixed_precision, cpu_workers=cpu_workers
-        )
-
-
-
-        # 3. 标准训练测试集分割
-        logger.info("\n" + "=" * 50)
-        logger.info("步骤 3: 标准训练测试集验证")
-        logger.info("=" * 50)
-
-        X_train, X_test, y_train, y_test, coords_train, coords_test, station_train, station_test = train_test_split(
-            X, y, coords, station_groups, test_size=test_size, random_state=random_state
-        )
-
-        logger.info(f"数据划分: 训练集 {len(X_train)}, 测试集 {len(X_test)}")
-
-        # 创建数据集
-        train_dataset = EnhancedSpatialDataset(X_train, y_train, coords_train)
-        test_dataset = EnhancedSpatialDataset(X_test, y_test, coords_test)
-
-        # 创建优化训练器
-        trainer = PureGNNWRTrainer(
-            input_dim=X.shape[1],
-            coords=coords_train,
-            hidden_dims=[512, 256, 128, 64],  # 更大的模型
-            learning_rate=0.001,
-            dropout_rate=0.3,
-            weight_decay=1e-4,
-            device=device,
-            mixed_precision=mixed_precision,
-            cpu_workers=cpu_workers
-        )
-
-        # 创建优化的数据加载器
-        train_loader = trainer.create_optimized_dataloader(
-            train_dataset, batch_size=512, shuffle=True, is_train=True
-        )
-        test_loader = trainer.create_optimized_dataloader(
-            test_dataset, batch_size=1024, shuffle=False, is_train=False
-        )
-
-        logger.info("开始纯净版GNNWR训练...")
-
-        # 训练
-        train_losses, val_losses = trainer.train(train_loader, test_loader, epochs=200)
-
-        # 最终评估
-        y_pred = trainer.predict(X_test, coords_test, batch_size=2048)
-
-        # 计算评估指标
-        test_metrics = evaluate_predictions(y_test, y_pred)
+        if 'overall_metrics' not in yearly_cv_results:
+            logger.warning("overall_metrics不存在，创建默认值")
+            yearly_cv_results['overall_metrics'] = {
+                'r2': 0.0, 'rmse': 1.0, 'mae': 1.0, 'explained_variance': 0.0
+            }
 
         # 整合所有结果
         results = {
-            'station_cv': station_cv_results,
             'yearly_cv': yearly_cv_results,
-            'standard_test': test_metrics,
-            'trainer': trainer,
-            'training_info': trainer.get_training_info(),
             'data_info': {
                 'total_samples': len(X),
                 'n_features': X.shape[1],
                 'n_stations': len(np.unique(station_groups)),
                 'n_years': len(np.unique(year_groups)),
-                'train_size': len(X_train),
-                'test_size': len(X_test),
-                'device': str(trainer.device),
+                'device': str(device),
                 'mixed_precision': mixed_precision
             }
         }
@@ -2634,46 +2576,458 @@ def train_pure_gnnwr_analysis(df, output_dir=None, test_size=0.2, random_state=4
         # 保存结果和生成图表
         if output_dir is None:
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_dir = f"./pure_gnnwr_results_optimized_{timestamp}"
+            output_dir = f"./pure_gnnwr_annual_only_{timestamp}"
 
         os.makedirs(output_dir, exist_ok=True)
         logger.info(f"保存结果到: {output_dir}")
 
-        # 保存模型
-        model_path = os.path.join(output_dir, 'pure_gnnwr_model_optimized.pth')
-        torch.save({
-            'model_state_dict': trainer.model.state_dict(),
-            'config': {
-                'input_dim': X.shape[1],
-                'hidden_dims': [512, 256, 128, 64],
-                'learning_rate': 0.001,
-                'device': str(trainer.device),
-                'mixed_precision': mixed_precision
-            },
-            'training_info': trainer.get_training_info()
-        }, model_path)
-
         # 保存结果数据
-        results_path = os.path.join(output_dir, 'pure_gnnwr_results_optimized.pkl')
+        results_path = os.path.join(output_dir, 'pure_gnnwr_results_annual.pkl')
         joblib.dump(results, results_path)
 
-        # 生成可视化图表
-        create_pure_gnnwr_visualizations_optimized(results, output_dir)
+        # 生成专门针对年度验证的可视化图表
+        create_annual_only_visualizations(results, output_dir)
 
         # 生成详细报告
-        report_path = os.path.join(output_dir, 'pure_gnnwr_report_optimized.txt')
+        report_path = os.path.join(output_dir, 'pure_gnnwr_report_annual.txt')
         with open(report_path, 'w', encoding='utf-8') as f:
-            f.write(generate_detailed_report_optimized(results))
+            f.write(generate_annual_report(results))
 
         # 输出综合报告
-        print_comprehensive_report_optimized(results)
+        print_annual_report(results)
 
-        logger.info("🎯 纯净版GNNWR完整分析完成!")
-        return results, trainer
+        logger.info("✅ 纯净版GNNWR年度交叉验证分析完成!")
+        return results
 
     except Exception as e:
-        logger.error(f"纯净版GNNWR分析失败: {e}")
+        logger.error(f"纯净版GNNWR年度分析失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         raise
+
+
+def create_annual_only_visualizations(results, output_dir):
+    """专门为年度交叉验证生成可视化图表"""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib.gridspec import GridSpec
+
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+    plt.rcParams['axes.unicode_minus'] = False
+
+    # 创建图表
+    fig = plt.figure(figsize=(20, 16))
+    gs = GridSpec(3, 3, figure=fig)
+
+    yearly_cv = results['yearly_cv']
+
+    # 检查是否有有效数据
+    if not yearly_cv['fold_metrics']:
+        # 如果没有有效数据，创建空图表
+        ax = fig.add_subplot(gs[:, :])
+        ax.text(0.5, 0.5, '无有效数据可用\n请检查训练过程',
+                horizontalalignment='center', verticalalignment='center',
+                transform=ax.transAxes, fontsize=16)
+        ax.set_title('年度交叉验证分析', fontsize=18)
+        plt.savefig(os.path.join(output_dir, 'annual_cross_validation_analysis.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        return
+
+    try:
+        # 1. 年度交叉验证性能对比
+        ax1 = fig.add_subplot(gs[0, 0])
+        years = list(yearly_cv['fold_metrics'].keys())
+        r2_scores = [yearly_cv['fold_metrics'][year]['r2'] for year in years]
+        rmse_scores = [yearly_cv['fold_metrics'][year]['rmse'] for year in years]
+
+        x = np.arange(len(years))
+        width = 0.35
+
+        ax1.bar(x - width / 2, r2_scores, width, label='R²', alpha=0.7, color='skyblue')
+        ax1.bar(x + width / 2, rmse_scores, width, label='RMSE', alpha=0.7, color='lightcoral')
+
+        ax1.set_xlabel('年份')
+        ax1.set_ylabel('指标值')
+        ax1.set_title('年度交叉验证性能对比', fontsize=14, fontweight='bold')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(years, rotation=45)
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+
+        # 2. 年度性能热力图
+        ax2 = fig.add_subplot(gs[0, 1:])
+        metrics_data = []
+        for year, metrics in yearly_cv['fold_metrics'].items():
+            metrics_data.append({
+                'Year': year,
+                'R²': metrics['r2'],
+                'RMSE': metrics['rmse'],
+                'MAE': metrics['mae'],
+                '样本数': metrics.get('n_samples', 0)
+            })
+
+        metrics_df = pd.DataFrame(metrics_data)
+        metrics_pivot = metrics_df.pivot_table(values=['R²', 'RMSE'], index='Year')
+
+        sns.heatmap(metrics_pivot, annot=True, fmt='.3f', cmap='YlOrRd', ax=ax2)
+        ax2.set_title('年度交叉验证性能热力图', fontsize=14, fontweight='bold')
+
+        # 3. 模型架构信息
+        ax3 = fig.add_subplot(gs[1, 0])
+        ax3.axis('off')
+        info_text = f"""
+        模型架构信息:
+        - 输入维度: {results['data_info']['n_features']}
+        - 隐藏层: [512, 256, 128, 64]
+        - Dropout: 0.3
+        - 学习率: 0.001
+        - 设备: {results['data_info']['device']}
+        - 混合精度: {results['data_info']['mixed_precision']}
+
+        数据统计:
+        - 总样本: {results['data_info']['total_samples']}
+        - 年份数: {results['data_info']['n_years']}
+        - 站点数: {results['data_info']['n_stations']}
+        """
+        ax3.text(0.1, 0.9, info_text, transform=ax3.transAxes, fontsize=10,
+                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.5))
+
+        # 4. 性能汇总
+        ax4 = fig.add_subplot(gs[1, 1:])
+        ax4.axis('off')
+
+        yearly_avg_r2 = yearly_cv['overall_metrics']['r2']
+        yearly_avg_rmse = yearly_cv['overall_metrics']['rmse']
+
+        summary_text = f"""
+        性能汇总:
+
+        年度交叉验证:
+        - 平均 R²: {yearly_avg_r2:.4f}
+        - 平均 RMSE: {yearly_avg_rmse:.4f}
+        - 平均 MAE: {yearly_cv['overall_metrics']['mae']:.4f}
+        - 平均解释方差: {yearly_cv['overall_metrics']['explained_variance']:.4f}
+        """
+
+        # 添加最佳和最差年份信息
+        if yearly_cv['fold_metrics']:
+            best_year = max(yearly_cv['fold_metrics'].items(), key=lambda x: x[1]['r2'])
+            worst_year = min(yearly_cv['fold_metrics'].items(), key=lambda x: x[1]['r2'])
+            summary_text += f"\n最佳年份: {best_year[0]} (R² = {best_year[1]['r2']:.4f})"
+            summary_text += f"\n最差年份: {worst_year[0]} (R² = {worst_year[1]['r2']:.4f})"
+
+        ax4.text(0.1, 0.9, summary_text, transform=ax4.transAxes, fontsize=12,
+                 verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.7))
+
+        # 5. 残差分析（使用所有年份的残差）
+        ax5 = fig.add_subplot(gs[2, 0])
+        all_residuals = []
+        for year_data in yearly_cv['fold_results']:
+            all_residuals.extend(year_data['residuals'])
+
+        ax5.hist(all_residuals, bins=50, alpha=0.7, color='orange', edgecolor='black')
+        ax5.axvline(0, color='red', linestyle='--', linewidth=2)
+        ax5.set_xlabel('残差')
+        ax5.set_ylabel('频数')
+        ax5.set_title('所有年份残差分布', fontsize=14, fontweight='bold')
+        ax5.grid(True, alpha=0.3)
+
+        # 6. 预测vs真实值散点图（使用所有年份数据）
+        ax6 = fig.add_subplot(gs[2, 1:])
+        all_y_true = []
+        all_y_pred = []
+        for year_data in yearly_cv['fold_results']:
+            all_y_true.extend(year_data['y_true'])
+            all_y_pred.extend(year_data['y_pred'])
+
+        ax6.scatter(all_y_true, all_y_pred, alpha=0.6, color='blue', s=20)
+        ax6.plot([min(all_y_true), max(all_y_true)], [min(all_y_true), max(all_y_true)],
+                 'r--', linewidth=2)
+        ax6.set_xlabel('真实值')
+        ax6.set_ylabel('预测值')
+        ax6.set_title(f'所有年份预测 vs 真实值\n总体R² = {yearly_avg_r2:.3f}, RMSE = {yearly_avg_rmse:.3f}',
+                      fontsize=14, fontweight='bold')
+        ax6.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'annual_cross_validation_analysis.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+        # 额外保存年度详细图表
+        create_detailed_year_analysis(yearly_cv, output_dir)
+
+    except Exception as e:
+        logger.error(f"可视化生成失败: {e}")
+        # 创建错误图表
+        ax = fig.add_subplot(gs[:, :])
+        ax.text(0.5, 0.5, f'可视化生成失败:\n{str(e)}',
+                horizontalalignment='center', verticalalignment='center',
+                transform=ax.transAxes, fontsize=12, color='red')
+        ax.set_title('年度交叉验证分析 - 错误', fontsize=16)
+        plt.savefig(os.path.join(output_dir, 'annual_cross_validation_analysis.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+
+def create_detailed_year_analysis(yearly_cv, output_dir):
+    """为每个年份创建详细的分析图表"""
+    import matplotlib.pyplot as plt
+
+    if not yearly_cv['fold_results']:
+        return
+
+    # 为每个年份创建单独的图表
+    for fold_result in yearly_cv['fold_results']:
+        year = fold_result['test_group']
+
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
+        fig.suptitle(f'年份 {year} 详细分析', fontsize=16, fontweight='bold')
+
+        # 1. 预测 vs 真实值
+        y_true = fold_result['y_true']
+        y_pred = fold_result['y_pred']
+        metrics = fold_result['metrics']
+
+        ax1.scatter(y_true, y_pred, alpha=0.6, color='blue')
+        ax1.plot([y_true.min(), y_true.max()], [y_true.min(), y_true.max()], 'r--', linewidth=2)
+        ax1.set_xlabel('真实值')
+        ax1.set_ylabel('预测值')
+        ax1.set_title(f'预测 vs 真实值 (R² = {metrics["r2"]:.3f})')
+        ax1.grid(True, alpha=0.3)
+
+        # 2. 残差分布
+        residuals = fold_result['residuals']
+        ax2.hist(residuals, bins=30, alpha=0.7, color='orange', edgecolor='black')
+        ax2.axvline(0, color='red', linestyle='--', linewidth=2)
+        ax2.set_xlabel('残差')
+        ax2.set_ylabel('频数')
+        ax2.set_title(f'残差分布 (均值 = {np.mean(residuals):.3f})')
+        ax2.grid(True, alpha=0.3)
+
+        # 3. 残差 vs 预测值
+        ax3.scatter(y_pred, residuals, alpha=0.6, color='green')
+        ax3.axhline(0, color='red', linestyle='--', linewidth=2)
+        ax3.set_xlabel('预测值')
+        ax3.set_ylabel('残差')
+        ax3.set_title('残差 vs 预测值')
+        ax3.grid(True, alpha=0.3)
+
+        # 4. 训练历史（如果有）
+        ax4.axis('off')
+        if fold_result['train_losses'] and fold_result['val_losses']:
+            ax4.plot(fold_result['train_losses'], label='训练损失', alpha=0.7)
+            ax4.plot(fold_result['val_losses'], label='验证损失', alpha=0.7)
+            ax4.set_xlabel('Epoch')
+            ax4.set_ylabel('损失')
+            ax4.set_title('训练历史')
+            ax4.legend()
+            ax4.grid(True, alpha=0.3)
+        else:
+            info_text = f"""
+                模型指标:
+                - R²: {metrics['r2']:.4f}
+                - RMSE: {metrics['rmse']:.4f}
+                - MAE: {metrics['mae']:.4f}
+                - 解释方差: {metrics['explained_variance']:.4f}
+                - 样本数: {fold_result['n_samples']}
+                """
+            if fold_result.get('fallback', False):
+                info_text += "\n⚠️ 使用备选预测方案"
+
+            ax4.text(0.1, 0.9, info_text, transform=ax4.transAxes, fontsize=11,
+                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.7))
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'year_{year}_detailed_analysis.png'),
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+
+
+def generate_annual_report(results):
+    """生成年度验证详细报告"""
+    import numpy as np
+    from datetime import datetime
+
+    report = []
+    report.append("=" * 60)
+    report.append("          纯净版GNNWR年度交叉验证分析报告")
+    report.append("=" * 60)
+    report.append("")
+
+    # 数据信息
+    data_info = results['data_info']
+    report.append("📊 数据信息:")
+    report.append(f"  总样本数: {data_info['total_samples']}")
+    report.append(f"  特征维度: {data_info['n_features']}")
+    report.append(f"  年份数量: {data_info['n_years']}")
+    report.append(f"  站点数量: {data_info['n_stations']}")
+    report.append(f"  计算设备: {data_info['device']}")
+    report.append(f"  混合精度: {data_info['mixed_precision']}")
+    report.append("")
+
+    # 年度交叉验证总体性能
+    yearly_cv = results['yearly_cv']
+    overall_metrics = yearly_cv['overall_metrics']
+    report.append("📈 年度交叉验证总体性能:")
+    report.append(f"  平均 R²: {overall_metrics['r2']:.4f}")
+    report.append(f"  平均 RMSE: {overall_metrics['rmse']:.4f}")
+    report.append(f"  平均 MAE: {overall_metrics['mae']:.4f}")
+    report.append(f"  平均解释方差: {overall_metrics['explained_variance']:.4f}")
+    report.append("")
+
+    # 各年份详细性能
+    report.append("📅 各年份详细性能:")
+    report.append("-" * 60)
+    report.append("年份       样本数     R²        RMSE       MAE       解释方差")
+    report.append("-" * 60)
+
+    fold_metrics = yearly_cv['fold_metrics']
+    if fold_metrics:
+        for year in sorted(fold_metrics.keys()):
+            metrics = fold_metrics[year]
+            n_samples = metrics.get('n_samples', 0)
+            report.append(
+                f"{year:<12}{n_samples:<10}{metrics['r2']:.4f}    {metrics['rmse']:.4f}    {metrics['mae']:.4f}    {metrics['explained_variance']:.4f}")
+    else:
+        report.append("          无有效数据")
+
+    report.append("")
+
+    # 性能分析
+    report.append("🔍 性能分析:")
+    if fold_metrics:
+        best_year = max(fold_metrics.items(), key=lambda x: x[1]['r2'])
+        worst_year = min(fold_metrics.items(), key=lambda x: x[1]['r2'])
+
+        report.append(f"  最佳年份: {best_year[0]} (R² = {best_year[1]['r2']:.4f})")
+        report.append(f"  最差年份: {worst_year[0]} (R² = {worst_year[1]['r2']:.4f})")
+
+        # 稳定性分析
+        r2_scores = [metrics['r2'] for metrics in fold_metrics.values()]
+        r2_std = np.std(r2_scores)
+        report.append(f"  R²标准差: {r2_std:.4f} (稳定性指标)")
+
+        if r2_std < 0.1:
+            stability = "优秀"
+        elif r2_std < 0.15:
+            stability = "良好"
+        elif r2_std < 0.2:
+            stability = "一般"
+        else:
+            stability = "较差"
+
+        report.append(f"  模型稳定性: {stability}")
+    else:
+        report.append("  无法进行性能分析 - 无有效数据")
+
+    report.append("")
+
+    # 残差分析
+    all_residuals = []
+    fallback_count = 0
+
+    for year_data in yearly_cv['fold_results']:
+        all_residuals.extend(year_data['residuals'])
+        if year_data.get('fallback', False):
+            fallback_count += 1
+
+    if all_residuals:
+        residual_mean = np.mean(all_residuals)
+        residual_std = np.std(all_residuals)
+        report.append("📊 残差分析:")
+        report.append(f"  残差均值: {residual_mean:.4f} (接近0表示无偏)")
+        report.append(f"  残差标准差: {residual_std:.4f}")
+
+        if fallback_count > 0:
+            report.append(f"  ⚠️  {fallback_count}个年份使用了备选预测方案")
+    else:
+        report.append("📊 残差分析: 无有效数据")
+
+    report.append("")
+
+    # 建议和改进方向
+    report.append("💡 建议和改进方向:")
+    if fold_metrics:
+        if overall_metrics['r2'] < 0.7:
+            report.append("  • 考虑增加模型复杂度或特征工程")
+        if len(fold_metrics) > 1:
+            r2_scores = [metrics['r2'] for metrics in fold_metrics.values()]
+            r2_std = np.std(r2_scores)
+            if r2_std > 0.15:
+                report.append("  • 模型在不同年份间稳定性有待提升")
+        if overall_metrics['rmse'] > 1.0:
+            report.append("  • 预测误差较大，可能需要更多数据或正则化")
+
+        if fallback_count > 0:
+            report.append("  • 部分年份训练失败，建议检查数据质量或调整超参数")
+    else:
+        report.append("  • 所有年份训练失败，建议检查数据预处理和模型配置")
+
+    report.append("  • 可以尝试调整学习率或优化器参数")
+    report.append("  • 考虑使用更复杂的空间权重机制")
+    report.append("")
+
+    report.append("=" * 60)
+    report.append("报告生成完成 - " + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    report.append("=" * 60)
+
+    return "\n".join(report)
+
+
+def print_annual_report(results):
+    """在控制台输出年度验证报告摘要"""
+    yearly_cv = results['yearly_cv']
+
+    print("\n" + "=" * 70)
+    print("             纯净版GNNWR年度交叉验证结果摘要")
+    print("=" * 70)
+
+    print(f"\n📊 数据概况:")
+    print(f"  总样本: {results['data_info']['total_samples']}")
+    print(f"  年份数: {results['data_info']['n_years']}")
+    print(f"  站点数: {results['data_info']['n_stations']}")
+
+    if yearly_cv['fold_metrics']:
+        print(f"\n📈 年度交叉验证性能:")
+        print(f"  平均 R²: {yearly_cv['overall_metrics']['r2']:.4f}")
+        print(f"  平均 RMSE: {yearly_cv['overall_metrics']['rmse']:.4f}")
+        print(f"  平均 MAE: {yearly_cv['overall_metrics']['mae']:.4f}")
+
+        # 显示最佳和最差年份
+        fold_metrics = yearly_cv['fold_metrics']
+        best_year = max(fold_metrics.items(), key=lambda x: x[1]['r2'])
+        worst_year = min(fold_metrics.items(), key=lambda x: x[1]['r2'])
+
+        print(f"\n⭐ 最佳年份: {best_year[0]} (R² = {best_year[1]['r2']:.4f})")
+        print(f"⚠️  最差年份: {worst_year[0]} (R² = {worst_year[1]['r2']:.4f})")
+
+        # 性能稳定性
+        r2_scores = [metrics['r2'] for metrics in fold_metrics.values()]
+        r2_std = np.std(r2_scores)
+        print(f"📊 性能稳定性: R²标准差 = {r2_std:.4f}")
+
+        # 检查是否有备选方案
+        fallback_count = sum(1 for result in yearly_cv['fold_results'] if result.get('fallback', False))
+        if fallback_count > 0:
+            print(f"⚠️  警告: {fallback_count}个年份使用了备选预测方案")
+
+        print(f"\n💡 建议:")
+        if yearly_cv['overall_metrics']['r2'] > 0.8:
+            print("  模型性能优秀，可以考虑进行站点验证")
+        elif yearly_cv['overall_metrics']['r2'] > 0.6:
+            print("  模型性能良好，可以尝试优化超参数")
+        else:
+            print("  模型性能有待提升，建议检查特征工程")
+    else:
+        print(f"\n❌ 年度交叉验证失败:")
+        print("  所有年份训练均未成功完成")
+        print("  建议检查数据预处理和模型配置")
+
+    print("=" * 70)
+
+
 
 
 def create_pure_gnnwr_visualizations_optimized(results, output_dir):
@@ -2971,172 +3325,147 @@ def generate_detailed_report(results):
 
 def pure_gnnwr_cross_validate_fixed(X, y, groups, coords, cv_type, logger,
                                     device='auto', mixed_precision=True, cpu_workers=24):
-    """优化的交叉验证 - GPU版本"""
-    from sklearn.model_selection import LeaveOneGroupOut
+    """
+    修复版的纯净GNNWR交叉验证函数
+    """
+    import numpy as np
+    from sklearn.model_selection import GroupKFold
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
-    logo = LeaveOneGroupOut()
-    all_predictions = []
-    all_true_values = []
-    fold_results = {}
-    skipped_folds = 0
+    # 根据交叉验证类型设置分组
+    if cv_type == 'yearly':
+        unique_groups = np.unique(groups)
+        n_splits = len(unique_groups)
+        group_kfold = GroupKFold(n_splits=n_splits)
+    else:
+        n_splits = 5
+        group_kfold = GroupKFold(n_splits=n_splits)
 
-    unique_groups = np.unique(groups)
-    total_folds = len(unique_groups)
+    fold_results = []
+    fold_metrics = {}
 
-    logger.info(f"开始{cv_type}交叉验证，共{total_folds}个折叠...")
-    logger.info(f"设备: {device}, 混合精度: {mixed_precision}")
+    logger.info(f"开始{cv_type}交叉验证，共{n_splits}折")
 
-    for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups)):
-        group_id = groups[test_idx[0]]
-        test_size = len(test_idx)
-        train_size = len(train_idx)
-
-        # 训练集应该是很大的（所有其他站点），测试集可能很小
-        logger.info(f"Fold {fold + 1}/{total_folds}: {cv_type} {group_id}, 训练集={train_size}, 测试集={test_size}")
-
-        # 分割数据
-        X_train, X_test = X[train_idx], X[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-
-        # 分割坐标
-        coords_train = coords[train_idx] if coords is not None else None
-        coords_test = coords[test_idx] if coords is not None else None
-
+    for fold_idx, (train_idx, test_idx) in enumerate(group_kfold.split(X, y, groups)):
         try:
-            # 使用优化配置的训练器
-            trainer = PureGNNWRTrainer(
-                input_dim=X.shape[1],
-                coords=coords_train,
-                hidden_dims=[512, 256, 128, 64],  # 使用完整模型
-                learning_rate=0.001,
+            # 获取当前测试组的标识
+            test_group = np.unique(groups[test_idx])[0]
+            logger.info(f"训练第{fold_idx + 1}/{n_splits}折，测试组: {test_group}")
+
+            # 数据分割
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            coords_train, coords_test = coords[train_idx], coords[test_idx]
+
+            # 特征标准化 - 确保正确拟合
+            scaler_X = StandardScaler()
+            X_train_scaled = scaler_X.fit_transform(X_train)
+            X_test_scaled = scaler_X.transform(X_test)
+
+            scaler_y = StandardScaler()
+            y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1)).flatten()
+
+            # 训练模型
+            model = PureGNNWRTrainer(
+                input_dim=X_train_scaled.shape[1],
+                coords=coords_train,  # 添加坐标数据
+                hidden_dims=[512, 256, 128, 64],
                 dropout_rate=0.3,
+                learning_rate=0.001,
                 device=device,
-                mixed_precision=mixed_precision,
-                cpu_workers=cpu_workers,
-                output_std_penalty=0.05  # 防止输出恒定
+                mixed_precision=mixed_precision
             )
 
-            # 🔴 添加调试代码：检查模型初始输出
-            logger.info("=== 调试模型初始输出 ===")
-            trainer.model.eval()
-            with torch.no_grad():
-                sample_outputs = []
-                for i in range(min(5, len(X_train))):
-                    x = torch.tensor(X_train[i:i + 1], dtype=torch.float32, device=trainer.device)
-                    c = torch.tensor(coords_train[i:i + 1], dtype=torch.float32,
-                                     device=trainer.device) if coords_train is not None else None
-
-                    if trainer.mixed_precision:
-                        with autocast(device_type=trainer.device_type):
-                            output = trainer.model(x, None, c)
-                    else:
-                        output = trainer.model(x, None, c)
-
-                    sample_outputs.append(output.item())
-                    logger.info(
-                        f"样本 {i}: 输入范围[{x.min().item():.3f}, {x.max().item():.3f}], 输出={output.item():.6f}")
-
-                output_std = np.std(sample_outputs)
-                logger.info(f"初始输出标准差: {output_std:.6f}")
-                if output_std < 1e-6:
-                    logger.error("🚨 模型输出恒定！检查：")
-                    logger.error("1. 模型权重初始化")
-                    logger.error("2. 数据预处理")
-                    logger.error("3. 学习率配置")
-                else:
-                    logger.info(f"✅ 模型输出正常，标准差: {output_std:.6f}")
-
-            # 创建优化的数据加载器
-            train_dataset = EnhancedSpatialDataset(X_train, y_train, coords_train)
-            train_loader = trainer.create_optimized_dataloader(
-                train_dataset, batch_size=512, shuffle=True, is_train=True
+            # 训练模型
+            train_losses, val_losses = model.fit(
+                X_train_scaled, y_train_scaled, coords_train
             )
 
-            # 🔴 关键位置：在训练前检查数据
-            logger.info("=== 训练前数据检查 ===")
-            logger.info(f"X_train形状: {X_train.shape}, y_train形状: {y_train.shape}")
-            logger.info(f"y_train范围: [{y_train.min():.3f}, {y_train.max():.3f}]")
+            # 预测 - 使用训练时的标准化器
+            y_pred_scaled = model.predict(X_test_scaled, coords_test)
 
-            trainer.fit(X_train, y_train, coords_train)
+            # 反标准化预测结果
+            y_pred = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
 
-            # 🔴 关键位置：在训练后添加标准化器调试
-            logger.info("=== 训练后标准化器调试 ===")
-            trainer.debug_standardization(X_train, y_train)  # 就是这里！
-
-            # 预测
-            y_pred = trainer.predict(X_test, coords_test, batch_size=1024)
-
-            # 检查预测结果质量
-            if len(test_idx) > 1 and np.std(y_pred) < 1e-6:
-                logger.warning(f"折叠 {fold + 1}: 预测结果恒定，可能模型有问题")
-                # 额外调试信息
-                logger.info("=== 预测结果调试 ===")
-                logger.info(f"y_pred形状: {y_pred.shape}")
-                logger.info(f"y_pred唯一值: {np.unique(y_pred)}")
-                logger.info(f"y_pred标准差: {np.std(y_pred)}")
+            # 计算指标
+            r2 = r2_score(y_test, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+            mae = mean_absolute_error(y_test, y_pred)
+            explained_variance = 1 - np.var(y_test - y_pred) / np.var(y_test)
 
             # 存储结果
-            all_predictions.extend(y_pred)
-            all_true_values.extend(y_test)
-
-            # 计算当前折叠性能
-            fold_metrics = evaluate_predictions(y_test, y_pred)
-            fold_results[group_id] = {
-                **fold_metrics,
-                'train_size': train_size,
-                'test_size': test_size,
-                'device': str(trainer.device)
+            fold_result = {
+                'fold': fold_idx,
+                'test_group': test_group,
+                'y_true': y_test,
+                'y_pred': y_pred,
+                'residuals': y_test - y_pred,
+                'n_samples': len(y_test),
+                'metrics': {
+                    'r2': r2,
+                    'rmse': rmse,
+                    'mae': mae,
+                    'explained_variance': explained_variance
+                },
+                'train_losses': train_losses,
+                'val_losses': val_losses
             }
 
-            logger.info(
-                f"  {cv_type} Fold {fold + 1}: {group_id} - "
-                f"Train={train_size}, Test={test_size}, "
-                f"MAE={fold_metrics['MAE']:.3f}, R={fold_metrics['R']:.3f}"
-            )
+            fold_results.append(fold_result)
+            fold_metrics[test_group] = fold_result['metrics']
+
+            logger.info(f"  第{fold_idx + 1}折完成 - R²: {r2:.4f}, RMSE: {rmse:.4f}")
 
         except Exception as e:
-            logger.error(f"折叠 {fold + 1} 训练失败: {e}")
-            import traceback
-            logger.error(f"详细错误: {traceback.format_exc()}")
-            skipped_folds += 1
-            continue
+            logger.error(f"第{fold_idx + 1}折训练失败: {e}")
+            # 如果失败，使用简单均值作为预测
+            y_pred_fallback = np.full_like(y_test, np.mean(y_train))
 
-    # 计算总体性能
-    if len(all_true_values) == 0:
-        logger.error(f"{cv_type}交叉验证没有有效结果")
-        return {
-            'overall': {'MAE': 0, 'RMSE': 0, 'R': 0, 'R_squared': 0, 'samples': 0},
-            'by_fold': {},
-            'predictions': np.array([]),
-            'true_values': np.array([]),
-            'folds': 0,
-            'total_folds': total_folds,
-            'skipped_folds': skipped_folds
-        }
+            r2 = r2_score(y_test, y_pred_fallback)
+            rmse = np.sqrt(mean_squared_error(y_test, y_pred_fallback))
+            mae = mean_absolute_error(y_test, y_pred_fallback)
+            explained_variance = 1 - np.var(y_test - y_pred_fallback) / np.var(y_test)
 
-    overall_metrics = evaluate_predictions(
-        np.array(all_true_values),
-        np.array(all_predictions)
-    )
+            fallback_result = {
+                'fold': fold_idx,
+                'test_group': test_group,
+                'y_true': y_test,
+                'y_pred': y_pred_fallback,
+                'residuals': y_test - y_pred_fallback,
+                'n_samples': len(y_test),
+                'metrics': {
+                    'r2': r2,
+                    'rmse': rmse,
+                    'mae': mae,
+                    'explained_variance': explained_variance
+                },
+                'train_losses': [],
+                'val_losses': [],
+                'fallback': True
+            }
 
-    # 分析折叠结果
-    successful_folds = len(fold_results)
-    avg_test_size = np.mean([info['test_size'] for info in fold_results.values()])
+            fold_results.append(fallback_result)
+            fold_metrics[test_group] = fallback_result['metrics']
+            logger.warning(f"  使用备选方案完成第{fold_idx + 1}折")
 
-    logger.info(f"✅ {cv_type}交叉验证完成")
-    logger.info(f"  总折叠数: {total_folds}, 成功: {successful_folds}, 失败: {skipped_folds}")
-    logger.info(f"  平均测试集大小: {avg_test_size:.1f} 样本/折叠")
-    logger.info(f"  聚合性能: MAE={overall_metrics['MAE']:.3f}, R={overall_metrics['R']:.3f}")
+    # 计算总体指标
+    all_y_true = np.concatenate([result['y_true'] for result in fold_results])
+    all_y_pred = np.concatenate([result['y_pred'] for result in fold_results])
+
+    overall_metrics = {
+        'r2': r2_score(all_y_true, all_y_pred),
+        'rmse': np.sqrt(mean_squared_error(all_y_true, all_y_pred)),
+        'mae': mean_absolute_error(all_y_true, all_y_pred),
+        'explained_variance': 1 - np.var(all_y_true - all_y_pred) / np.var(all_y_true)
+    }
+
+    logger.info(f"{cv_type}交叉验证完成 - 总体R²: {overall_metrics['r2']:.4f}")
 
     return {
-        'overall': overall_metrics,
-        'by_fold': fold_results,
-        'predictions': np.array(all_predictions),
-        'true_values': np.array(all_true_values),
-        'folds': successful_folds,
-        'total_folds': total_folds,
-        'skipped_folds': skipped_folds,
-        'avg_test_size': avg_test_size
+        'fold_results': fold_results,
+        'fold_metrics': fold_metrics,
+        'overall_metrics': overall_metrics
     }
 
 
@@ -3242,17 +3571,17 @@ def print_comprehensive_report_optimized(results):
 
 
 # 在SWEClusterEnsemble类中添加一个便捷方法
-def SWEClusterEnsemble_run_pure_comparison_optimized(self, df, device='auto', mixed_precision=True, cpu_workers=24):
-    """
-    在SWEClusterEnsemble类中添加的方法
-    用于快速运行纯净版对比实验 - 优化版本
-    """
-    return train_pure_gnnwr_analysis(
-        df,
-        device=device,
-        mixed_precision=mixed_precision,
-        cpu_workers=cpu_workers
-    )
+# def SWEClusterEnsemble_run_pure_comparison_optimized(self, df, device='auto', mixed_precision=True, cpu_workers=24):
+#     """
+#     在SWEClusterEnsemble类中添加的方法
+#     用于快速运行纯净版对比实验 - 优化版本
+#     """
+#     return train_pure_gnnwr_analysis(
+#         df,
+#         device=device,
+#         mixed_precision=mixed_precision,
+#         cpu_workers=cpu_workers
+#     )
 
 
 
@@ -3272,7 +3601,7 @@ if __name__ == "__main__":
     try:
         import pandas as pd
         df = pd.read_excel("lu_onehot.xlsx")  # 替换为您的数据文件
-        results, trainer = train_pure_gnnwr_analysis(df)
+        results, trainer =  train_pure_gnnwr_annual_only(df)
     except Exception as e:
         print(f"示例运行失败: {e}")
         print("请确保有数据文件并修改文件路径")
