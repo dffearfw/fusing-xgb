@@ -23,7 +23,7 @@ from torch import optim
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from GNNWR import EnhancedGNNWRTrainer
+
 
 
 # 禁用TF32相关警告（CPU上不需要）
@@ -62,58 +62,6 @@ except ImportError as e:
         logger.error("无法导入任何GNNWR版本")
         HAS_ENHANCED_GNNWR = False
 
-
-        # 创建虚拟类以避免后续错误
-        class EnhancedSpatialDataset:
-            def __init__(self, features, targets, coords=None):
-                self.features = features
-                self.targets = targets
-                self.coords = coords
-
-            def __len__(self):
-                return len(self.features)
-
-            def __getitem__(self, idx):
-                if self.coords is not None:
-                    return self.features[idx], self.targets[idx], self.coords[idx]
-                else:
-                    return self.features[idx], self.targets[idx]
-
-
-        class EnhancedGNNWRTrainer:
-            def __init__(self, *args, **kwargs):
-                logger.warning("使用虚拟EnhancedGNNWRTrainer")
-
-            def train(self, *args, **kwargs):
-                logger.warning("虚拟训练方法")
-
-            def predict(self, features, coords=None):
-                logger.warning("虚拟预测方法")
-                return np.random.normal(50, 20, len(features))
-
-
-        class SpatialDataset:
-            def __init__(self, features, targets):
-                self.features = features
-                self.targets = targets
-
-            def __len__(self):
-                return len(self.features)
-
-            def __getitem__(self, idx):
-                return self.features[idx], self.targets[idx]
-
-
-        class GNNWRTrainer:
-            def __init__(self, *args, **kwargs):
-                logger.warning("使用虚拟GNNWRTrainer")
-
-            def train(self, *args, **kwargs):
-                logger.warning("虚拟训练方法")
-
-            def predict(self, features):
-                logger.warning("虚拟预测方法")
-                return np.random.normal(50, 20, len(features))
 
 
 class SWEClusterEnsemble:
@@ -236,8 +184,8 @@ class SWEClusterEnsemble:
         # 确定特征列和目标列
         if self.feature_columns is None:
             # 自动选择特征列（排除目标列和其他非特征列）
-            exclude_cols = [self.target_column, 'station_id', 'year', 'date', 'station', 'group',
-                            'longitude', 'latitude', 'lon', 'lat']  # 排除坐标列
+            exclude_cols = [self.target_column, 'station_id', 'date', 'station', 'group',
+                            'longitude', 'latitude', 'lon', 'lat','Altitude','snowDensity','snowDepth']  # 排除坐标列
             self.feature_columns = [col for col in df.columns if
                                     col not in exclude_cols and df[col].dtype in [np.int64, np.float64]]
 
@@ -323,40 +271,83 @@ class SWEClusterEnsemble:
 
         return X, y, station_groups, year_groups, coords
 
-    def perform_clustering(self, X, groups):
-        """执行聚类分析
+    def perform_clustering(self, X, groups, df):
+        """执行聚类分析 - 使用指定特征进行聚类
 
         Args:
-            X (np.array): 特征数据
+            X (np.array): 原始特征数据
             groups (np.array): 分组信息
+            df (pd.DataFrame): 原始数据框，用于提取特定聚类特征
 
         Returns:
             np.array: 聚类标签
         """
         self.logger.info(f"执行K-means聚类，聚类数: {self.n_clusters}")
+        self.logger.info("使用指定特征进行聚类: longitude, latitude, Altitude, snowDensity, snowDepth")
 
-        # 按站点聚合特征
+        # 定义聚类特征列
+        cluster_features = ['longitude', 'latitude', 'Altitude', 'snowDensity', 'snowDepth']
+
+        # 检查特征是否存在
+        available_features = []
+        missing_features = []
+
+        for feature in cluster_features:
+            if feature in df.columns:
+                available_features.append(feature)
+            else:
+                missing_features.append(feature)
+
+        if missing_features:
+            self.logger.warning(f"以下聚类特征不存在: {missing_features}")
+
+        if not available_features:
+            self.logger.error("没有可用的聚类特征")
+            # 回退到原始方法
+
+
+        self.logger.info(f"使用聚类特征: {available_features}")
+
+        # 按站点聚合聚类特征
         unique_groups = np.unique(groups)
-        group_features = []
+        group_cluster_features = []
 
         for group in unique_groups:
             group_mask = groups == group
-            group_data = X[group_mask]
-            # 使用每个站点的特征均值作为聚类特征
-            group_mean = np.nanmean(group_data, axis=0)
-            group_features.append(group_mean)
+            group_data = df[group_mask]
 
-        group_features = np.array(group_features)
+            # 计算每个站点的聚类特征均值
+            group_feature_means = []
+            for feature in available_features:
+                if feature in group_data.columns:
+                    feature_mean = np.nanmean(group_data[feature].values)
+                    group_feature_means.append(feature_mean)
+                else:
+                    # 如果特征缺失，使用0填充
+                    group_feature_means.append(0.0)
+                    self.logger.warning(f"特征 {feature} 在分组 {group} 中缺失")
+
+            group_cluster_features.append(group_feature_means)
+
+        group_cluster_features = np.array(group_cluster_features)
 
         # 处理可能的NaN值
-        if np.isnan(group_features).any():
+        if np.isnan(group_cluster_features).any():
             self.logger.info("处理聚类特征中的缺失值")
             cluster_imputer = SimpleImputer(strategy='median')
-            group_features = cluster_imputer.fit_transform(group_features)
+            group_cluster_features = cluster_imputer.fit_transform(group_cluster_features)
+
+        # 标准化聚类特征（因为不同特征的量纲不同）
+        from sklearn.preprocessing import StandardScaler
+        scaler = StandardScaler()
+        group_cluster_features_scaled = scaler.fit_transform(group_cluster_features)
+
+        self.logger.info(f"聚类特征统计 - 均值: {np.mean(group_cluster_features_scaled, axis=0)}")
+        self.logger.info(f"聚类特征统计 - 标准差: {np.std(group_cluster_features_scaled, axis=0)}")
 
         # 执行K-means聚类
         self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
-        group_clusters = self.kmeans.fit_predict(group_features)
+        group_clusters = self.kmeans.fit_predict(group_cluster_features_scaled)
 
         # 将聚类标签映射回原始样本
         cluster_assignments = np.zeros(len(X), dtype=int)
@@ -367,6 +358,9 @@ class SWEClusterEnsemble:
         # 统计每个聚类的样本数
         cluster_counts = np.bincount(cluster_assignments)
         self.logger.info(f"聚类分布: {dict(enumerate(cluster_counts))}")
+
+        # 分析聚类特征
+        self._analyze_cluster_characteristics(df, cluster_assignments, available_features)
 
         return cluster_assignments
 
@@ -625,7 +619,7 @@ class SWEClusterEnsemble:
 
         self.logger.info(f"GNNWR模型训练完成: MAE={mae:.3f}, RMSE={rmse:.3f}, R={r_value:.3f}")
 
-    def cross_validate(self, X, y, groups, coords=None, cv_type='station'):
+    def cross_validate(self, X, y, groups, coords=None, cv_type='station',df=None):
         """执行交叉验证 - GPU优化版本"""
         from sklearn.model_selection import LeaveOneGroupOut
         logo = LeaveOneGroupOut()
@@ -642,7 +636,7 @@ class SWEClusterEnsemble:
 
         # 在整个数据集上按站点进行一次聚类
         self.logger.info("在整个数据集上按站点进行聚类分配...")
-        self.cluster_assignments = self.perform_clustering(X, groups)
+        self.cluster_assignments = self.perform_clustering(X, groups,df)
 
         for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups)):
             group_id = groups[test_idx[0]]
@@ -877,7 +871,7 @@ class SWEClusterEnsemble:
             self.logger.info("步骤 2: 站点级聚类分析")
             self.logger.info("=" * 50)
 
-            self.cluster_assignments = self.perform_clustering(X, station_groups)
+            self.cluster_assignments = self.perform_clustering(X, station_groups,df)
             results['cluster_assignments'] = self.cluster_assignments
 
             # 3. 年度交叉验证（使用固定聚类）
@@ -925,7 +919,7 @@ class SWEClusterEnsemble:
             raise
 
 
-    def fit(self, X, y, station_groups, coords=None):
+    def fit(self, X, y, station_groups, coords=None,df=None):
         """在整个数据集上训练模型
 
         Args:
@@ -938,7 +932,7 @@ class SWEClusterEnsemble:
 
         # 第一步：在整个数据集上按站点进行聚类
         self.logger.info(f"在整个数据集上按站点进行K-means聚类，聚类数: {self.n_clusters}")
-        self.cluster_assignments = self.perform_clustering(X, station_groups)
+        self.cluster_assignments = self.perform_clustering(X, station_groups,df)
 
         # 第二步：为每个聚类训练模型
         self.train_cluster_models(X, y, self.cluster_assignments)
