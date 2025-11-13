@@ -1,29 +1,45 @@
 import logging
+import traceback
 import unittest
 import warnings
-
 import torch.nn as nn
-# import logger
 import numpy as np
 import pandas as pd
 import torch
 import xgboost as xgb
 from sklearn.cluster import KMeans
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from scipy.stats import pearsonr
 from sklearn.model_selection import LeaveOneGroupOut
 import joblib
 import os
 from datetime import datetime
-import matplotlib.pyplot as plt
-import seaborn as sns
 from scipy import stats
 from torch import optim
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib import font_manager
 
+# 方法1：尝试多个字体
+font_options = ['DejaVu Sans', 'Arial', 'Liberation Sans', 'Bitstream Vera Sans']
+available_fonts = set([f.name for f in font_manager.fontManager.ttflist])
+
+for font in font_options:
+    if font in available_fonts:
+        plt.rcParams['font.family'] = font
+        print(f"使用字体: {font}")
+        break
+else:
+    # 如果没有找到合适的字体，使用默认字体
+    plt.rcParams['font.family'] = 'sans-serif'
+
+plt.rcParams['axes.unicode_minus'] = False
+sns.set_style("whitegrid")
 
 
 # 禁用TF32相关警告（CPU上不需要）
@@ -127,6 +143,9 @@ class SWEClusterEnsemble:
         self.use_enhanced_gnnwr = use_enhanced_gnnwr and HAS_ENHANCED_GNNWR
         self.use_rf = use_rf
 
+        self.clustering_features = ['longitude', 'latitude', 'Altitude', 'snowDensity', 'snowDepth']
+        self.exclude_columns = ['station_id', 'date', 'swe']  # 从特征中排除的列
+
         # 关键修复：确保params不为None
         if params is None:
             params = {}
@@ -177,192 +196,154 @@ class SWEClusterEnsemble:
         self.logger.info(f"使用设备: {self.device}")
         self.logger.info(f"混合精度: {self.mixed_precision}")
 
-    def preprocess_data(self, df):
-        """数据预处理 - 完整调试版本"""
-        self.logger.info("开始数据预处理...")
+    def preprocess_data(self, data_df):
+        """数据预处理"""
+        try:
+            # 保存原始数据用于聚类
+            self.data_df = data_df.copy()
 
-        # 确定特征列和目标列
-        if self.feature_columns is None:
-            # 自动选择特征列（排除目标列和其他非特征列）
-            exclude_cols = [self.target_column, 'station_id', 'date', 'station', 'group',
-                            'longitude', 'latitude', 'lon', 'lat','Altitude','snowDensity','snowDepth']  # 排除坐标列
-            self.feature_columns = [col for col in df.columns if
-                                    col not in exclude_cols and df[col].dtype in [np.int64, np.float64]]
+            # 设置特征列
+            self.feature_columns = [col for col in data_df.columns if col not in self.exclude_columns]
+            self.logger.info(f"特征列设置: {len(self.feature_columns)} 个特征")
+            self.logger.info(f"特征列表: {self.feature_columns}")
 
-        self.logger.info(f"使用特征: {self.feature_columns}")
+            # 提取坐标
+            coords = data_df[['longitude', 'latitude']].values
 
-        # 提取特征和目标
-        X = df[self.feature_columns].values
-        y = df[self.target_column].values
+            # 保存聚类特征的值
+            if 'Altitude' in data_df.columns:
+                self.altitude_values = data_df['Altitude'].values
+            if 'snowDensity' in data_df.columns:
+                self.snowdensity_values = data_df['snowDensity'].values
+            if 'snowDepth' in data_df.columns:
+                self.snowdepth_values = data_df['snowDepth'].values
 
-        # 处理缺失值
-        if np.isnan(X).any():
-            self.logger.info("处理特征中的缺失值")
-            self.feature_imputer = SimpleImputer(strategy='median')
-            X = self.feature_imputer.fit_transform(X)
-        else:
-            self.feature_imputer = None
+            # 特征和目标变量
+            target_column = 'swe'
 
-        # 创建分组信息
-        if 'station_id' in df.columns:
-            station_groups = df['station_id'].values
-        elif 'station' in df.columns:
-            station_groups = df['station'].values
-        else:
-            # 如果没有站点信息，使用索引作为分组
-            station_groups = np.arange(len(df))
-            self.logger.warning("未找到站点信息，使用索引作为分组")
+            X = data_df[self.feature_columns].values
+            y = data_df[target_column].values
 
-        if 'year' in df.columns:
-            year_groups = df['year'].values
-        else:
-            # 如果没有年份信息，创建虚拟年份
-            year_groups = np.ones(len(df), dtype=int)
-            self.logger.warning("未找到年份信息，使用统一年份分组")
+            # 年份分组
+            year_groups = data_df['year'].values if 'year' in data_df.columns else np.zeros(len(data_df))
 
-        # === 坐标调试部分 ===
-        self.logger.info("=== 坐标调试信息 ===")
+            # 特征名称
+            feature_names = self.feature_columns
 
-        # 检查坐标列的存在和内容
-        coord_columns = ['longitude', 'latitude', 'lon', 'lat']
-        available_coords = [col for col in coord_columns if col in df.columns]
-        self.logger.info(f"找到的坐标列: {available_coords}")
+            self.logger.info(f"数据预处理完成: {len(X)}个样本, {len(feature_names)}个特征")
 
-        for col in available_coords:
-            if col in df.columns:
-                non_na_count = df[col].notna().sum()
-                dtype = df[col].dtype
-                min_val = df[col].min() if non_na_count > 0 else "N/A"
-                max_val = df[col].max() if non_na_count > 0 else "N/A"
-                self.logger.info(f"  {col}: 非空值={non_na_count}, 类型={dtype}, 范围=[{min_val}, {max_val}]")
+            return X, y, coords, year_groups, feature_names
 
-        # 提取坐标信息
-        coords = None
-        if all(col in df.columns for col in ['longitude', 'latitude']):
-            coords = df[['longitude', 'latitude']].values
-            self.logger.info(f"✅ 使用经纬度坐标: {len(coords)} 个点")
-            self.logger.info(
-                f"   坐标范围: lon[{coords[:, 0].min():.2f}, {coords[:, 0].max():.2f}], lat[{coords[:, 1].min():.2f}, {coords[:, 1].max():.2f}]")
-
-            # 检查是否有NaN坐标
-            nan_coords = np.isnan(coords).any(axis=1).sum()
-            if nan_coords > 0:
-                self.logger.warning(f"⚠️  发现 {nan_coords} 个坐标包含NaN值")
-                # 使用均值填充NaN坐标
-                for i in range(coords.shape[1]):
-                    col_mean = np.nanmean(coords[:, i])
-                    nan_mask = np.isnan(coords[:, i])
-                    coords[nan_mask, i] = col_mean
-                    self.logger.info(f"   列 {i} 的NaN值已用均值 {col_mean:.4f} 填充")
-
-        elif all(col in df.columns for col in ['lon', 'lat']):
-            coords = df[['lon', 'lat']].values
-            self.logger.info(f"✅ 使用经纬度坐标: {len(coords)} 个点")
-        else:
-            self.logger.warning("❌ 未找到坐标信息，将使用虚拟坐标")
-            unique_stations = np.unique(station_groups)
-            station_to_coord = {station: [i, i] for i, station in enumerate(unique_stations)}
-            coords = np.array([station_to_coord[station] for station in station_groups])
-            self.logger.info(f"   生成虚拟坐标: {len(coords)} 个点")
-
-        self.logger.info(f"数据预处理完成: {len(X)}个样本, {X.shape[1]}个特征")
-        self.logger.info(f"站点数: {len(np.unique(station_groups))}, 年份数: {len(np.unique(year_groups))}")
-        self.logger.info(f"坐标最终状态: {'可用' if coords is not None else '不可用'}")
-
-        return X, y, station_groups, year_groups, coords
+        except Exception as e:
+            self.logger.error(f"数据预处理失败: {str(e)}")
+            raise
 
     def perform_clustering(self, X, groups, df):
-        """执行聚类分析 - 使用指定特征进行聚类
+        """执行聚类分析"""
+        try:
+            # 安全检查
+            if df is None:
+                self.logger.warning("df 参数为 None，从 X 创建 DataFrame")
+                feature_names = getattr(self, 'feature_names', [f'feature_{i}' for i in range(X.shape[1])])
+                df = pd.DataFrame(X, columns=feature_names)
 
-        Args:
-            X (np.array): 原始特征数据
-            groups (np.array): 分组信息
-            df (pd.DataFrame): 原始数据框，用于提取特定聚类特征
+            self.logger.info(f"聚类 - DataFrame 形状: {df.shape}")
+            self.logger.info(f"DataFrame 列: {list(df.columns)}")
+            self.logger.info(f"请求的聚类特征: {self.clustering_features}")
 
-        Returns:
-            np.array: 聚类标签
-        """
-        self.logger.info(f"执行K-means聚类，聚类数: {self.n_clusters}")
-        self.logger.info("使用指定特征进行聚类: longitude, latitude, Altitude, snowDensity, snowDepth")
+            # 检查哪些聚类特征可用
+            available_features = []
+            missing_features = []
 
-        # 定义聚类特征列
-        cluster_features = ['longitude', 'latitude', 'Altitude', 'snowDensity', 'snowDepth']
-
-        # 检查特征是否存在
-        available_features = []
-        missing_features = []
-
-        for feature in cluster_features:
-            if feature in df.columns:
-                available_features.append(feature)
-            else:
-                missing_features.append(feature)
-
-        if missing_features:
-            self.logger.warning(f"以下聚类特征不存在: {missing_features}")
-
-        if not available_features:
-            self.logger.error("没有可用的聚类特征")
-            # 回退到原始方法
-
-
-        self.logger.info(f"使用聚类特征: {available_features}")
-
-        # 按站点聚合聚类特征
-        unique_groups = np.unique(groups)
-        group_cluster_features = []
-
-        for group in unique_groups:
-            group_mask = groups == group
-            group_data = df[group_mask]
-
-            # 计算每个站点的聚类特征均值
-            group_feature_means = []
-            for feature in available_features:
-                if feature in group_data.columns:
-                    feature_mean = np.nanmean(group_data[feature].values)
-                    group_feature_means.append(feature_mean)
+            for feature in self.clustering_features:
+                if feature in df.columns:
+                    available_features.append(feature)
+                    # 检查该特征是否有有效值
+                    non_null_count = df[feature].notna().sum()
+                    self.logger.info(f"聚类特征 '{feature}': {non_null_count}/{len(df)} 非空值")
                 else:
-                    # 如果特征缺失，使用0填充
-                    group_feature_means.append(0.0)
-                    self.logger.warning(f"特征 {feature} 在分组 {group} 中缺失")
+                    missing_features.append(feature)
 
-            group_cluster_features.append(group_feature_means)
+            if missing_features:
+                self.logger.warning(f"以下聚类特征不存在: {missing_features}")
 
-        group_cluster_features = np.array(group_cluster_features)
+            if not available_features:
+                self.logger.error("没有可用的聚类特征！使用备用特征")
+                # 使用前几个数值特征作为备用
+                numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                available_features = numeric_cols[:5]  # 使用前5个数值特征
+                self.logger.info(f"使用备用特征: {available_features}")
 
-        # 处理可能的NaN值
-        if np.isnan(group_cluster_features).any():
-            self.logger.info("处理聚类特征中的缺失值")
-            cluster_imputer = SimpleImputer(strategy='median')
-            group_cluster_features = cluster_imputer.fit_transform(group_cluster_features)
+            self.logger.info(f"实际使用的聚类特征: {available_features}")
 
-        # 标准化聚类特征（因为不同特征的量纲不同）
-        from sklearn.preprocessing import StandardScaler
-        scaler = StandardScaler()
-        group_cluster_features_scaled = scaler.fit_transform(group_cluster_features)
+            # 提取聚类数据
+            clustering_data = df[available_features].values
 
-        self.logger.info(f"聚类特征统计 - 均值: {np.mean(group_cluster_features_scaled, axis=0)}")
-        self.logger.info(f"聚类特征统计 - 标准差: {np.std(group_cluster_features_scaled, axis=0)}")
+            # 处理缺失值
+            clustering_data = np.nan_to_num(clustering_data, nan=0.0)
 
-        # 执行K-means聚类
-        self.kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
-        group_clusters = self.kmeans.fit_predict(group_cluster_features_scaled)
+            # 标准化
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            clustering_data_scaled = scaler.fit_transform(clustering_data)
 
-        # 将聚类标签映射回原始样本
-        cluster_assignments = np.zeros(len(X), dtype=int)
-        for i, group in enumerate(unique_groups):
-            group_mask = groups == group
-            cluster_assignments[group_mask] = group_clusters[i]
+            self.logger.info(f"聚类数据形状: {clustering_data_scaled.shape}")
 
-        # 统计每个聚类的样本数
-        cluster_counts = np.bincount(cluster_assignments)
-        self.logger.info(f"聚类分布: {dict(enumerate(cluster_counts))}")
+            # 执行 K-means 聚类
+            from sklearn.cluster import KMeans
+            kmeans = KMeans(n_clusters=self.n_clusters, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(clustering_data_scaled)
 
-        # 分析聚类特征
-        self._analyze_cluster_characteristics(df, cluster_assignments, available_features)
+            # 记录聚类分布
+            unique, counts = np.unique(cluster_labels, return_counts=True)
+            cluster_distribution = dict(zip(unique, counts))
+            self.logger.info(f"聚类分布: {cluster_distribution}")
 
-        return cluster_assignments
+            return cluster_labels
+
+        except Exception as e:
+            self.logger.error(f"聚类过程失败: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            # 返回默认聚类（所有样本属于同一类）
+            return np.zeros(len(X))
+
+    def _fit_ensemble(self, X, y, cluster_assignments):
+        """训练集成模型（内部方法）"""
+        try:
+            self.logger.info("训练聚类集成模型...")
+
+            self.estimators = {}
+
+            for cluster_id in range(self.n_clusters):
+                # 获取当前簇的样本
+                cluster_mask = (cluster_assignments == cluster_id)
+                X_cluster = X[cluster_mask]
+                y_cluster = y[cluster_mask]
+
+                if len(X_cluster) == 0:
+                    self.logger.warning(f"簇 {cluster_id} 无样本，跳过")
+                    continue
+
+                self.logger.info(f"训练簇 {cluster_id} 模型: {len(X_cluster)} 个样本")
+
+                # 为每个簇训练一个随机森林模型
+                rf = RandomForestRegressor(
+                    n_estimators=100,
+                    max_depth=10,
+                    min_samples_split=5,
+                    min_samples_leaf=2,
+                    random_state=42,
+                    n_jobs=-1
+                )
+
+                rf.fit(X_cluster, y_cluster)
+                self.estimators[cluster_id] = rf
+
+            self.logger.info(f"集成模型训练完成: {len(self.estimators)} 个基模型")
+
+        except Exception as e:
+            self.logger.error(f"集成模型训练失败: {str(e)}")
+            raise
 
     def train_cluster_models(self, X, y, cluster_labels):
         """为每个聚类训练模型 - 优化版本"""
@@ -619,110 +600,149 @@ class SWEClusterEnsemble:
 
         self.logger.info(f"GNNWR模型训练完成: MAE={mae:.3f}, RMSE={rmse:.3f}, R={r_value:.3f}")
 
-    def cross_validate(self, X, y, groups, coords=None, cv_type='station',df=None):
-        """执行交叉验证 - GPU优化版本"""
-        from sklearn.model_selection import LeaveOneGroupOut
-        logo = LeaveOneGroupOut()
-
-        all_predictions = []
-        all_true_values = []
-        fold_results = {}
-
-        unique_groups = np.unique(groups)
-        total_folds = len(unique_groups)
-
-        self.logger.info(f"开始{cv_type}交叉验证，共{total_folds}个折叠...")
-        self.logger.info(f"使用设备: {self.device}")
-
-        # 在整个数据集上按站点进行一次聚类
-        self.logger.info("在整个数据集上按站点进行聚类分配...")
-        self.cluster_assignments = self.perform_clustering(X, groups,df)
-
-        for fold, (train_idx, test_idx) in enumerate(logo.split(X, y, groups)):
-            group_id = groups[test_idx[0]]
-            test_size = len(test_idx)
-            train_size = len(train_idx)
-
-            self.logger.info(f"=== Fold {fold + 1} ===")
-            self.logger.info(f"训练集大小: {train_size}, 测试集大小: {test_size}")
-
-            # 分割数据
-            X_train, X_test = X[train_idx], X[test_idx]
-            y_train, y_test = y[train_idx], y[test_idx]
-            groups_train, groups_test = groups[train_idx], groups[test_idx]
-
-            # 分割坐标
-            if coords is not None:
-                coords_train = coords[train_idx]
-                coords_test = coords[test_idx]
+    def cross_validate(self, X, y, groups, coords, strategy='yearly'):
+        """执行交叉验证"""
+        try:
+            # 使用原始的完整 data_df
+            if hasattr(self, 'data_df') and self.data_df is not None:
+                df = self.data_df
+                self.logger.info(f"使用原始完整 DataFrame，形状: {df.shape}")
+                self.logger.info(f"DataFrame 包含的列: {list(df.columns)}")
             else:
-                coords_train = None
-                coords_test = None
+                # 如果 data_df 不存在，创建包含所有必要列的 DataFrame
+                self.logger.warning("self.data_df 不存在，创建包含所有列的 DataFrame")
+                feature_names = getattr(self, 'feature_names', [f'feature_{i}' for i in range(X.shape[1])])
+                df = pd.DataFrame(X, columns=feature_names)
 
-            # 使用固定的聚类分配
-            train_cluster_labels = self.cluster_assignments[train_idx]
-            test_cluster_labels = self.cluster_assignments[test_idx]
+                # 添加坐标列
+                if coords is not None and len(coords) == len(X):
+                    df['longitude'] = coords[:, 0]
+                    df['latitude'] = coords[:, 1]
 
-            # 训练聚类集成模型
-            try:
-                # 第一步：为每个聚类训练模型 - 使用多线程
-                self.train_cluster_models(X_train, y_train, train_cluster_labels)
+                # 添加其他聚类特征列
+                if hasattr(self, 'altitude_values') and len(self.altitude_values) == len(X):
+                    df['Altitude'] = self.altitude_values
+                if hasattr(self, 'snowdensity_values') and len(self.snowdensity_values) == len(X):
+                    df['snowDensity'] = self.snowdensity_values
+                if hasattr(self, 'snowdepth_values') and len(self.snowdepth_values) == len(X):
+                    df['snowDepth'] = self.snowdepth_values
 
-                # 第二步：获取训练集上的聚类预测
-                cluster_predictions_train = self._get_cluster_predictions(X_train, train_cluster_labels)
+            self.logger.info(f"交叉验证 - 数据形状: X{X.shape}, y{y.shape}, df{df.shape}")
 
-                # 第三步：训练GNNWR集成模型
-                if coords_train is None:
-                    raise ValueError(f"Fold {fold + 1}: coords_train为None，无法训练GNNWR")
+            # 检查聚类特征是否存在
+            missing_features = [f for f in self.clustering_features if f not in df.columns]
+            if missing_features:
+                self.logger.warning(f"以下聚类特征不存在: {missing_features}")
+                self.logger.info(f"可用的列: {list(df.columns)}")
 
-                self.train_gnnwr_model(X_train, y_train, cluster_predictions_train, coords_train)
+            # 执行聚类（在整个数据集上）
+            self.cluster_assignments = self.perform_clustering(X, groups, df)
 
-                # 第四步：预测测试集
-                cluster_predictions_test = self._get_cluster_predictions(X_test, test_cluster_labels)
+            # 根据策略设置交叉验证
+            if strategy == 'yearly':
+                # 按年份分组交叉验证
+                unique_years = np.unique(groups)
+                self.logger.info(f"按年份交叉验证，年份数: {len(unique_years)}")
 
-                # 关键修复：测试集特征也需要与聚类预测合并
-                test_features_combined = np.hstack([X_test, cluster_predictions_test])
-                self.logger.info(f"测试集合并特征形状: {test_features_combined.shape}")
+                cv_scores = {
+                    'mse': [], 'rmse': [], 'mae': [], 'r2': [],
+                    'train_mse': [], 'train_rmse': [], 'train_mae': [], 'train_r2': []
+                }
 
-                y_pred = self.predict_with_gnnwr(test_features_combined, None, coords_test)
+                for test_year in unique_years:
+                    # 划分训练集和测试集
+                    train_mask = groups != test_year
+                    test_mask = groups == test_year
 
-                # 存储结果
-                all_predictions.extend(y_pred)
-                all_true_values.extend(y_test)
+                    X_train, X_test = X[train_mask], X[test_mask]
+                    y_train, y_test = y[train_mask], y[test_mask]
 
-                # 计算当前折叠性能
-                fold_metrics = self.evaluate_predictions(y_test, y_pred)
-                fold_results[group_id] = fold_metrics
+                    # 获取对应的聚类标签
+                    train_clusters = self.cluster_assignments[train_mask]
+                    test_clusters = self.cluster_assignments[test_mask]
 
-                self.logger.info(
-                    f"  {cv_type} Fold {fold + 1}/{total_folds}: {group_id} "
-                    f"(聚类{test_cluster_labels[0]}, {test_size}样本) - "
-                    f"MAE={fold_metrics['MAE']:.3f}, R={fold_metrics['R']:.3f}"
-                )
+                    self.logger.info(f"年份 {test_year}: 训练集 {len(X_train)}, 测试集 {len(X_test)}")
 
-            except Exception as e:
-                self.logger.error(f"折叠 {fold + 1} 训练失败: {e}")
-                import traceback
-                self.logger.error(f"详细错误信息: {traceback.format_exc()}")
-                continue
+                    # 为当前折叠创建新的模型实例
+                    fold_estimators = {}
 
-        # 计算总体性能
-        overall_metrics = self.evaluate_predictions(
-            np.array(all_true_values),
-            np.array(all_predictions)
-        )
+                    # 训练当前折叠的模型
+                    for cluster_id in range(self.n_clusters):
+                        # 获取当前簇的训练样本
+                        cluster_mask = (train_clusters == cluster_id)
+                        X_cluster = X_train[cluster_mask]
+                        y_cluster = y_train[cluster_mask]
 
-        self.logger.info(f"✅ {cv_type}交叉验证完成")
-        self.logger.info(f"  聚合性能: MAE={overall_metrics['MAE']:.3f}mm, R={overall_metrics['R']:.3f}")
+                        if len(X_cluster) == 0:
+                            self.logger.warning(f"簇 {cluster_id} 无训练样本，跳过")
+                            continue
 
-        return {
-            'overall': overall_metrics,
-            'by_fold': fold_results,
-            'predictions': np.array(all_predictions),
-            'true_values': np.array(all_true_values),
-            'folds': total_folds,
-            'cluster_assignments': self.cluster_assignments
-        }
+                        # 为每个簇训练一个随机森林模型
+                        rf = RandomForestRegressor(
+                            n_estimators=100,
+                            max_depth=10,
+                            min_samples_split=5,
+                            min_samples_leaf=2,
+                            random_state=42,
+                            n_jobs=-1
+                        )
+
+                        rf.fit(X_cluster, y_cluster)
+                        fold_estimators[cluster_id] = rf
+
+                    # 使用当前折叠的模型进行预测
+                    y_pred_train = self._predict_with_estimators(X_train, train_clusters, fold_estimators)
+                    y_pred_test = self._predict_with_estimators(X_test, test_clusters, fold_estimators)
+
+                    # 计算指标
+                    train_mse = mean_squared_error(y_train, y_pred_train)
+                    train_rmse = np.sqrt(train_mse)
+                    train_mae = mean_absolute_error(y_train, y_pred_train)
+                    train_r2 = r2_score(y_train, y_pred_train)
+
+                    test_mse = mean_squared_error(y_test, y_pred_test)
+                    test_rmse = np.sqrt(test_mse)
+                    test_mae = mean_absolute_error(y_test, y_pred_test)
+                    test_r2 = r2_score(y_test, y_pred_test)
+
+                    # 保存结果
+                    cv_scores['mse'].append(test_mse)
+                    cv_scores['rmse'].append(test_rmse)
+                    cv_scores['mae'].append(test_mae)
+                    cv_scores['r2'].append(test_r2)
+                    cv_scores['train_mse'].append(train_mse)
+                    cv_scores['train_rmse'].append(train_rmse)
+                    cv_scores['train_mae'].append(train_mae)
+                    cv_scores['train_r2'].append(train_r2)
+
+                    self.logger.info(
+                        f"年份 {test_year} - 测试集: RMSE={test_rmse:.4f}, MAE={test_mae:.4f}, R²={test_r2:.4f}")
+
+                return cv_scores
+
+            # 其他策略（spatial, kfold）也需要类似的修复...
+
+        except Exception as e:
+            self.logger.error(f"交叉验证失败: {str(e)}")
+            raise
+
+    def _predict_with_estimators(self, X, cluster_assignments, estimators):
+        """使用指定的estimators进行预测（用于交叉验证）"""
+        try:
+            predictions = np.zeros(len(X))
+
+            for cluster_id, estimator in estimators.items():
+                # 获取属于当前簇的样本
+                cluster_mask = (cluster_assignments == cluster_id)
+                if np.any(cluster_mask):
+                    X_cluster = X[cluster_mask]
+                    predictions[cluster_mask] = estimator.predict(X_cluster)
+
+            return predictions
+
+        except Exception as e:
+            self.logger.error(f"使用estimators预测失败: {str(e)}")
+            raise
 
     def predict_with_gnnwr(self, X, cluster_predictions=None, coords=None):
         """使用GNNWR进行预测 - GPU优化版本"""
@@ -824,98 +844,61 @@ class SWEClusterEnsemble:
             prefetch_factor=2 if num_workers > 0 else None
         )
 
-    def run_complete_analysis(self, df, output_dir=None):
-        """运行完整分析流程 - GPU优化版本"""
-        self.logger.info("=" * 70)
-        self.logger.info("🚀 开始SWE聚类集成回归完整分析流程 (GPU优化版)")
-        self.logger.info("=" * 70)
-
-        # 显示硬件信息
-        if self.device.type == 'cuda':
-            gpu_info = f"GPU: {torch.cuda.get_device_name()}, 内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f}GB"
-            self.logger.info(f"硬件配置: {gpu_info}, CPU线程: {self.cpu_workers}")
-        else:
-            self.logger.info(f"硬件配置: CPU模式, {self.cpu_workers}线程")
-
-        # 创建输出目录
-        if output_dir is None:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_dir = f"./swe_cluster_ensemble_results_{timestamp}"
-
-        os.makedirs(output_dir, exist_ok=True)
-        self.logger.info(f"输出目录: {output_dir}")
-
+    def run_complete_analysis(self, data_df, output_dir):
+        """运行完整的分析流程"""
         try:
-            # 1. 数据预处理
-            self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 1: 数据预处理")
-            self.logger.info("=" * 50)
+            self.logger.info("开始完整分析流程...")
 
-            X, y, station_groups, year_groups, coords = self.preprocess_data(df)
+            # 确保 feature_columns 已正确初始化
+            if not hasattr(self, 'feature_columns') or self.feature_columns is None:
+                self.feature_columns = [col for col in data_df.columns if col not in self.exclude_columns]
+                self.logger.info(f"初始化特征列: {len(self.feature_columns)} 个特征")
 
+            # 数据预处理
+            X, y, coords, year_groups, feature_names = self.preprocess_data(data_df)
+
+            # 保存预处理后的数据
+            self.X = X
+            self.y = y
+            self.coords = coords
+            self.year_groups = year_groups
+            self.feature_names = feature_names
+
+            # 执行交叉验证
+            self.logger.info("开始交叉验证...")
+            cv_results = self.cross_validate(X, y, year_groups, coords, strategy='yearly')
+
+            # 最终模型训练
+            self.logger.info("训练最终模型...")
+            self.fit(X, y, year_groups, coords)
+
+            # 收集结果
             results = {
-                'preprocessing': {
-                    'samples': len(X),
-                    'features': len(self.feature_columns),
-                    'stations': len(np.unique(station_groups)),
-                    'years': len(np.unique(year_groups)),
+                'cv_results': cv_results,
+                'feature_importance': self.get_feature_importance(),
+                'clustering_info': {
                     'n_clusters': self.n_clusters,
-                    'has_coords': coords is not None,
-                    'device': str(self.device),
-                    'mixed_precision': self.mixed_precision
+                    'cluster_sizes': np.bincount(self.cluster_assignments) if hasattr(self,
+                                                                                      'cluster_assignments') and self.cluster_assignments is not None else []
+                },
+                'model_info': {
+                    'n_estimators': len(self.estimators) if hasattr(self,
+                                                                    'estimators') and self.estimators is not None else 0,
+                    'features': len(self.feature_columns) if self.feature_columns is not None else 0,
+                    'samples': len(X)
                 }
             }
 
-            # 2. 在整个数据集上按站点进行聚类
-            self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 2: 站点级聚类分析")
-            self.logger.info("=" * 50)
+            # 保存模型和结果
+            self.save_model(output_dir)
+            self.save_results(results, output_dir)
 
-            self.cluster_assignments = self.perform_clustering(X, station_groups,df)
-            results['cluster_assignments'] = self.cluster_assignments
-
-            # 3. 年度交叉验证（使用固定聚类）
-            self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 3: 年度交叉验证")
-            self.logger.info("=" * 50)
-
-            results['yearly_cv'] = self.cross_validate(X, y, year_groups, coords, 'yearly')
-
-            # 4. 训练最终模型
-            self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 4: 训练最终模型")
-            self.logger.info("=" * 50)
-
-            self.fit(X, y, station_groups, coords)
-
-            results['final_model'] = {
-                'kmeans': self.kmeans,
-                'cluster_models': self.cluster_models,
-                'gnnwr_trainer': self.gnnwr_trainer,
-                'cluster_assignments': self.cluster_assignments,
-                'feature_columns': self.feature_columns,
-                'training_config': {
-                    'device': str(self.device),
-                    'mixed_precision': self.mixed_precision,
-                    'cpu_workers': self.cpu_workers
-                }
-            }
-
-            # 5. 保存结果
-            self.logger.info("\n" + "=" * 50)
-            self.logger.info("步骤 5: 保存结果")
-            self.logger.info("=" * 50)
-
-            self._save_results(results, output_dir)
-
-            # 6. 生成报告
-            report = self._generate_report(results)
-            print(report)
-            self.logger.info("🎯 聚类集成分析完成！")
+            self.logger.info("✅ 分析流程完成")
             return results
 
         except Exception as e:
             self.logger.error(f"❌ 分析流程失败: {str(e)}")
+            self.logger.error(traceback.format_exc())
             raise
 
 
@@ -1011,6 +994,123 @@ class SWEClusterEnsemble:
         self._create_visualizations(results, output_dir)
 
         self.logger.info(f"结果已保存到: {output_dir}")
+
+    def get_feature_importance(self):
+        """获取特征重要性"""
+        try:
+            self.logger.info("计算特征重要性...")
+
+            if not hasattr(self, 'estimators') or not self.estimators:
+                raise ValueError("模型尚未训练，请先调用fit方法")
+
+            # 获取特征名称
+            if hasattr(self, 'feature_names'):
+                feature_names = self.feature_names
+            else:
+                feature_names = [f'feature_{i}' for i in
+                                 range(len(next(iter(self.estimators.values())).feature_importances_))]
+
+            # 计算每个簇模型的特征重要性
+            cluster_importances = {}
+            for cluster_id, estimator in self.estimators.items():
+                if hasattr(estimator, 'feature_importances_'):
+                    importances = estimator.feature_importances_
+                    cluster_importances[cluster_id] = dict(zip(feature_names, importances))
+
+            # 计算整体特征重要性（加权平均）
+            overall_importances = {}
+            cluster_weights = {}
+
+            # 计算每个簇的权重（基于样本数量）
+            total_samples = sum(len(self.cluster_assignments[self.cluster_assignments == cluster_id])
+                                for cluster_id in self.estimators.keys())
+
+            for cluster_id, estimator in self.estimators.items():
+                cluster_samples = len(self.cluster_assignments[self.cluster_assignments == cluster_id])
+                cluster_weights[cluster_id] = cluster_samples / total_samples if total_samples > 0 else 0
+
+            # 计算加权平均特征重要性
+            for feature in feature_names:
+                weighted_importance = 0
+                for cluster_id, importances in cluster_importances.items():
+                    if feature in importances:
+                        weighted_importance += importances[feature] * cluster_weights[cluster_id]
+                overall_importances[feature] = weighted_importance
+
+            # 按重要性排序
+            overall_importances = dict(sorted(overall_importances.items(),
+                                              key=lambda x: x[1], reverse=True))
+
+            # 为每个簇的重要性也排序
+            for cluster_id in cluster_importances:
+                cluster_importances[cluster_id] = dict(sorted(cluster_importances[cluster_id].items(),
+                                                              key=lambda x: x[1], reverse=True))
+
+            result = {
+                'overall': overall_importances,
+                'by_cluster': cluster_importances,
+                'cluster_weights': cluster_weights
+            }
+
+            self.logger.info("特征重要性计算完成")
+            return result
+
+        except Exception as e:
+            self.logger.error(f"计算特征重要性失败: {str(e)}")
+            raise
+
+    def plot_feature_importance(self, save_path=None):
+        """绘制特征重要性图"""
+        try:
+            if not hasattr(self, 'feature_importance_results'):
+                self.feature_importance_results = self.get_feature_importance()
+
+            importances = self.feature_importance_results['overall']
+
+            # 取前15个最重要的特征
+            top_features = list(importances.keys())[:15]
+            top_importances = [importances[feature] for feature in top_features]
+
+            plt.figure(figsize=(12, 8))
+            y_pos = np.arange(len(top_features))
+
+            plt.barh(y_pos, top_importances, align='center', alpha=0.8)
+            plt.yticks(y_pos, top_features)
+            plt.xlabel('特征重要性')
+            plt.title('Top 15 特征重要性')
+            plt.gca().invert_yaxis()  # 最重要的特征在顶部
+
+            plt.tight_layout()
+
+            if save_path:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                self.logger.info(f"特征重要性图已保存: {save_path}")
+
+            plt.show()
+
+        except Exception as e:
+            self.logger.error(f"绘制特征重要性图失败: {str(e)}")
+            raise
+
+    def get_cluster_feature_importance(self, cluster_id, top_n=10):
+        """获取指定簇的特征重要性"""
+        try:
+            if not hasattr(self, 'feature_importance_results'):
+                self.feature_importance_results = self.get_feature_importance()
+
+            if cluster_id not in self.feature_importance_results['by_cluster']:
+                raise ValueError(f"簇 {cluster_id} 不存在")
+
+            cluster_importances = self.feature_importance_results['by_cluster'][cluster_id]
+
+            # 返回前top_n个特征
+            top_features = list(cluster_importances.items())[:top_n]
+
+            return dict(top_features)
+
+        except Exception as e:
+            self.logger.error(f"获取簇 {cluster_id} 特征重要性失败: {str(e)}")
+            raise
 
     def _generate_report(self, results):
         """生成分析报告 - 包含GPU信息"""

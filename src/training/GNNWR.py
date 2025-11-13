@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import numpy as np
 from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
@@ -268,7 +268,7 @@ class EnhancedGNNWRTrainer:
                               dtype=torch.float16 if self.mixed_precision else torch.float32)
 
         # 使用混合精度计算
-        with autocast(enabled=self.mixed_precision):
+        with autocast(device_type='cuda',enabled=self.mixed_precision):
             # 使用PyTorch向量化计算（GPU加速）
             diff = batch_coords.unsqueeze(1) - batch_coords.unsqueeze(0)
             distances = torch.sqrt(torch.sum(diff ** 2, dim=2) + 1e-8)
@@ -367,7 +367,7 @@ class EnhancedGNNWRTrainer:
             self.optimizer.zero_grad(set_to_none=True)  # 更快的梯度清零
 
             # 混合精度前向传播
-            with autocast(enabled=self.mixed_precision):
+            with autocast(device_type='cuda',enabled=self.mixed_precision):
                 if self.use_spatial_weights and batch_coords is not None:
                     if self.device.type == 'cuda':
                         batch_weights = self._compute_gpu_spatial_weights(batch_coords)
@@ -506,7 +506,7 @@ class EnhancedGNNWRTrainer:
             dummy_coords = torch.randn(32, 2, device=self.device,
                                        dtype=torch.float16 if self.mixed_precision else torch.float32)
 
-            with autocast(enabled=self.mixed_precision):
+            with autocast(device_type='cuda',enabled=self.mixed_precision):
                 for _ in range(10):
                     if self.use_spatial_weights:
                         dummy_weights = self._compute_gpu_spatial_weights(dummy_coords)
@@ -536,7 +536,7 @@ class EnhancedGNNWRTrainer:
                     batch_coords = torch.tensor(coords[i:end_idx], dtype=dtype, device=self.device)
 
                 # 混合精度预测
-                with autocast(enabled=self.mixed_precision):
+                with autocast(device_type='cuda',enabled=self.mixed_precision):
                     if self.use_spatial_weights and batch_coords is not None:
                         if self.device.type == 'cuda':
                             batch_weights = self._compute_gpu_spatial_weights(batch_coords)

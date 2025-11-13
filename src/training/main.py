@@ -4,7 +4,7 @@ import os
 import argparse
 import pandas as pd
 from cluster import train_swe_cluster_ensemble
-from cluster import train_pure_gnnwr_analysis
+from cluster import train_pure_gnnwr_annual_only
 
 # 添加当前目录到路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
