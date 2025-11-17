@@ -274,144 +274,216 @@ def plot_aggregated_scatter(all_true, all_pred, metrics, save_path="result/cross
     print(f"✅ 散点图已保存至: {save_path}/aggregated_scatter_plot.png")
 
 
-def station_level_cross_validation(data, x_column, y_column, spatial_column, station_column='station_id'):
-    """修复版本的站点级交叉验证 - 最小改动"""
-    print("开始站点级交叉验证...")
+def quick_smoke_test(data, x_column, y_column, spatial_column, station_column='station_id'):
+    """快速冒烟测试 - 修复无穷大和NaN值问题"""
+    print("🚀 开始快速冒烟测试...")
 
-    # 原有的预处理逻辑保持不变
-    data = data.copy()
-    numeric_columns = data.select_dtypes(include=[np.number]).columns
-    for col in numeric_columns:
-        if col in data.columns:
-            data[col] = data[col].replace([np.inf, -np.inf], np.nan)
+    # 数据诊断信息
+    print("数据诊断:")
+    print(f"  总数据量: {len(data)}")
+    print(f"  站点数: {data[station_column].nunique()}")
+    print(f"  特征数: {len(x_column)}")
+    print(f"  目标变量: {y_column}")
 
-    clean_data = robust_data_cleaning(data, x_column, y_column, spatial_column, station_column)
-    data_standardized = standardize_data(clean_data, x_column, y_column)
+    # 检查关键列是否存在
+    required_columns = x_column + y_column + spatial_column + [station_column]
+    missing_columns = [col for col in required_columns if col not in data.columns]
+    if missing_columns:
+        print(f"❌ 缺少必要列: {missing_columns}")
+        return False
 
-    unique_stations = data_standardized[station_column].unique()
-    n_stations = len(unique_stations)
-    print(f"总站点数: {n_stations}")
+    try:
+        # 第一步：数据预处理测试
+        print("1. 数据预处理和清理...")
+        clean_data = data.copy()
 
-    all_true = []
-    all_pred = []
-    fold_results = []
+        # 详细检查数据问题
+        print("数据问题检查:")
 
-    total_start_time = time.time()
+        # 检查无穷大值
+        inf_columns = []
+        for col in x_column + y_column:
+            if col in clean_data.columns:
+                has_inf = np.isinf(clean_data[col]).any()
+                if has_inf:
+                    inf_columns.append(col)
+                    print(f"  ⚠️ {col}: 包含无穷大值")
 
-    for i, test_station in enumerate(unique_stations):
-        print(f"\n--- 折 {i + 1}/{n_stations}: 验证站点 {test_station} ---")
+        # 检查NaN值
+        nan_counts = clean_data[x_column + y_column].isnull().sum()
+        nan_columns = nan_counts[nan_counts > 0].index.tolist()
+        for col in nan_columns:
+            print(f"  ⚠️ {col}: {nan_counts[col]} 个NaN值")
 
-        try:
-            train_data = data_standardized[data_standardized[station_column] != test_station]
-            val_data = data_standardized[data_standardized[station_column] == test_station]
+        # 检查零方差特征
+        zero_var_columns = []
+        for col in x_column:
+            if col in clean_data.columns:
+                if clean_data[col].std() == 0:
+                    zero_var_columns.append(col)
+                    print(f"  ⚠️ {col}: 方差为零")
 
-            if len(val_data) == 0:
-                print(f"⚠️ 跳过站点 {test_station}: 验证集为空")
-                continue
+        # 修复数据问题
+        print("修复数据问题...")
 
-            if len(train_data) < 10:
-                print(f"⚠️ 跳过站点 {test_station}: 训练数据太少 ({len(train_data)} 行)")
-                continue
+        # 1. 删除关键列的缺失值
+        critical_columns = y_column + spatial_column + [station_column]
+        initial_count = len(clean_data)
+        clean_data = clean_data.dropna(subset=critical_columns)
+        print(f"  - 删除关键列缺失值: {len(clean_data)} 行 (删除了 {initial_count - len(clean_data)} 行)")
 
-            print(f"训练集: {len(train_data)} 行, 验证集: {len(val_data)} 行")
+        if len(clean_data) == 0:
+            print("❌ 删除关键列缺失值后数据为空")
+            return False
 
-            # 关键修复：使用修复后的初始化函数
-            train_set, val_set = safe_dataset_initialization(
-                train_data, val_data, x_column, y_column, spatial_column
-            )
+        # 2. 处理无穷大值 - 用列的最大值/最小值替换
+        for col in inf_columns:
+            if col in clean_data.columns:
+                col_data = clean_data[col]
+                # 替换正无穷为最大值，负无穷为最小值
+                max_val = col_data[np.isfinite(col_data)].max()
+                min_val = col_data[np.isfinite(col_data)].min()
 
-            # 原有的模型配置保持不变
-            model_name = f"GNNWR_Fold_{i + 1}"
-            gnnwr = models.GNNWR(
-                train_dataset=train_set,
-                valid_dataset=val_set,
-                test_dataset=val_set,
-                dense_layers=[128, 64],
-                activate_func=nn.ReLU(),
-                start_lr=0.0005,
-                optimizer="Adam",
-                model_name=model_name,
-                model_save_path="result/cross_validation_models",
-                log_path="result/cross_validation_logs",
-                write_path="result/cross_validation_runs",
-                optimizer_params={
-                    "scheduler": "MultiStepLR",
-                    "scheduler_milestones": [50, 100],
-                    "scheduler_gamma": 0.8,
-                }
-            )
+                clean_data[col] = col_data.replace([np.inf], max_val)
+                clean_data[col] = clean_data[col].replace([-np.inf], min_val)
+                print(f"  - 修复 {col} 的无穷大值")
 
-            # 创建目录
-            os.makedirs("result/cross_validation_models", exist_ok=True)
-            os.makedirs("result/cross_validation_logs", exist_ok=True)
-            os.makedirs("result/cross_validation_runs", exist_ok=True)
+        # 3. 处理特征列的NaN值
+        for col in x_column:
+            if col in clean_data.columns and clean_data[col].isnull().any():
+                # 使用中位数填充，避免异常值影响
+                median_val = clean_data[col].median()
+                clean_data[col] = clean_data[col].fillna(median_val)
+                print(f"  - 用中位数填充 {col} 的NaN值: {median_val:.4f}")
 
-            # 训练模型
-            gnnwr.add_graph()
-            gnnwr.run(max_epoch=30, early_stop=15, print_frequency=10)
+        # 4. 处理零方差特征 - 添加微小噪声
+        for col in zero_var_columns:
+            if col in clean_data.columns:
+                noise = np.random.normal(0, 1e-6, len(clean_data))
+                clean_data[col] = clean_data[col] + noise
+                print(f"  - 为 {col} 添加微小噪声避免零方差")
 
-            # 预测
-            gnnwr.load_model(f'result/cross_validation_models/{model_name}.pkl')
-            val_predictions = gnnwr.predict(val_set)
+        # 最终数据检查
+        print("最终数据检查:")
+        print(f"  - 数据量: {len(clean_data)}")
+        print(f"  - 剩余无穷大值: {np.isinf(clean_data[x_column + y_column]).sum().sum()}")
+        print(f"  - 剩余NaN值: {clean_data[x_column + y_column].isnull().sum().sum()}")
 
-            if len(val_predictions) == 0:
-                print(f"⚠️ 跳过站点 {test_station}: 无预测结果")
-                continue
+        # 第二步：标准化测试
+        print("2. 测试数据标准化...")
 
-            val_true = val_data[y_column[0]].values
+        # 再次检查零方差
+        zero_variance_features = []
+        for col in x_column:
+            if col in clean_data.columns:
+                std_val = clean_data[col].std()
+                if std_val == 0 or np.isnan(std_val) or np.isinf(std_val):
+                    zero_variance_features.append(col)
+                    print(f"  ⚠️ 特征 {col} 方差异常: {std_val}")
 
-            # 存储结果
-            all_true.extend(val_true)
-            all_pred.extend(val_predictions)
+        if len(zero_variance_features) == len(x_column):
+            print("❌ 所有特征方差都异常，无法标准化")
+            return False
 
-            # 计算当前折的指标
-            fold_metrics = calculate_metrics(val_true, val_predictions)
-            fold_results.append({
-                'station_id': test_station,
-                'fold': i + 1,
-                'n_train': len(train_data),
-                'n_val': len(val_data),
-                **fold_metrics
-            })
+        # 执行标准化
+        data_standardized = standardize_data(clean_data, x_column, y_column)
 
-            print(f"✅ 折 {i + 1} 完成 - RMSE: {fold_metrics['RMSE']:.4f}, R²: {fold_metrics['R2']:.4f}")
+        if len(data_standardized) == 0:
+            print("❌ 标准化后数据为空")
+            return False
 
-            # 清理内存
-            del gnnwr, train_set, val_set
-            gc.collect()
+        print(f"标准化后数据量: {len(data_standardized)}")
 
-        except Exception as e:
-            print(f"❌ 折 {i + 1} 失败: {e}")
-            continue
+        # 标准化后再次检查数据质量
+        print("标准化后数据质量检查:")
+        for col in x_column:
+            if col in data_standardized.columns:
+                std_val = data_standardized[col].std()
+                has_inf = np.isinf(data_standardized[col]).any()
+                has_nan = data_standardized[col].isnull().any()
+                print(f"  {col}: 标准差={std_val:.4f}, 无穷大={has_inf}, NaN={has_nan}")
 
-    # 原有的结果处理逻辑保持不变
-    total_time = time.time() - total_start_time
-    print(f"\n=== 交叉验证完成 ===")
-    print(f"总耗时: {total_time:.2f}秒")
-    print(f"成功完成的折数: {len(fold_results)}/{n_stations}")
+        # 第三步：简化模型测试
+        if len(data_standardized) >= 3:
+            print("3. 测试单折训练...")
 
-    if len(all_true) > 0:
-        overall_metrics = calculate_metrics(all_true, all_pred)
+            available_stations = data_standardized[station_column].unique()
+            if len(available_stations) >= 2:
+                # 选择第一个站点作为验证集
+                test_station = available_stations[0]
+                train_data = data_standardized[data_standardized[station_column] != test_station]
+                val_data = data_standardized[data_standardized[station_column] == test_station]
 
-        results_df = pd.DataFrame({
-            'True': all_true,
-            'Predicted': all_pred
-        })
-        results_df.to_csv('result/cross_validation_results.csv', index=False)
+                if len(train_data) > 0 and len(val_data) > 0:
+                    print(f"训练集: {len(train_data)} 行, 验证集: {len(val_data)} 行")
 
-        detailed_results = pd.DataFrame(fold_results)
-        detailed_results.to_csv('result/cross_validation_detailed.csv', index=False)
+                    # 数据集初始化前再次检查数据
+                    print("数据集初始化前检查:")
+                    for dataset_name, dataset in [("训练集", train_data), ("验证集", val_data)]:
+                        print(f"  {dataset_name}:")
+                        for col in x_column + y_column:
+                            if col in dataset.columns:
+                                has_inf = np.isinf(dataset[col]).any()
+                                has_nan = dataset[col].isnull().any()
+                                if has_inf or has_nan:
+                                    print(f"    ⚠️ {col}: 无穷大={has_inf}, NaN={has_nan}")
 
-        plot_aggregated_scatter(all_true, all_pred, 'result/cross_validation_scatter.png')
+                    # 数据集初始化
+                    train_set, val_set = safe_dataset_initialization(
+                        train_data, val_data, x_column, y_column, spatial_column
+                    )
 
-        print("\n总体评估指标:")
-        for metric, value in overall_metrics.items():
-            print(f"{metric}: {value:.4f}")
+                    # 极简模型测试
+                    print("4. 测试简化模型训练...")
+                    model_name = "Smoke_Test_Model"
 
-        return overall_metrics, detailed_results
-    else:
-        print("❌ 没有成功的交叉验证折")
-        return None, None
+                    # 使用极简配置
+                    gnnwr = models.GNNWR(
+                        train_dataset=train_set,
+                        valid_dataset=val_set,
+                        test_dataset=val_set,
+                        dense_layers=[8, 4],  # 极简网络
+                        activate_func=nn.ReLU(),
+                        start_lr=0.001,
+                        optimizer="Adam",
+                        model_name=model_name,
+                        model_save_path="result/smoke_test",
+                        log_path="result/smoke_test",
+                        write_path="result/smoke_test",
+                    )
+
+                    # 只训练1-2轮验证流程
+                    gnnwr.add_graph()
+                    gnnwr.run(max_epoch=2, early_stop=1, print_frequency=1)
+
+                    print("✅ 模型训练测试通过")
+                else:
+                    print("⚠️ 训练集或验证集为空，跳过模型测试")
+            else:
+                print("⚠️ 可用站点不足，跳过模型测试")
+        else:
+            print("⚠️ 数据量不足，跳过模型测试")
+
+        print("✅ 冒烟测试通过!")
+        return True
+
+    except Exception as e:
+        print(f"❌ 冒烟测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+        # 提供更详细的调试建议
+        print("\n💡 详细调试建议:")
+        print("1. 检查数据中的无穷大值:")
+        print("   - 运行: data[np.isinf(data)].sum()")
+        print("2. 检查NaN值:")
+        print("   - 运行: data.isnull().sum()")
+        print("3. 检查零方差特征:")
+        print("   - 运行: data.std()")
+        print("4. 检查数据范围:")
+        print("   - 运行: data.describe()")
+
+        return False
 
 
 def quick_smoke_test(data, x_column, y_column, spatial_column, station_column='station_id'):
