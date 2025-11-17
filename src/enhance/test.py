@@ -413,6 +413,72 @@ def station_level_cross_validation(data, x_column, y_column, spatial_column, sta
         print("❌ 没有成功的交叉验证折")
         return None, None
 
+def quick_smoke_test(data, x_column, y_column, spatial_column, station_column='station_id'):
+    """快速冒烟测试 - 验证整个流程能否跑通"""
+    print("🚀 开始快速冒烟测试...")
+
+    # 使用极小的数据子集
+    test_stations = data[station_column].unique()[:2]  # 只取前2个站点
+    test_data = data[data[station_column].isin(test_stations)].copy()
+
+    print(f"测试数据: {len(test_data)} 行, {len(test_stations)} 个站点")
+
+    try:
+        # 测试数据预处理
+        print("1. 测试数据预处理...")
+        clean_data = robust_data_cleaning(test_data, x_column, y_column, spatial_column, station_column)
+        data_standardized = standardize_data(clean_data, x_column, y_column)
+
+        # 测试单个折的训练
+        print("2. 测试单折训练...")
+        test_station = test_stations[0]
+        train_data = data_standardized[data_standardized[station_column] != test_station]
+        val_data = data_standardized[data_standardized[station_column] == test_station]
+
+        train_set, val_set = safe_dataset_initialization(train_data, val_data, x_column, y_column, spatial_column)
+
+        # 测试简化模型（极短训练）
+        print("3. 测试简化模型...")
+        model_name = "Smoke_Test_Model"
+        gnnwr = models.GNNWR(
+            train_dataset=train_set,
+            valid_dataset=val_set,
+            test_dataset=val_set,
+            dense_layers=[32, 16],  # 简化网络
+            activate_func=nn.ReLU(),
+            start_lr=0.001,
+            optimizer="Adam",
+            model_name=model_name,
+            model_save_path="result/smoke_test",
+            log_path="result/smoke_test",
+            write_path="result/smoke_test",
+        )
+
+        # 极短训练
+        gnnwr.add_graph()
+        gnnwr.run(max_epoch=3, early_stop=2, print_frequency=1)  # 只训练3轮
+
+        # 测试预测和保存
+        print("4. 测试预测和保存...")
+        predictions = gnnwr.predict(val_set)
+        metrics = calculate_metrics(val_data[y_column[0]].values, predictions)
+
+        # 测试结果保存
+        test_results = pd.DataFrame({
+            'True': val_data[y_column[0]].values,
+            'Predicted': predictions
+        })
+        test_results.to_csv('result/smoke_test_results.csv', index=False)
+
+        print("✅ 冒烟测试通过!")
+        print(f"测试指标 - RMSE: {metrics['RMSE']:.4f}, R²: {metrics['R2']:.4f}")
+        return True
+
+    except Exception as e:
+        print(f"❌ 冒烟测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def main():
     """主函数 - 站点级交叉验证版本"""
@@ -449,6 +515,20 @@ def main():
         # 4. 数据清洗
         clean_data = robust_data_cleaning(data, x_column, y_column, spatial_column, station_column)
 
+        print("=== 开始交叉验证流程 ===")
+
+        # 第一步：执行快速冒烟测试
+        print("\n1. 执行快速冒烟测试...")
+        smoke_test_passed = quick_smoke_test(
+            data, x_column, y_column, spatial_column, station_column='station_id'
+        )
+
+        if not smoke_test_passed:
+            print("❌ 冒烟测试失败！请先修复问题再继续")
+            return
+
+        print("✅ 冒烟测试通过，开始完整交叉验证...")
+
         # 5. 执行站点级交叉验证
         overall_metrics, detailed_results = station_level_cross_validation(
             clean_data, x_column, y_column, spatial_column, station_column
@@ -472,6 +552,8 @@ def main():
         print(f"❌ 主程序失败: {e}")
         import traceback
         traceback.print_exc()
+
+
 
 
 def simple_station_cv_version():
