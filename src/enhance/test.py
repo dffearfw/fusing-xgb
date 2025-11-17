@@ -453,8 +453,8 @@ def quick_smoke_test(data, x_column, y_column, spatial_column, station_column='s
         print(f"  - 缺失值数量: {test_data[x_column + y_column].isnull().sum().sum()}")
         print(f"  - 站点样本分布: {test_data[station_column].value_counts().to_dict()}")
 
-        # 调用数据清洗函数，但准备处理可能的空数据
-        clean_data = data_cleaning(test_data, x_column, y_column, spatial_column, station_column)
+        # 调用数据清洗函数（使用正确的函数名）
+        clean_data = robust_data_cleaning(test_data, x_column, y_column, spatial_column, station_column)
 
         # 检查清洗后数据
         if len(clean_data) == 0:
