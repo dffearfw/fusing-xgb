@@ -22,6 +22,424 @@ def monitor_performance(step_name):
     print(f"[性能监控] {step_name} - 内存使用: {memory_usage:.1f}MB, 系统内存: {memory.percent}%")
 
 
+def fix_timestamp_issues(data, x_columns, y_columns):
+    """修复时间戳数据类型问题"""
+    print("🔧 修复时间戳问题...")
+
+    data_fixed = data.copy()
+    updated_x_columns = x_columns.copy()
+
+    for col in x_columns + y_columns:
+        if col in data_fixed.columns:
+            # 检查是否是时间戳类型或字符串类型
+            if data_fixed[col].dtype == 'object' or 'time' in str(col).lower() or 'date' in str(col).lower():
+                try:
+                    # 尝试转换为数值
+                    data_fixed[col] = pd.to_numeric(data_fixed[col], errors='coerce')
+                    print(f"   - 已转换列 {col} 为数值类型")
+                except:
+                    # 如果是时间字符串，转换为时间戳再提取特征
+                    try:
+                        timestamp_col = pd.to_datetime(data_fixed[col], errors='coerce')
+                        if not timestamp_col.isna().all():
+                            # 成功转换为时间戳，提取数值特征
+                            data_fixed[f'{col}_year'] = timestamp_col.dt.year
+                            data_fixed[f'{col}_month'] = timestamp_col.dt.month
+                            data_fixed[f'{col}_day'] = timestamp_col.dt.day
+                            data_fixed[f'{col}_dayofweek'] = timestamp_col.dt.dayofweek
+                            data_fixed[f'{col}_hour'] = timestamp_col.dt.hour
+
+                            # 更新特征列
+                            updated_x_columns.extend([f'{col}_year', f'{col}_month', f'{col}_day',
+                                                      f'{col}_dayofweek', f'{col}_hour'])
+                            print(f"   - 已从时间列 {col} 提取特征")
+
+                            # 移除原始列
+                            if col in updated_x_columns:
+                                updated_x_columns.remove(col)
+                            data_fixed = data_fixed.drop(columns=[col])
+                    except:
+                        print(f"   ⚠️ 无法处理列 {col}，将删除")
+                        if col in updated_x_columns:
+                            updated_x_columns.remove(col)
+                        data_fixed = data_fixed.drop(columns=[col])
+
+    # 确保所有列都是数值类型
+    for col in updated_x_columns + y_columns:
+        if col in data_fixed.columns:
+            data_fixed[col] = pd.to_numeric(data_fixed[col], errors='coerce')
+
+    print(f"   - 修复后特征列数: {len(updated_x_columns)}")
+    return data_fixed, updated_x_columns
+
+
+def create_10_fold_by_station(data, station_column='station_id', random_state=42):
+    """将站点分成10折"""
+    print("🎯 创建10折交叉验证（按站点划分）...")
+
+    # 获取所有唯一站点
+    stations = data[station_column].unique()
+    print(f"   - 总站点数: {len(stations)}")
+
+    # 随机打乱站点
+    np.random.seed(random_state)
+    np.random.shuffle(stations)
+
+    # 分成10折
+    n_folds = 10
+    fold_size = len(stations) // n_folds
+    station_folds = []
+
+    for i in range(n_folds):
+        if i < n_folds - 1:
+            fold_stations = stations[i * fold_size:(i + 1) * fold_size]
+        else:
+            fold_stations = stations[i * fold_size:]  # 最后一折包含剩余站点
+        station_folds.append(fold_stations)
+        print(f"   - 折 {i + 1}: {len(fold_stations)} 个站点")
+
+    return station_folds
+
+
+def run_10_fold_cross_validation(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
+    """运行10折交叉验证"""
+    print("🚀 开始10折交叉验证...")
+
+    # 修复时间戳问题
+    data_fixed, x_columns_fixed = fix_timestamp_issues(data, x_columns, y_columns)
+    print(f"   - 修复后特征列: {x_columns_fixed}")
+    print(f"   - 目标列: {y_columns}")
+
+    # 数据清洗
+    clean_data = robust_data_cleaning(data_fixed, x_columns_fixed, y_columns, spatial_columns, station_column)
+
+    # 创建10折
+    station_folds = create_10_fold_by_station(clean_data, station_column)
+
+    all_true = []
+    all_pred = []
+    all_results = []
+    fold_metrics_list = []
+
+    total_start_time = time.time()
+
+    for fold_idx, val_stations in enumerate(station_folds):
+        print(f"\n=== 折 {fold_idx + 1}/10 ===")
+
+        try:
+            # 训练集：其他9折的站点
+            train_stations = []
+            for i, stations in enumerate(station_folds):
+                if i != fold_idx:
+                    train_stations.extend(stations)
+
+            # 分割数据
+            train_data = clean_data[clean_data[station_column].isin(train_stations)]
+            val_data = clean_data[clean_data[station_column].isin(val_stations)]
+
+            print(f"   - 训练集: {len(train_data)} 样本, {len(train_stations)} 站点")
+            print(f"   - 验证集: {len(val_data)} 样本, {len(val_stations)} 站点")
+
+            if len(train_data) == 0 or len(val_data) == 0:
+                print("⚠️ 训练集或验证集为空，跳过该折")
+                continue
+
+            # 数据标准化
+            data_standardized = standardize_data(pd.concat([train_data, val_data]), x_columns_fixed, y_columns)
+            train_data_std = data_standardized[data_standardized[station_column].isin(train_stations)]
+            val_data_std = data_standardized[data_standardized[station_column].isin(val_stations)]
+
+            # 创建数据集
+            train_set, val_set = safe_dataset_initialization(
+                train_data_std, val_data_std, x_columns_fixed, y_columns, spatial_columns
+            )
+
+            # 配置模型
+            model_name = f"GNNWR_10fold_{fold_idx + 1}"
+            gnnwr = models.GNNWR(
+                train_dataset=train_set,
+                valid_dataset=val_set,
+                test_dataset=val_set,
+                dense_layers=[128, 64],
+                activate_func=nn.ReLU(),
+                start_lr=0.0005,
+                optimizer="Adam",
+                model_name=model_name,
+                model_save_path="result/10fold_cv_models",
+                log_path="result/10fold_cv_logs",
+                write_path="result/10fold_cv_runs",
+                optimizer_params={
+                    "scheduler": "MultiStepLR",
+                    "scheduler_milestones": [20, 40],
+                    "scheduler_gamma": 0.8,
+                }
+            )
+
+            # 创建目录
+            os.makedirs("result/10fold_cv_models", exist_ok=True)
+            os.makedirs("result/10fold_cv_logs", exist_ok=True)
+            os.makedirs("result/10fold_cv_runs", exist_ok=True)
+
+            # 训练模型（减少epoch数）
+            gnnwr.add_graph()
+            gnnwr.run(max_epoch=20, early_stop=8, print_frequency=5)
+
+            # 预测
+            gnnwr.load_model(f'result/10fold_cv_models/{model_name}.pkl')
+            val_predictions = gnnwr.predict(val_set)
+
+            if len(val_predictions) == 0:
+                print(f"⚠️ 无预测结果，跳过该折")
+                continue
+
+            val_true = val_data_std[y_columns[0]].values
+
+            # 存储结果
+            all_true.extend(val_true)
+            all_pred.extend(val_predictions)
+
+            # 计算当前折的指标
+            fold_metrics = calculate_metrics(val_true, val_predictions)
+            fold_results = {
+                'fold': fold_idx + 1,
+                'train_stations': len(train_stations),
+                'val_stations': len(val_stations),
+                'train_samples': len(train_data),
+                'val_samples': len(val_data),
+                **fold_metrics
+            }
+            all_results.append(fold_results)
+            fold_metrics_list.append(fold_metrics)
+
+            print(f"✅ 折 {fold_idx + 1} 完成 - RMSE: {fold_metrics['RMSE']:.4f}, R²: {fold_metrics['R2']:.4f}")
+
+            # 清理内存
+            del gnnwr, train_set, val_set
+            gc.collect()
+
+        except Exception as e:
+            print(f"❌ 折 {fold_idx + 1} 失败: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    # 汇总结果
+    total_time = time.time() - total_start_time
+    print(f"\n=== 10折交叉验证完成 ===")
+    print(f"总耗时: {total_time:.2f}秒")
+    print(f"成功完成的折数: {len(all_results)}/10")
+
+    if len(all_true) > 0:
+        overall_metrics = calculate_metrics(all_true, all_pred)
+
+        # 计算各折平均指标
+        if fold_metrics_list:
+            avg_r2 = np.mean([m['R2'] for m in fold_metrics_list])
+            avg_rmse = np.mean([m['RMSE'] for m in fold_metrics_list])
+            std_r2 = np.std([m['R2'] for m in fold_metrics_list])
+            std_rmse = np.std([m['RMSE'] for m in fold_metrics_list])
+
+            print(f"\n📊 10折交叉验证统计:")
+            print(f"  平均 R²: {avg_r2:.4f} ± {std_r2:.4f}")
+            print(f"  平均 RMSE: {avg_rmse:.4f} ± {std_rmse:.4f}")
+            print(f"  总体 R²: {overall_metrics['R2']:.4f}")
+            print(f"  总体 RMSE: {overall_metrics['RMSE']:.4f}")
+
+        # 保存结果
+        results_df = pd.DataFrame({
+            'True': all_true,
+            'Predicted': all_pred
+        })
+        results_df.to_csv('result/10fold_cv_results.csv', index=False)
+
+        detailed_results = pd.DataFrame(all_results)
+        detailed_results.to_csv('result/10fold_cv_detailed.csv', index=False)
+
+        # 绘制结果图
+        plot_aggregated_scatter(all_true, all_pred, overall_metrics, "result/10fold_cv_results")
+
+        print("\n总体评估指标:")
+        for metric, value in overall_metrics.items():
+            print(f"{metric}: {value:.4f}")
+
+        return overall_metrics, detailed_results
+    else:
+        print("❌ 没有成功的交叉验证折")
+        return None, None
+
+
+def quick_2_fold_test(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
+    """快速2折测试，验证10折交叉验证的可行性"""
+    print("⚡ 快速2折测试...")
+
+    # 修复时间戳
+    data_fixed, x_fixed = fix_timestamp_issues(data, x_columns, y_columns)
+
+    # 数据清洗
+    clean_data = robust_data_cleaning(data_fixed, x_fixed, y_columns, spatial_columns, station_column)
+
+    # 只取前20个站点测试
+    stations = clean_data[station_column].unique()[:20]
+    test_data = clean_data[clean_data[station_column].isin(stations)]
+
+    # 分成2折
+    np.random.shuffle(stations)
+    fold1_stations = stations[:10]
+    fold2_stations = stations[10:]
+
+    results = []
+    all_true = []
+    all_pred = []
+
+    for fold_idx, (train_stations, val_stations) in enumerate(
+            [(fold2_stations, fold1_stations), (fold1_stations, fold2_stations)]):
+        print(f"\n折 {fold_idx + 1}:")
+
+        train_data = test_data[test_data[station_column].isin(train_stations)]
+        val_data = test_data[test_data[station_column].isin(val_stations)]
+
+        if len(train_data) == 0 or len(val_data) == 0:
+            print("⚠️ 训练集或验证集为空，跳过")
+            continue
+
+        print(f"  训练集: {len(train_data)} 样本, {len(train_stations)} 站点")
+        print(f"  验证集: {len(val_data)} 样本, {len(val_stations)} 站点")
+
+        # 数据标准化
+        data_standardized = standardize_data(pd.concat([train_data, val_data]), x_fixed, y_columns)
+        train_data_std = data_standardized[data_standardized[station_column].isin(train_stations)]
+        val_data_std = data_standardized[data_standardized[station_column].isin(val_stations)]
+
+        # 数据集初始化
+        train_set, val_set = safe_dataset_initialization(train_data_std, val_data_std, x_fixed, y_columns,
+                                                         spatial_columns)
+
+        # 简化模型配置
+        model_name = f"quick_test_{fold_idx}"
+        gnnwr = models.GNNWR(
+            train_dataset=train_set,
+            valid_dataset=val_set,
+            test_dataset=val_set,
+            dense_layers=[64, 32],  # 更小的网络
+            start_lr=0.001,
+            optimizer="Adam",
+            model_name=model_name,
+            model_save_path="result/quick_test"
+        )
+
+        # 创建目录
+        os.makedirs("result/quick_test", exist_ok=True)
+
+        # 快速训练
+        gnnwr.add_graph()
+        gnnwr.run(max_epoch=5, early_stop=2, print_frequency=2)
+
+        # 预测
+        gnnwr.load_model(f'result/quick_test/{model_name}.pkl')
+        val_predictions = gnnwr.predict(val_set)
+        val_true = val_data_std[y_columns[0]].values
+
+        if len(val_predictions) > 0:
+            all_true.extend(val_true)
+            all_pred.extend(val_predictions)
+
+            fold_metrics = calculate_metrics(val_true, val_predictions)
+            results.append({
+                'fold': fold_idx + 1,
+                'r2': fold_metrics['R2'],
+                'rmse': fold_metrics['RMSE']
+            })
+
+            print(f"✅ 折 {fold_idx + 1} 完成: R² = {fold_metrics['R2']:.4f}")
+
+        # 清理内存
+        del gnnwr, train_set, val_set
+        gc.collect()
+
+    # 计算总体指标
+    if len(all_true) > 0:
+        overall_metrics = calculate_metrics(all_true, all_pred)
+        print(f"\n快速测试总体结果: R² = {overall_metrics['R2']:.4f}, RMSE = {overall_metrics['RMSE']:.4f}")
+
+    return results
+
+
+# 修改主函数以使用10折交叉验证
+def main():
+    """主函数 - 10折交叉验证版本"""
+    try:
+        # 1. 加载数据
+        print("加载数据...")
+        monitor_performance("程序开始")
+        if not os.path.exists('lu_onehot.xlsx'):
+            raise FileNotFoundError("数据文件 'lu_onehot.xlsx' 不存在")
+
+        data = pd.read_excel('lu_onehot.xlsx')
+        print(f"原始数据: {data.shape}")
+        monitor_performance("数据加载后")
+
+        # 2. 定义特征
+        x_columns = ['aspect', 'slope', 'eastness', 'tpi', 'curvature1', 'curvature2', 'elevation',
+                     'std_slope', 'std_eastness', 'std_tpi', 'std_curvature1', 'std_curvature2',
+                     'std_high', 'std_aspect', 'glsnow', 'cswe', 'snow_depth_snow_depth',
+                     'ERA5温度_ERA5温度', 'era5_swe', 'doy', 'gldas', 'year', 'month', 'scp_start',
+                     'scp_end', 'd1', 'd2', 'X', 'Y', 'Z', 'da', 'db', 'dc', 'dd', 'landuse_11',
+                     'landuse_12', 'landuse_21', 'landuse_22', 'landuse_23', 'landuse_24',
+                     'landuse_31', 'landuse_32', 'landuse_33', 'landuse_41', 'landuse_42',
+                     'landuse_43', 'landuse_46', 'landuse_51', 'landuse_52', 'landuse_53',
+                     'landuse_62', 'landuse_63', 'landuse_64']
+        y_columns = ['swe']
+        spatial_columns = ['X', 'Y']
+        station_column = 'station_id'
+        # 3. 数据调试
+        if not debug_data_issues(data, x_columns, y_columns, spatial_columns, station_column):
+            raise ValueError("数据调试发现问题，请检查数据")
+
+        print("=== 开始10折交叉验证流程 ===")
+
+        # 第一步：执行快速2折测试
+        print("\n1. 执行快速2折测试...")
+        quick_test_results = quick_2_fold_test(
+            data, x_columns, y_columns, spatial_columns, station_column
+        )
+
+        if quick_test_results and len(quick_test_results) > 0:
+            print("✅ 快速测试通过，开始完整10折交叉验证...")
+
+            # 第二步：执行10折交叉验证
+            overall_metrics, detailed_results = run_10_fold_cross_validation(
+                data, x_columns, y_columns, spatial_columns, station_column
+            )
+
+            if overall_metrics is not None:
+                print("\n🎉 10折交叉验证成功完成!")
+                print(f"最终结果保存在: result/10fold_cv_results/")
+
+                # 打印最佳和最差折
+                if detailed_results is not None:
+                    best_fold = detailed_results.loc[detailed_results['R2'].idxmax()]
+                    worst_fold = detailed_results.loc[detailed_results['R2'].idxmin()]
+
+                    print(f"\n最佳预测折: {best_fold['fold']} (R²: {best_fold['R2']:.4f})")
+                    print(f"最差预测折: {worst_fold['fold']} (R²: {worst_fold['R2']:.4f})")
+                    print(
+                        f"验证集大小范围: {detailed_results['val_samples'].min()} - {detailed_results['val_samples'].max()} 样本")
+            else:
+                print("❌ 10折交叉验证失败，回退到简化版本...")
+                simple_station_cv_version()
+        else:
+            print("❌ 快速测试失败！请先修复问题再继续")
+            return
+
+        monitor_performance("程序结束")
+
+    except Exception as e:
+        print(f"❌ 主程序失败: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# 添加缺失的函数（保持原有实现）
 def debug_data_issues(data, x_column, y_column, spatial_column, station_column='station_id'):
     """详细的数据问题调试"""
     print("=== 数据调试信息 ===")
@@ -36,47 +454,11 @@ def debug_data_issues(data, x_column, y_column, spatial_column, station_column='
         return False
 
     print("✅ 所有必需列都存在")
-
-    # 2. 检查站点数量
-    unique_stations = data[station_column].nunique()
-    print(f"站点数量: {unique_stations}")
-
-    # 3. 检查缺失值
-    print("\n=== 缺失值分析 ===")
-    missing_info = data[all_required_columns].isnull().sum()
-    total_missing = missing_info.sum()
-    print(f"总缺失值: {total_missing}")
-
-    if total_missing > 0:
-        print("缺失值详情:")
-        for col, missing_count in missing_info[missing_info > 0].items():
-            print(f"  {col}: {missing_count} 个缺失值 ({missing_count / len(data):.1%})")
-
-    # 4. 检查无穷值
-    print("\n=== 无穷值检查 ===")
-    numeric_cols = data[all_required_columns].select_dtypes(include=[np.number]).columns
-    inf_count = 0
-    for col in numeric_cols:
-        if np.isinf(data[col]).any():
-            inf_count += 1
-            print(f"❌ 列 '{col}' 包含无穷值")
-
-    if inf_count == 0:
-        print("✅ 没有无穷值")
-
-    # 5. 检查每个站点的数据量
-    print("\n=== 站点数据量分布 ===")
-    station_counts = data[station_column].value_counts()
-    print(f"每个站点平均数据量: {station_counts.mean():.1f}")
-    print(f"最小数据量: {station_counts.min()}")
-    print(f"最大数据量: {station_counts.max()}")
-    print(f"数据量少于5条的站点数: {(station_counts < 5).sum()}")
-
     return True
 
 
 def robust_data_cleaning(data, x_column, y_column, spatial_column, station_column):
-    """修复版本的数据清洗 - 添加数值检查"""
+    """修复版本的数据清洗"""
     print("开始数据清洗...")
     clean_data = data.copy()
 
@@ -90,7 +472,6 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
     numeric_columns = clean_data.select_dtypes(include=[np.number]).columns
     for col in numeric_columns:
         if col in clean_data.columns:
-            # 替换无穷大为NaN，这样会被后续的缺失值处理捕获
             clean_data[col] = clean_data[col].replace([np.inf, -np.inf], np.nan)
 
     # 原有的缺失值处理逻辑保持不变
@@ -129,13 +510,11 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
 
 
 def standardize_data(data, x_column, y_column):
-    """数据标准化 - 新增函数"""
+    """数据标准化"""
     print("标准化数据...")
     standardized_data = data.copy()
 
-    # 只对特征列进行标准化，不对目标变量和空间坐标标准化
     from sklearn.preprocessing import StandardScaler
-
     scaler = StandardScaler()
     standardized_data[x_column] = scaler.fit_transform(standardized_data[x_column])
 
@@ -144,7 +523,7 @@ def standardize_data(data, x_column, y_column):
 
 
 def safe_dataset_initialization(train_data, val_data, x_column, y_column, spatial_column):
-    """修复版本的数据集初始化 - 只修复核心问题"""
+    """修复版本的数据集初始化"""
     print("初始化数据集...")
     monitor_performance("数据集初始化前")
 
@@ -216,13 +595,13 @@ def plot_aggregated_scatter(all_true, all_pred, metrics, save_path="result/cross
     plt.scatter(all_true, all_pred, alpha=0.6, s=10)
 
     # 添加1:1线
-    min_val = min(all_true.min(), all_pred.min())
-    max_val = max(all_true.max(), all_pred.max())
+    min_val = min(np.min(all_true), np.min(all_pred))
+    max_val = max(np.max(all_true), np.max(all_pred))
     plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
 
     plt.xlabel('真实值')
     plt.ylabel('预测值')
-    plt.title('站点级交叉验证结果')
+    plt.title('10折交叉验证结果')
     plt.grid(True, alpha=0.3)
 
     # 在右上角添加指标文本
@@ -251,7 +630,7 @@ def plot_aggregated_scatter(all_true, all_pred, metrics, save_path="result/cross
     plt.legend()
     plt.grid(True, alpha=0.3)
 
-    # 残差分布图（新增）
+    # 残差分布图
     plt.subplot(2, 2, 4)
     plt.hist(residuals, bins=50, alpha=0.7, color='green', density=True)
     plt.axvline(x=0, color='r', linestyle='--', linewidth=2)
@@ -261,7 +640,7 @@ def plot_aggregated_scatter(all_true, all_pred, metrics, save_path="result/cross
     plt.grid(True, alpha=0.3)
 
     # 在残差分布图中添加统计信息
-    residual_stats = f"残差统计:\n均值: {residuals.mean():.4f}\n标准差: {residuals.std():.4f}"
+    residual_stats = f"残差统计:\n均值: {np.mean(residuals):.4f}\n标准差: {np.std(residuals):.4f}"
     plt.text(0.95, 0.95, residual_stats, transform=plt.gca().transAxes,
              fontsize=10, verticalalignment='top', horizontalalignment='right',
              bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
@@ -274,433 +653,6 @@ def plot_aggregated_scatter(all_true, all_pred, metrics, save_path="result/cross
     print(f"✅ 散点图已保存至: {save_path}/aggregated_scatter_plot.png")
 
 
-def station_level_cross_validation(data, x_column, y_column, spatial_column, station_column='station_id'):
-    """修复版本的站点级交叉验证 - 最小改动"""
-    print("开始站点级交叉验证...")
-
-    # 原有的预处理逻辑保持不变
-    data = data.copy()
-    numeric_columns = data.select_dtypes(include=[np.number]).columns
-    for col in numeric_columns:
-        if col in data.columns:
-            data[col] = data[col].replace([np.inf, -np.inf], np.nan)
-
-    clean_data = robust_data_cleaning(data, x_column, y_column, spatial_column, station_column)
-    data_standardized = standardize_data(clean_data, x_column, y_column)
-
-    unique_stations = data_standardized[station_column].unique()
-    n_stations = len(unique_stations)
-    print(f"总站点数: {n_stations}")
-
-    all_true = []
-    all_pred = []
-    fold_results = []
-
-    total_start_time = time.time()
-
-    for i, test_station in enumerate(unique_stations):
-        print(f"\n--- 折 {i + 1}/{n_stations}: 验证站点 {test_station} ---")
-
-        try:
-            train_data = data_standardized[data_standardized[station_column] != test_station]
-            val_data = data_standardized[data_standardized[station_column] == test_station]
-
-            if len(val_data) == 0:
-                print(f"⚠️ 跳过站点 {test_station}: 验证集为空")
-                continue
-
-            if len(train_data) < 10:
-                print(f"⚠️ 跳过站点 {test_station}: 训练数据太少 ({len(train_data)} 行)")
-                continue
-
-            print(f"训练集: {len(train_data)} 行, 验证集: {len(val_data)} 行")
-
-            # 关键修复：使用修复后的初始化函数
-            train_set, val_set = safe_dataset_initialization(
-                train_data, val_data, x_column, y_column, spatial_column
-            )
-
-            # 原有的模型配置保持不变
-            model_name = f"GNNWR_Fold_{i + 1}"
-            gnnwr = models.GNNWR(
-                train_dataset=train_set,
-                valid_dataset=val_set,
-                test_dataset=val_set,
-                dense_layers=[128, 64],
-                activate_func=nn.ReLU(),
-                start_lr=0.0005,
-                optimizer="Adam",
-                model_name=model_name,
-                model_save_path="result/cross_validation_models",
-                log_path="result/cross_validation_logs",
-                write_path="result/cross_validation_runs",
-                optimizer_params={
-                    "scheduler": "MultiStepLR",
-                    "scheduler_milestones": [50, 100],
-                    "scheduler_gamma": 0.8,
-                }
-            )
-
-            # 创建目录
-            os.makedirs("result/cross_validation_models", exist_ok=True)
-            os.makedirs("result/cross_validation_logs", exist_ok=True)
-            os.makedirs("result/cross_validation_runs", exist_ok=True)
-
-            # 训练模型
-            gnnwr.add_graph()
-            gnnwr.run(max_epoch=30, early_stop=15, print_frequency=10)
-
-            # 预测
-            gnnwr.load_model(f'result/cross_validation_models/{model_name}.pkl')
-            val_predictions = gnnwr.predict(val_set)
-
-            if len(val_predictions) == 0:
-                print(f"⚠️ 跳过站点 {test_station}: 无预测结果")
-                continue
-
-            val_true = val_data[y_column[0]].values
-
-            # 存储结果
-            all_true.extend(val_true)
-            all_pred.extend(val_predictions)
-
-            # 计算当前折的指标
-            fold_metrics = calculate_metrics(val_true, val_predictions)
-            fold_results.append({
-                'station_id': test_station,
-                'fold': i + 1,
-                'n_train': len(train_data),
-                'n_val': len(val_data),
-                **fold_metrics
-            })
-
-            print(f"✅ 折 {i + 1} 完成 - RMSE: {fold_metrics['RMSE']:.4f}, R²: {fold_metrics['R2']:.4f}")
-
-            # 清理内存
-            del gnnwr, train_set, val_set
-            gc.collect()
-
-        except Exception as e:
-            print(f"❌ 折 {i + 1} 失败: {e}")
-            continue
-
-    # 原有的结果处理逻辑保持不变
-    total_time = time.time() - total_start_time
-    print(f"\n=== 交叉验证完成 ===")
-    print(f"总耗时: {total_time:.2f}秒")
-    print(f"成功完成的折数: {len(fold_results)}/{n_stations}")
-
-    if len(all_true) > 0:
-        overall_metrics = calculate_metrics(all_true, all_pred)
-
-        results_df = pd.DataFrame({
-            'True': all_true,
-            'Predicted': all_pred
-        })
-        results_df.to_csv('result/cross_validation_results.csv', index=False)
-
-        detailed_results = pd.DataFrame(fold_results)
-        detailed_results.to_csv('result/cross_validation_detailed.csv', index=False)
-
-        plot_aggregated_scatter(all_true, all_pred, 'result/cross_validation_scatter.png')
-
-        print("\n总体评估指标:")
-        for metric, value in overall_metrics.items():
-            print(f"{metric}: {value:.4f}")
-
-        return overall_metrics, detailed_results
-    else:
-        print("❌ 没有成功的交叉验证折")
-        return None, None
-
-
-def quick_smoke_test(data, x_column, y_column, spatial_column, station_column='station_id'):
-    """快速冒烟测试 - 修复无穷大和NaN值问题"""
-    print("🚀 开始快速冒烟测试...")
-
-    # 数据诊断信息
-    print("数据诊断:")
-    print(f"  总数据量: {len(data)}")
-    print(f"  站点数: {data[station_column].nunique()}")
-    print(f"  特征数: {len(x_column)}")
-    print(f"  目标变量: {y_column}")
-
-    # 检查关键列是否存在
-    required_columns = x_column + y_column + spatial_column + [station_column]
-    missing_columns = [col for col in required_columns if col not in data.columns]
-    if missing_columns:
-        print(f"❌ 缺少必要列: {missing_columns}")
-        return False
-
-    try:
-        # 第一步：数据预处理测试
-        print("1. 数据预处理和清理...")
-        clean_data = data.copy()
-
-        # 详细检查数据问题
-        print("数据问题检查:")
-
-        # 检查无穷大值
-        inf_columns = []
-        for col in x_column + y_column:
-            if col in clean_data.columns:
-                has_inf = np.isinf(clean_data[col]).any()
-                if has_inf:
-                    inf_columns.append(col)
-                    print(f"  ⚠️ {col}: 包含无穷大值")
-
-        # 检查NaN值
-        nan_counts = clean_data[x_column + y_column].isnull().sum()
-        nan_columns = nan_counts[nan_counts > 0].index.tolist()
-        for col in nan_columns:
-            print(f"  ⚠️ {col}: {nan_counts[col]} 个NaN值")
-
-        # 检查零方差特征
-        zero_var_columns = []
-        for col in x_column:
-            if col in clean_data.columns:
-                if clean_data[col].std() == 0:
-                    zero_var_columns.append(col)
-                    print(f"  ⚠️ {col}: 方差为零")
-
-        # 修复数据问题
-        print("修复数据问题...")
-
-        # 1. 删除关键列的缺失值
-        critical_columns = y_column + spatial_column + [station_column]
-        initial_count = len(clean_data)
-        clean_data = clean_data.dropna(subset=critical_columns)
-        print(f"  - 删除关键列缺失值: {len(clean_data)} 行 (删除了 {initial_count - len(clean_data)} 行)")
-
-        if len(clean_data) == 0:
-            print("❌ 删除关键列缺失值后数据为空")
-            return False
-
-        # 2. 处理无穷大值 - 用列的最大值/最小值替换
-        for col in inf_columns:
-            if col in clean_data.columns:
-                col_data = clean_data[col]
-                # 替换正无穷为最大值，负无穷为最小值
-                max_val = col_data[np.isfinite(col_data)].max()
-                min_val = col_data[np.isfinite(col_data)].min()
-
-                clean_data[col] = col_data.replace([np.inf], max_val)
-                clean_data[col] = clean_data[col].replace([-np.inf], min_val)
-                print(f"  - 修复 {col} 的无穷大值")
-
-        # 3. 处理特征列的NaN值
-        for col in x_column:
-            if col in clean_data.columns and clean_data[col].isnull().any():
-                # 使用中位数填充，避免异常值影响
-                median_val = clean_data[col].median()
-                clean_data[col] = clean_data[col].fillna(median_val)
-                print(f"  - 用中位数填充 {col} 的NaN值: {median_val:.4f}")
-
-        # 4. 处理零方差特征 - 添加微小噪声
-        for col in zero_var_columns:
-            if col in clean_data.columns:
-                noise = np.random.normal(0, 1e-6, len(clean_data))
-                clean_data[col] = clean_data[col] + noise
-                print(f"  - 为 {col} 添加微小噪声避免零方差")
-
-        # 最终数据检查
-        print("最终数据检查:")
-        print(f"  - 数据量: {len(clean_data)}")
-        print(f"  - 剩余无穷大值: {np.isinf(clean_data[x_column + y_column]).sum().sum()}")
-        print(f"  - 剩余NaN值: {clean_data[x_column + y_column].isnull().sum().sum()}")
-
-        # 第二步：标准化测试
-        print("2. 测试数据标准化...")
-
-        # 再次检查零方差
-        zero_variance_features = []
-        for col in x_column:
-            if col in clean_data.columns:
-                std_val = clean_data[col].std()
-                if std_val == 0 or np.isnan(std_val) or np.isinf(std_val):
-                    zero_variance_features.append(col)
-                    print(f"  ⚠️ 特征 {col} 方差异常: {std_val}")
-
-        if len(zero_variance_features) == len(x_column):
-            print("❌ 所有特征方差都异常，无法标准化")
-            return False
-
-        # 执行标准化
-        data_standardized = standardize_data(clean_data, x_column, y_column)
-
-        if len(data_standardized) == 0:
-            print("❌ 标准化后数据为空")
-            return False
-
-        print(f"标准化后数据量: {len(data_standardized)}")
-
-        # 标准化后再次检查数据质量
-        print("标准化后数据质量检查:")
-        for col in x_column:
-            if col in data_standardized.columns:
-                std_val = data_standardized[col].std()
-                has_inf = np.isinf(data_standardized[col]).any()
-                has_nan = data_standardized[col].isnull().any()
-                print(f"  {col}: 标准差={std_val:.4f}, 无穷大={has_inf}, NaN={has_nan}")
-
-        # 第三步：简化模型测试
-        if len(data_standardized) >= 3:
-            print("3. 测试单折训练...")
-
-            available_stations = data_standardized[station_column].unique()
-            if len(available_stations) >= 2:
-                # 选择第一个站点作为验证集
-                test_station = available_stations[0]
-                train_data = data_standardized[data_standardized[station_column] != test_station]
-                val_data = data_standardized[data_standardized[station_column] == test_station]
-
-                if len(train_data) > 0 and len(val_data) > 0:
-                    print(f"训练集: {len(train_data)} 行, 验证集: {len(val_data)} 行")
-
-                    # 数据集初始化前再次检查数据
-                    print("数据集初始化前检查:")
-                    for dataset_name, dataset in [("训练集", train_data), ("验证集", val_data)]:
-                        print(f"  {dataset_name}:")
-                        for col in x_column + y_column:
-                            if col in dataset.columns:
-                                has_inf = np.isinf(dataset[col]).any()
-                                has_nan = dataset[col].isnull().any()
-                                if has_inf or has_nan:
-                                    print(f"    ⚠️ {col}: 无穷大={has_inf}, NaN={has_nan}")
-
-                    # 数据集初始化
-                    train_set, val_set = safe_dataset_initialization(
-                        train_data, val_data, x_column, y_column, spatial_column
-                    )
-
-                    # 极简模型测试
-                    print("4. 测试简化模型训练...")
-                    model_name = "Smoke_Test_Model"
-
-                    # 使用极简配置
-                    gnnwr = models.GNNWR(
-                        train_dataset=train_set,
-                        valid_dataset=val_set,
-                        test_dataset=val_set,
-                        dense_layers=[8, 4],  # 极简网络
-                        activate_func=nn.ReLU(),
-                        start_lr=0.001,
-                        optimizer="Adam",
-                        model_name=model_name,
-                        model_save_path="result/smoke_test",
-                        log_path="result/smoke_test",
-                        write_path="result/smoke_test",
-                    )
-
-                    # 只训练1-2轮验证流程
-                    gnnwr.add_graph()
-                    gnnwr.run(max_epoch=2, early_stop=1, print_frequency=1)
-
-                    print("✅ 模型训练测试通过")
-                else:
-                    print("⚠️ 训练集或验证集为空，跳过模型测试")
-            else:
-                print("⚠️ 可用站点不足，跳过模型测试")
-        else:
-            print("⚠️ 数据量不足，跳过模型测试")
-
-        print("✅ 冒烟测试通过!")
-        return True
-
-    except Exception as e:
-        print(f"❌ 冒烟测试失败: {e}")
-        import traceback
-        traceback.print_exc()
-
-        # 提供更详细的调试建议
-        print("\n💡 详细调试建议:")
-        print("1. 检查数据中的无穷大值:")
-        print("   - 运行: data[np.isinf(data)].sum()")
-        print("2. 检查NaN值:")
-        print("   - 运行: data.isnull().sum()")
-        print("3. 检查零方差特征:")
-        print("   - 运行: data.std()")
-        print("4. 检查数据范围:")
-        print("   - 运行: data.describe()")
-
-        return False
-
-def main():
-    """主函数 - 站点级交叉验证版本"""
-    try:
-        # 1. 加载数据
-        print("加载数据...")
-        monitor_performance("程序开始")
-        if not os.path.exists('lu_onehot.xlsx'):
-            raise FileNotFoundError("数据文件 'lu_onehot.xlsx' 不存在")
-
-        data = pd.read_excel('lu_onehot.xlsx')
-        print(f"原始数据: {data.shape}")
-        monitor_performance("数据加载后")
-
-
-        # 2. 定义特征
-        x_column = ['aspect', 'slope', 'eastness', 'tpi', 'curvature1', 'curvature2', 'elevation',
-                    'std_slope', 'std_eastness', 'std_tpi', 'std_curvature1', 'std_curvature2',
-                    'std_high', 'std_aspect', 'glsnow', 'cswe', 'snow_depth_snow_depth',
-                    'ERA5温度_ERA5温度', 'era5_swe', 'doy', 'gldas', 'year', 'month', 'scp_start',
-                    'scp_end', 'd1', 'd2', 'X', 'Y', 'Z', 'da', 'db', 'dc', 'dd', 'landuse_11',
-                    'landuse_12', 'landuse_21', 'landuse_22', 'landuse_23', 'landuse_24',
-                    'landuse_31', 'landuse_32', 'landuse_33', 'landuse_41', 'landuse_42',
-                    'landuse_43', 'landuse_46', 'landuse_51', 'landuse_52', 'landuse_53',
-                    'landuse_62', 'landuse_63', 'landuse_64']
-        y_column = ['swe']
-        spatial_column = ['X', 'Y']
-        station_column = 'station_id'
-
-        # 3. 数据调试
-        if not debug_data_issues(data, x_column, y_column, spatial_column, station_column):
-            raise ValueError("数据调试发现问题，请检查数据")
-
-        # 4. 数据清洗
-        clean_data = robust_data_cleaning(data, x_column, y_column, spatial_column, station_column)
-
-        print("=== 开始交叉验证流程 ===")
-
-        # 第一步：执行快速冒烟测试
-        print("\n1. 执行快速冒烟测试...")
-        smoke_test_passed = quick_smoke_test(
-            data, x_column, y_column, spatial_column, station_column='station_id'
-        )
-
-        if not smoke_test_passed:
-            print("❌ 冒烟测试失败！请先修复问题再继续")
-            return
-
-        print("✅ 冒烟测试通过，开始完整交叉验证...")
-
-        # 5. 执行站点级交叉验证
-        overall_metrics, detailed_results = station_level_cross_validation(
-            clean_data, x_column, y_column, spatial_column, station_column
-        )
-
-        if overall_metrics is not None:
-            print("\n🎉 站点级交叉验证成功完成!")
-            print(f"最终结果保存在: result/cross_validation_results/")
-
-            # 打印最佳和最差站点
-            if detailed_results is not None:
-                best_station = detailed_results.loc[detailed_results['R2'].idxmax()]
-                worst_station = detailed_results.loc[detailed_results['R2'].idxmin()]
-
-                print(f"\n最佳预测站点: {best_station['station_id']} (R²: {best_station['R2']:.4f})")
-                print(f"最差预测站点: {worst_station['station_id']} (R²: {worst_station['R2']:.4f})")
-
-        monitor_performance("程序结束")
-
-    except Exception as e:
-        print(f"❌ 主程序失败: {e}")
-        import traceback
-        traceback.print_exc()
-
-
-
-
 def simple_station_cv_version():
     """简化版本的站点级交叉验证"""
     try:
@@ -711,14 +663,17 @@ def simple_station_cv_version():
         print(f"原始数据: {data.shape}")
 
         # 2. 定义特征（简化版）
-        x_column = ['elevation', 'slope', 'aspect', 'X', 'Y', 'doy', 'year', 'month']
-        y_column = ['swe']
-        spatial_column = ['X', 'Y']
+        x_columns = ['elevation', 'slope', 'aspect', 'X', 'Y', 'doy', 'year', 'month']
+        y_columns = ['swe']
+        spatial_columns = ['X', 'Y']
         station_column = 'station_id'
 
-        # 3. 简化数据清洗
-        clean_data = data.copy()
-        clean_data = clean_data.dropna(subset=x_column + y_column + [station_column])
+        # 3. 修复时间戳问题
+        data_fixed, x_columns_fixed = fix_timestamp_issues(data, x_columns, y_columns)
+
+        # 4. 简化数据清洗
+        clean_data = data_fixed.copy()
+        clean_data = clean_data.dropna(subset=x_columns_fixed + y_columns + [station_column])
 
         # 移除数据量过少的站点
         station_counts = clean_data[station_column].value_counts()
@@ -728,7 +683,7 @@ def simple_station_cv_version():
         print(f"简化清洗后数据: {clean_data.shape}")
         print(f"可用站点数: {clean_data[station_column].nunique()}")
 
-        # 4. 执行简化的交叉验证（只运行前10个站点作为测试）
+        # 5. 执行简化的交叉验证（只运行前10个站点作为测试）
         unique_stations = clean_data[station_column].unique()[:10]
         print(f"测试运行前 {len(unique_stations)} 个站点...")
 
@@ -746,14 +701,20 @@ def simple_station_cv_version():
                 if len(train_data) == 0 or len(val_data) == 0:
                     continue
 
+                # 数据标准化
+                data_standardized = standardize_data(pd.concat([train_data, val_data]), x_columns_fixed, y_columns)
+                train_data_std = data_standardized[
+                    data_standardized[station_column].isin(train_data[station_column].unique())]
+                val_data_std = data_standardized[data_standardized[station_column].isin([test_station])]
+
                 # 初始化数据集
                 train_set, val_set, _ = datasets.init_dataset_split(
-                    train_data=train_data,
-                    val_data=val_data,
-                    test_data=val_data,
-                    x_column=x_column,
-                    y_column=y_column,
-                    spatial_column=spatial_column,
+                    train_data=train_data_std,
+                    val_data=val_data_std,
+                    test_data=val_data_std,
+                    x_column=x_columns_fixed,
+                    y_column=y_columns,
+                    spatial_column=spatial_columns,
                     batch_size=32,  # 更小的batch size
                     use_model="gnnwr"
                 )
@@ -784,7 +745,7 @@ def simple_station_cv_version():
                 # 预测
                 gnnwr.load_model(f'result/simple_cv_models/{model_name}.pkl')
                 val_predictions = gnnwr.predict(val_set)
-                val_true = val_data[y_column[0]].values
+                val_true = val_data_std[y_columns[0]].values
 
                 all_true.extend(val_true)
                 all_pred.extend(val_predictions)
@@ -819,12 +780,11 @@ def simple_station_cv_version():
 
 
 if __name__ == "__main__":
-    # 先尝试完整版本
+    # 先尝试10折交叉验证版本
     try:
         main()
     except Exception as e:
-        print(f"完整版本失败: {e}")
+        print(f"10折交叉验证版本失败: {e}")
         print("\n尝试简化版本...")
-        # 如果完整版本失败，尝试简化版本
+        # 如果10折版本失败，尝试简化版本
         simple_station_cv_version()
-
