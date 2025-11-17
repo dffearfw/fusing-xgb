@@ -434,7 +434,7 @@ def quick_smoke_test(data, x_column, y_column, spatial_column, station_column='s
 
     # 选择更多的测试站点确保有足够数据
     all_stations = data[station_column].unique()
-    test_stations = all_stations[:min(5, len(all_stations))]  # 最多5个站点
+    test_stations = all_stations[:min(10, len(all_stations))]  # 最多5个站点
     test_data = data[data[station_column].isin(test_stations)].copy()
 
     print(f"测试数据: {len(test_data)} 行, {len(test_stations)} 个站点")
