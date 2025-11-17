@@ -86,12 +86,14 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
 
     print("各列缺失率:")
     for col in all_columns:
-        rate = missing_rates[col]
+        # 确保获取的是标量值
+        rate = float(missing_rates[col])  # 转换为float确保是标量
         print(f"  {col}: {rate:.2%}")
 
-    # 修复：直接使用缺失率数值进行比较
+    # 修复缺失值处理逻辑
     for col in all_columns:
-        rate = missing_rates[col]  # 这已经是一个标量值
+        # 确保获取标量值
+        rate = float(missing_rates[col])
 
         if rate > 0 and rate < 0.3:  # 缺失率低于30%
             if col in ['elevation', 'slope', 'aspect', 'X', 'Y']:  # 数值型特征
@@ -99,7 +101,6 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
                 if not pd.isna(median_val):
                     clean_data[col].fillna(median_val, inplace=True)
                 else:
-                    # 如果中位数也是NaN，使用0填充
                     clean_data[col].fillna(0, inplace=True)
             elif col in ['doy', 'year', 'month']:  # 时间特征
                 mode_vals = clean_data[col].mode()
@@ -140,8 +141,8 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
     print("\n特征值范围:")
     for col in x_column + y_column:
         if col in clean_data.columns:
-            min_val = clean_data[col].min()
-            max_val = clean_data[col].max()
+            min_val = float(clean_data[col].min())  # 确保是标量
+            max_val = float(clean_data[col].max())  # 确保是标量
             print(f"  {col}: [{min_val:.4f}, {max_val:.4f}]")
 
     print(f"清洗后数据: {clean_data.shape}")
