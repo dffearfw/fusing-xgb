@@ -128,6 +128,20 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
     return clean_data
 
 
+def standardize_data(data, x_column, y_column):
+    """数据标准化 - 新增函数"""
+    print("标准化数据...")
+    standardized_data = data.copy()
+
+    # 只对特征列进行标准化，不对目标变量和空间坐标标准化
+    from sklearn.preprocessing import StandardScaler
+
+    scaler = StandardScaler()
+    standardized_data[x_column] = scaler.fit_transform(standardized_data[x_column])
+
+    print("数据标准化完成")
+    return standardized_data
+
 def safe_dataset_initialization(train_data, val_data, x_column, y_column, spatial_column):
     """安全的数据集初始化 - 最小改动版本"""
     print("初始化数据集...")
