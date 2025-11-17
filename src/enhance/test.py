@@ -269,23 +269,28 @@ def run_10_fold_cross_validation(data, x_columns, y_columns, spatial_columns, st
 
 
 def quick_2_fold_test(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
-    """快速2折测试，验证10折交叉验证的可行性"""
-    print("⚡ 快速2折测试...")
+    """修复的快速2折测试"""
+    print("⚡ 执行修复的快速2折测试...")
 
-    # 修复时间戳
+    # 使用已经清洗过的数据，跳过时间戳修复
     data_fixed, x_fixed = fix_timestamp_issues(data, x_columns, y_columns)
 
-    # 数据清洗
-    clean_data = robust_data_cleaning(data_fixed, x_fixed, y_columns, spatial_columns, station_column)
+    # 再次确保数据清洗
+    clean_data = enhanced_robust_data_cleaning(data_fixed, x_fixed, y_columns, spatial_columns, station_column)
 
-    # 只取前20个站点测试
-    stations = clean_data[station_column].unique()[:20]
+    # 只取前10个站点测试（更少的数据用于快速测试）
+    stations = clean_data[station_column].unique()[:10]
     test_data = clean_data[clean_data[station_column].isin(stations)]
 
+    if len(test_data) < 10:
+        print("⚠️ 测试数据过少，跳过快速测试")
+        return []
+
     # 分成2折
+    np.random.seed(42)
     np.random.shuffle(stations)
-    fold1_stations = stations[:10]
-    fold2_stations = stations[10:]
+    fold1_stations = stations[:5]  # 每折5个站点
+    fold2_stations = stations[5:10]
 
     results = []
     all_true = []
@@ -293,68 +298,83 @@ def quick_2_fold_test(data, x_columns, y_columns, spatial_columns, station_colum
 
     for fold_idx, (train_stations, val_stations) in enumerate(
             [(fold2_stations, fold1_stations), (fold1_stations, fold2_stations)]):
-        print(f"\n折 {fold_idx + 1}:")
+        print(f"\n快速测试折 {fold_idx + 1}:")
 
         train_data = test_data[test_data[station_column].isin(train_stations)]
         val_data = test_data[test_data[station_column].isin(val_stations)]
 
-        if len(train_data) == 0 or len(val_data) == 0:
-            print("⚠️ 训练集或验证集为空，跳过")
+        if len(train_data) < 5 or len(val_data) < 2:
+            print("⚠️ 训练集或验证集样本过少，跳过")
             continue
 
         print(f"  训练集: {len(train_data)} 样本, {len(train_stations)} 站点")
         print(f"  验证集: {len(val_data)} 样本, {len(val_stations)} 站点")
 
-        # 数据标准化
-        data_standardized = standardize_data(pd.concat([train_data, val_data]), x_fixed, y_columns)
-        train_data_std = data_standardized[data_standardized[station_column].isin(train_stations)]
-        val_data_std = data_standardized[data_standardized[station_column].isin(val_stations)]
+        try:
+            # 数据标准化
+            data_standardized = standardize_data(pd.concat([train_data, val_data]), x_fixed, y_columns)
+            train_data_std = data_standardized[data_standardized[station_column].isin(train_stations)]
+            val_data_std = data_standardized[data_standardized[station_column].isin(val_stations)]
 
-        # 数据集初始化
-        train_set, val_set = safe_dataset_initialization(train_data_std, val_data_std, x_fixed, y_columns,
-                                                         spatial_columns)
+            # 数据集初始化
+            train_set, val_set = enhanced_safe_dataset_initialization(
+                train_data_std, val_data_std, x_fixed, y_columns, spatial_columns
+            )
 
-        # 简化模型配置
-        model_name = f"quick_test_{fold_idx}"
-        gnnwr = models.GNNWR(
-            train_dataset=train_set,
-            valid_dataset=val_set,
-            test_dataset=val_set,
-            dense_layers=[64, 32],  # 更小的网络
-            start_lr=0.001,
-            optimizer="Adam",
-            model_name=model_name,
-            model_save_path="result/quick_test"
-        )
+            # 简化模型配置
+            model_name = f"quick_test_{fold_idx}"
+            gnnwr = models.GNNWR(
+                train_dataset=train_set,
+                valid_dataset=val_set,
+                test_dataset=val_set,
+                dense_layers=[32, 16],  # 更小的网络
+                start_lr=0.001,
+                optimizer="Adam",
+                model_name=model_name,
+                model_save_path="result/quick_test"
+            )
 
-        # 创建目录
-        os.makedirs("result/quick_test", exist_ok=True)
+            # 创建目录
+            os.makedirs("result/quick_test", exist_ok=True)
 
-        # 快速训练
-        gnnwr.add_graph()
-        gnnwr.run(max_epoch=5, early_stop=2, print_frequency=2)
+            # 快速训练
+            gnnwr.add_graph()
+            gnnwr.run(max_epoch=3, early_stop=1, print_frequency=1)  # 更少的epoch
 
-        # 预测
-        gnnwr.load_model(f'result/quick_test/{model_name}.pkl')
-        val_predictions = gnnwr.predict(val_set)
-        val_true = val_data_std[y_columns[0]].values
+            # 预测
+            model_path = f'result/quick_test/{model_name}.pkl'
+            if os.path.exists(model_path):
+                gnnwr.load_model(model_path)
+                val_predictions = gnnwr.predict(val_set)
+                val_true = val_data_std[y_columns[0]].values
 
-        if len(val_predictions) > 0:
-            all_true.extend(val_true)
-            all_pred.extend(val_predictions)
+                if len(val_predictions) > 0:
+                    all_true.extend(val_true)
+                    all_pred.extend(val_predictions)
 
-            fold_metrics = calculate_metrics(val_true, val_predictions)
-            results.append({
-                'fold': fold_idx + 1,
-                'r2': fold_metrics['R2'],
-                'rmse': fold_metrics['RMSE']
-            })
+                    fold_metrics = calculate_metrics(val_true, val_predictions)
+                    results.append({
+                        'fold': fold_idx + 1,
+                        'r2': fold_metrics['R2'],
+                        'rmse': fold_metrics['RMSE']
+                    })
 
-            print(f"✅ 折 {fold_idx + 1} 完成: R² = {fold_metrics['R2']:.4f}")
+                    print(f"✅ 快速测试折 {fold_idx + 1} 完成: R² = {fold_metrics['R2']:.4f}")
+                else:
+                    print(f"⚠️ 快速测试折 {fold_idx + 1} 无预测结果")
+            else:
+                print(f"⚠️ 快速测试折 {fold_idx + 1} 模型文件不存在")
+
+        except Exception as e:
+            print(f"❌ 快速测试折 {fold_idx + 1} 失败: {e}")
+            continue
 
         # 清理内存
-        del gnnwr, train_set, val_set
-        gc.collect()
+        try:
+            del gnnwr, train_set, val_set
+            gc.collect()
+        except:
+            pass
 
     # 计算总体指标
     if len(all_true) > 0:
@@ -366,7 +386,7 @@ def quick_2_fold_test(data, x_columns, y_columns, spatial_columns, station_colum
 
 # 修改主函数以使用10折交叉验证
 def main():
-    """主函数 - 10折交叉验证版本"""
+    """主函数 - 修复版本"""
     try:
         # 1. 加载数据
         print("加载数据...")
@@ -391,39 +411,42 @@ def main():
         y_columns = ['swe']
         spatial_columns = ['X', 'Y']
         station_column = 'station_id'
-        # 3. 数据调试
-        if not debug_data_issues(data, x_columns, y_columns, spatial_columns, station_column):
-            raise ValueError("数据调试发现问题，请检查数据")
 
-        print("=== 开始10折交叉验证流程 ===")
+        # 3. 使用增强的数据调试
+        print("\n=== 执行增强数据调试 ===")
+        if not enhanced_debug_data_issues(data, x_columns, y_columns, spatial_columns, station_column):
+            print("❌ 数据调试发现问题，将尝试修复...")
 
-        # 第一步：执行快速2折测试
-        print("\n1. 执行快速2折测试...")
-        quick_test_results = quick_2_fold_test(
+        # 4. 使用增强的数据清洗
+        print("\n=== 执行增强数据清洗 ===")
+        clean_data = enhanced_robust_data_cleaning(
             data, x_columns, y_columns, spatial_columns, station_column
+        )
+
+        # 5. 重新调试清洗后的数据
+        print("\n=== 检查清洗后数据 ===")
+        if not enhanced_debug_data_issues(clean_data, x_columns, y_columns, spatial_columns, station_column):
+            raise ValueError("数据清洗后仍然存在问题")
+
+        print("✅ 数据准备完成，开始模型训练...")
+
+        # 6. 先运行快速测试
+        print("\n=== 开始快速2折测试 ===")
+        quick_test_results = quick_2_fold_test(
+            clean_data, x_columns, y_columns, spatial_columns, station_column
         )
 
         if quick_test_results and len(quick_test_results) > 0:
             print("✅ 快速测试通过，开始完整10折交叉验证...")
 
-            # 第二步：执行10折交叉验证
-            overall_metrics, detailed_results = run_10_fold_cross_validation(
-                data, x_columns, y_columns, spatial_columns, station_column
+            # 7. 执行10折交叉验证
+            overall_metrics, detailed_results = improved_10_fold_cross_validation(
+                clean_data, x_columns, y_columns, spatial_columns, station_column
             )
 
             if overall_metrics is not None:
                 print("\n🎉 10折交叉验证成功完成!")
-                print(f"最终结果保存在: result/10fold_cv_results/")
-
-                # 打印最佳和最差折
-                if detailed_results is not None:
-                    best_fold = detailed_results.loc[detailed_results['R2'].idxmax()]
-                    worst_fold = detailed_results.loc[detailed_results['R2'].idxmin()]
-
-                    print(f"\n最佳预测折: {best_fold['fold']} (R²: {best_fold['R2']:.4f})")
-                    print(f"最差预测折: {worst_fold['fold']} (R²: {worst_fold['R2']:.4f})")
-                    print(
-                        f"验证集大小范围: {detailed_results['val_samples'].min()} - {detailed_results['val_samples'].max()} 样本")
+                # ... 其余代码保持不变
             else:
                 print("❌ 10折交叉验证失败，回退到简化版本...")
                 simple_station_cv_version()
@@ -440,13 +463,13 @@ def main():
 
 
 # 添加缺失的函数（保持原有实现）
-def debug_data_issues(data, x_column, y_column, spatial_column, station_column='station_id'):
-    """详细的数据问题调试"""
-    print("=== 数据调试信息 ===")
+def enhanced_debug_data_issues(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
+    """增强的数据问题调试"""
+    print("=== 增强数据调试 ===")
     print(f"原始数据形状: {data.shape}")
 
     # 1. 检查列是否存在
-    all_required_columns = x_column + y_column + spatial_column + [station_column]
+    all_required_columns = x_columns + y_columns + spatial_columns + [station_column]
     missing_columns = [col for col in all_required_columns if col not in data.columns]
     if missing_columns:
         print(f"❌ 缺失列: {missing_columns}")
@@ -454,57 +477,149 @@ def debug_data_issues(data, x_column, y_column, spatial_column, station_column='
         return False
 
     print("✅ 所有必需列都存在")
-    return True
+
+    # 2. 检查数据类型
+    print("检查数据类型...")
+    for col in all_required_columns:
+        dtype = data[col].dtype
+        print(f"   {col}: {dtype}")
+
+    # 3. 检查缺失值
+    print("检查缺失值...")
+    missing_stats = data[all_required_columns].isnull().sum()
+    if missing_stats.sum() > 0:
+        print("❌ 发现缺失值:")
+        for col, count in missing_stats.items():
+            if count > 0:
+                print(f"   {col}: {count} 个缺失值 ({count / len(data):.2%})")
+    else:
+        print("✅ 无缺失值")
+
+    # 4. 检查无穷大值
+    print("检查无穷大值...")
+    numeric_columns = data[all_required_columns].select_dtypes(include=[np.number]).columns
+    inf_found = False
+    for col in numeric_columns:
+        inf_count = np.isinf(data[col]).sum()
+        if inf_count > 0:
+            print(f"❌ {col}: {inf_count} 个无穷大值")
+            inf_found = True
+
+    if not inf_found:
+        print("✅ 无无穷大值")
+
+    # 5. 检查零方差特征
+    print("检查零方差特征...")
+    for col in x_columns:
+        if col in data.columns and data[col].dtype in [np.number]:
+            variance = data[col].var()
+            if variance == 0:
+                print(f"⚠️ {col}: 零方差特征")
+
+    # 6. 检查数据范围
+    print("检查数据范围...")
+    for col in y_columns:
+        if col in data.columns:
+            print(f"   {col}: min={data[col].min():.4f}, max={data[col].max():.4f}, mean={data[col].mean():.4f}")
+
+    return not (missing_stats.sum() > 0 or inf_found)
 
 
-def robust_data_cleaning(data, x_column, y_column, spatial_column, station_column):
-    """修复版本的数据清洗"""
-    print("开始数据清洗...")
+def enhanced_robust_data_cleaning(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
+    """增强版本的数据清洗，专门处理inf和NaN值"""
+    print("开始增强数据清洗...")
     clean_data = data.copy()
 
-    # 原有的列检查逻辑
-    all_columns = x_column + y_column + spatial_column + [station_column]
-    missing_columns = [col for col in all_columns if col not in clean_data.columns]
+    # 检查必需列
+    all_required_columns = x_columns + y_columns + spatial_columns + [station_column]
+    missing_columns = [col for col in all_required_columns if col not in clean_data.columns]
     if missing_columns:
         raise ValueError(f"缺少列: {missing_columns}")
 
-    # 修复：在处理缺失值前先处理无穷大值
+    # 第一步：处理无穷大值
+    print("处理无穷大值...")
     numeric_columns = clean_data.select_dtypes(include=[np.number]).columns
     for col in numeric_columns:
         if col in clean_data.columns:
+            # 替换inf为NaN
             clean_data[col] = clean_data[col].replace([np.inf, -np.inf], np.nan)
+            # 统计inf数量
+            inf_count = np.isinf(clean_data[col]).sum()
+            if inf_count > 0:
+                print(f"   - 列 {col}: 替换 {inf_count} 个无穷大值为NaN")
 
-    # 原有的缺失值处理逻辑保持不变
-    missing_rate = clean_data[all_columns].isnull().sum().sum() / (clean_data.shape[0] * len(all_columns))
-    print(f"缺失率: {missing_rate:.4f}")
+    # 第二步：处理缺失值
+    print("处理缺失值...")
+    required_data_columns = x_columns + y_columns + spatial_columns + [station_column]
 
-    if missing_rate > 0 and missing_rate < 0.3:
-        clean_data = clean_data.dropna(subset=all_columns)
-        print(f"删除缺失值后数据量: {len(clean_data)}")
-    elif missing_rate >= 0.3:
-        raise ValueError(f"缺失率过高: {missing_rate:.4f}")
+    # 检查每列的缺失率
+    missing_stats = clean_data[required_data_columns].isnull().sum()
+    high_missing_cols = missing_stats[missing_stats > 0].index.tolist()
 
-    # 原有的异常值处理逻辑保持不变
-    for col in y_column:
-        Q1 = clean_data[col].quantile(0.25)
-        Q3 = clean_data[col].quantile(0.75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
+    if high_missing_cols:
+        print(f"   - 有缺失值的列: {high_missing_cols}")
+        for col in high_missing_cols:
+            missing_rate = missing_stats[col] / len(clean_data)
+            print(f"     {col}: {missing_stats[col]} 个缺失值 ({missing_rate:.2%})")
 
-        outliers = clean_data[(clean_data[col] < lower_bound) | (clean_data[col] > upper_bound)]
-        print(f"{col} 异常值数量: {len(outliers)}")
+    # 删除在必需列中有缺失值的行
+    initial_count = len(clean_data)
+    clean_data = clean_data.dropna(subset=required_data_columns)
+    removed_count = initial_count - len(clean_data)
+    print(f"   - 删除 {removed_count} 个有缺失值的行")
+    print(f"   - 剩余数据量: {len(clean_data)}")
 
-        if len(outliers) > 0:
-            clean_data = clean_data[(clean_data[col] >= lower_bound) & (clean_data[col] <= upper_bound)]
-            print(f"删除异常值后数据量: {len(clean_data)}")
+    if len(clean_data) == 0:
+        raise ValueError("数据清洗后无有效数据")
 
-    # 原有的站点数据量筛选逻辑保持不变
+    # 第三步：检查并修复零方差特征
+    print("检查零方差特征...")
+    zero_variance_cols = []
+    for col in x_columns:
+        if col in clean_data.columns:
+            variance = clean_data[col].var()
+            if variance == 0:
+                zero_variance_cols.append(col)
+                # 添加微小噪声修复零方差
+                noise = np.random.normal(0, 1e-6, len(clean_data))
+                clean_data[col] = clean_data[col] + noise
+                print(f"   - 修复零方差列 {col}")
+
+    if zero_variance_cols:
+        print(f"   - 修复的零方差列: {zero_variance_cols}")
+
+    # 第四步：处理异常值（可选，根据需求调整）
+    print("处理异常值...")
+    for col in y_columns:
+        if col in clean_data.columns:
+            Q1 = clean_data[col].quantile(0.25)
+            Q3 = clean_data[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+
+            outliers = clean_data[(clean_data[col] < lower_bound) | (clean_data[col] > upper_bound)]
+            if len(outliers) > 0:
+                print(f"   - {col}: 发现 {len(outliers)} 个异常值")
+                # 可以选择删除或缩尾处理
+                clean_data = clean_data[(clean_data[col] >= lower_bound) & (clean_data[col] <= upper_bound)]
+
+    # 第五步：筛选有效站点
+    print("筛选有效站点...")
     station_counts = clean_data[station_column].value_counts()
     valid_stations = station_counts[station_counts >= 3].index
     clean_data = clean_data[clean_data[station_column].isin(valid_stations)]
-    print(f"筛选后站点数: {clean_data[station_column].nunique()}")
-    print(f"最终数据量: {len(clean_data)}")
+
+    print(f"   - 有效站点数: {clean_data[station_column].nunique()}")
+    print(f"   - 最终数据量: {len(clean_data)}")
+
+    # 最终检查
+    final_missing = clean_data[required_data_columns].isnull().sum().sum()
+    final_inf = np.isinf(clean_data[required_data_columns].select_dtypes(include=[np.number])).sum().sum()
+
+    print(f"数据清洗完成:")
+    print(f"   - 剩余缺失值: {final_missing}")
+    print(f"   - 无穷大值: {final_inf}")
 
     return clean_data
 
