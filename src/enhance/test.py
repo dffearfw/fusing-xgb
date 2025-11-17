@@ -81,42 +81,54 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
     clean_data = data.copy()
 
     # 1. 检查缺失值
-    missing_rates = clean_data[x_column + y_column + spatial_column + [station_column]].isnull().mean()
+    all_columns = x_column + y_column + spatial_column + [station_column]
+    missing_rates = clean_data[all_columns].isnull().mean()
 
     print("各列缺失率:")
-    for col, rate in missing_rates.items():
+    for col in all_columns:
+        rate = missing_rates[col]
         print(f"  {col}: {rate:.2%}")
 
-    # 修复这里：使用 .item() 或直接比较
-    for col in x_column + y_column + spatial_column + [station_column]:
-        missing_rate = missing_rates[col]
-        # 如果缺失率是 Series，取第一个值；如果是标量，直接使用
-        if hasattr(missing_rate, 'item'):
-            missing_rate = missing_rate.item()
+    # 修复：直接使用缺失率数值进行比较
+    for col in all_columns:
+        rate = missing_rates[col]  # 这已经是一个标量值
 
-        if missing_rate > 0 and missing_rate < 0.3:  # 缺失率低于30%
+        if rate > 0 and rate < 0.3:  # 缺失率低于30%
             if col in ['elevation', 'slope', 'aspect', 'X', 'Y']:  # 数值型特征
-                clean_data[col].fillna(clean_data[col].median(), inplace=True)
+                median_val = clean_data[col].median()
+                if not pd.isna(median_val):
+                    clean_data[col].fillna(median_val, inplace=True)
+                else:
+                    # 如果中位数也是NaN，使用0填充
+                    clean_data[col].fillna(0, inplace=True)
             elif col in ['doy', 'year', 'month']:  # 时间特征
-                clean_data[col].fillna(clean_data[col].mode()[0] if len(clean_data[col].mode()) > 0 else 0,
-                                       inplace=True)
+                mode_vals = clean_data[col].mode()
+                if len(mode_vals) > 0 and not pd.isna(mode_vals.iloc[0]):
+                    clean_data[col].fillna(mode_vals.iloc[0], inplace=True)
+                else:
+                    clean_data[col].fillna(0, inplace=True)
             else:  # 其他特征
-                clean_data[col].fillna(clean_data[col].median(), inplace=True)
-        elif missing_rate >= 0.3:  # 缺失率过高
-            print(f"⚠️ 列 {col} 缺失率过高 ({missing_rate:.2%})，考虑删除")
+                median_val = clean_data[col].median()
+                if not pd.isna(median_val):
+                    clean_data[col].fillna(median_val, inplace=True)
+                else:
+                    clean_data[col].fillna(0, inplace=True)
+        elif rate >= 0.3:  # 缺失率过高
+            print(f"⚠️ 列 {col} 缺失率过高 ({rate:.2%})，考虑删除")
 
     # 2. 移除仍有缺失值的行
     initial_rows = len(clean_data)
-    clean_data = clean_data.dropna(subset=x_column + y_column + spatial_column + [station_column])
+    clean_data = clean_data.dropna(subset=all_columns)
     removed_rows = initial_rows - len(clean_data)
     print(f"移除 {removed_rows} 个仍有缺失值的行")
 
     # 3. 检查并处理无穷大值
     numeric_columns = clean_data[x_column + y_column].select_dtypes(include=[np.number]).columns
-    inf_mask = np.isinf(clean_data[numeric_columns]).any(axis=1)
-    if inf_mask.any():
-        print(f"移除 {inf_mask.sum()} 个包含无穷大值的行")
-        clean_data = clean_data[~inf_mask]
+    if len(numeric_columns) > 0:
+        inf_mask = np.isinf(clean_data[numeric_columns]).any(axis=1)
+        if inf_mask.any():
+            print(f"移除 {inf_mask.sum()} 个包含无穷大值的行")
+            clean_data = clean_data[~inf_mask]
 
     # 4. 检查站点数据量
     station_counts = clean_data[station_column].value_counts()
