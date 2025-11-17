@@ -80,22 +80,31 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
     print("开始数据清洗...")
     clean_data = data.copy()
 
-    # 1. 检查缺失值
+    # 所有需要的列
     all_columns = x_column + y_column + spatial_column + [station_column]
-    missing_rates = clean_data[all_columns].isnull().mean()
 
+    # 1. 检查缺失值 - 使用安全的方式
     print("各列缺失率:")
+    missing_info = {}
     for col in all_columns:
-        # 确保获取的是标量值
-        rate = float(missing_rates[col])  # 转换为float确保是标量
-        print(f"  {col}: {rate:.2%}")
+        if col in clean_data.columns:
+            missing_count = clean_data[col].isnull().sum()
+            total_count = len(clean_data)
+            missing_rate = missing_count / total_count if total_count > 0 else 0
+            missing_info[col] = missing_rate
+            print(f"  {col}: {missing_rate:.2%}")
+        else:
+            print(f"  {col}: 列不存在")
+            missing_info[col] = 0
 
-    # 修复缺失值处理逻辑
+    # 2. 处理缺失值
     for col in all_columns:
-        # 确保获取标量值
-        rate = float(missing_rates[col])
+        if col not in clean_data.columns:
+            continue
 
-        if rate > 0 and rate < 0.3:  # 缺失率低于30%
+        missing_rate = missing_info[col]
+
+        if missing_rate > 0 and missing_rate < 0.3:  # 缺失率低于30%
             if col in ['elevation', 'slope', 'aspect', 'X', 'Y']:  # 数值型特征
                 median_val = clean_data[col].median()
                 if not pd.isna(median_val):
@@ -114,16 +123,16 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
                     clean_data[col].fillna(median_val, inplace=True)
                 else:
                     clean_data[col].fillna(0, inplace=True)
-        elif rate >= 0.3:  # 缺失率过高
-            print(f"⚠️ 列 {col} 缺失率过高 ({rate:.2%})，考虑删除")
+        elif missing_rate >= 0.3:  # 缺失率过高
+            print(f"⚠️ 列 {col} 缺失率过高 ({missing_rate:.2%})，考虑删除")
 
-    # 2. 移除仍有缺失值的行
+    # 3. 移除仍有缺失值的行
     initial_rows = len(clean_data)
     clean_data = clean_data.dropna(subset=all_columns)
     removed_rows = initial_rows - len(clean_data)
     print(f"移除 {removed_rows} 个仍有缺失值的行")
 
-    # 3. 检查并处理无穷大值
+    # 4. 检查并处理无穷大值
     numeric_columns = clean_data[x_column + y_column].select_dtypes(include=[np.number]).columns
     if len(numeric_columns) > 0:
         inf_mask = np.isinf(clean_data[numeric_columns]).any(axis=1)
@@ -131,19 +140,28 @@ def robust_data_cleaning(data, x_column, y_column, spatial_column, station_colum
             print(f"移除 {inf_mask.sum()} 个包含无穷大值的行")
             clean_data = clean_data[~inf_mask]
 
-    # 4. 检查站点数据量
-    station_counts = clean_data[station_column].value_counts()
-    valid_stations = station_counts[station_counts >= 3].index  # 至少3个样本
-    clean_data = clean_data[clean_data[station_column].isin(valid_stations)]
-    print(f"移除数据量少于3的站点，剩余 {len(valid_stations)} 个站点")
+    # 5. 检查站点数据量
+    if station_column in clean_data.columns:
+        station_counts = clean_data[station_column].value_counts()
+        valid_stations = station_counts[station_counts >= 3].index  # 至少3个样本
+        clean_data = clean_data[clean_data[station_column].isin(valid_stations)]
+        print(f"移除数据量少于3的站点，剩余 {len(valid_stations)} 个站点")
+    else:
+        print(f"⚠️ 站点列 {station_column} 不存在")
 
-    # 5. 检查特征值范围
+    # 6. 检查特征值范围
     print("\n特征值范围:")
     for col in x_column + y_column:
         if col in clean_data.columns:
-            min_val = float(clean_data[col].min())  # 确保是标量
-            max_val = float(clean_data[col].max())  # 确保是标量
-            print(f"  {col}: [{min_val:.4f}, {max_val:.4f}]")
+            min_val = clean_data[col].min()
+            max_val = clean_data[col].max()
+            # 确保是标量值
+            try:
+                min_val_float = float(min_val) if not pd.isna(min_val) else 0
+                max_val_float = float(max_val) if not pd.isna(max_val) else 0
+                print(f"  {col}: [{min_val_float:.4f}, {max_val_float:.4f}]")
+            except (TypeError, ValueError):
+                print(f"  {col}: [无法计算范围]")
 
     print(f"清洗后数据: {clean_data.shape}")
     return clean_data
