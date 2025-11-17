@@ -142,36 +142,49 @@ def standardize_data(data, x_column, y_column):
     print("数据标准化完成")
     return standardized_data
 
+
 def safe_dataset_initialization(train_data, val_data, x_column, y_column, spatial_column):
-    """安全的数据集初始化 - 最小改动版本"""
+    """修复版本的数据集初始化 - 只修复核心问题"""
     print("初始化数据集...")
     monitor_performance("数据集初始化前")
 
-    # 修复：确保传入明确的数据副本
-    train_data_copy = train_data.copy()
-    val_data_copy = val_data.copy()
-
-    # 验证数据集不为空
-    if len(train_data_copy) == 0 or len(val_data_copy) == 0:
-        raise ValueError("训练集或验证集为空")
-
     try:
         start_time = time.time()
-        # 使用副本而不是原始数据
+
+        # 关键修复：在初始化前检查并修复数据
+        train_data_fixed = train_data.copy()
+        val_data_fixed = val_data.copy()
+
+        # 修复零方差问题 - 对每个特征列进行检查
+        for col in x_column:
+            if col in train_data_fixed.columns:
+                # 如果训练集该列方差为零，添加微小噪声
+                if train_data_fixed[col].var() == 0:
+                    print(f"⚠️ 修复零方差列: {col}")
+                    noise = np.random.normal(0, 1e-6, len(train_data_fixed))
+                    train_data_fixed[col] = train_data_fixed[col] + noise
+
+                # 同样修复验证集
+                if col in val_data_fixed.columns and val_data_fixed[col].var() == 0:
+                    noise = np.random.normal(0, 1e-6, len(val_data_fixed))
+                    val_data_fixed[col] = val_data_fixed[col] + noise
+
         train_set, val_set, _ = datasets.init_dataset_split(
-            train_data=train_data_copy,  # 使用副本
-            val_data=val_data_copy,  # 使用副本
-            test_data=val_data_copy,
+            train_data=train_data_fixed,
+            val_data=val_data_fixed,
+            test_data=val_data_fixed,
             x_column=x_column,
             y_column=y_column,
             spatial_column=spatial_column,
             batch_size=64,
             use_model="gnnwr"
         )
+
         init_time = time.time() - start_time
         print(f"✅ 数据集初始化成功 - 耗时: {init_time:.2f}秒")
         monitor_performance("数据集初始化后")
         return train_set, val_set
+
     except Exception as e:
         print(f"❌ 数据集初始化失败: {e}")
         raise
@@ -265,14 +278,13 @@ def station_level_cross_validation(data, x_column, y_column, spatial_column, sta
     """修复版本的站点级交叉验证 - 最小改动"""
     print("开始站点级交叉验证...")
 
-    # 修复：预处理时处理无穷大值
+    # 原有的预处理逻辑保持不变
     data = data.copy()
     numeric_columns = data.select_dtypes(include=[np.number]).columns
     for col in numeric_columns:
         if col in data.columns:
             data[col] = data[col].replace([np.inf, -np.inf], np.nan)
 
-    # 原有的数据清洗流程
     clean_data = robust_data_cleaning(data, x_column, y_column, spatial_column, station_column)
     data_standardized = standardize_data(clean_data, x_column, y_column)
 
@@ -290,35 +302,33 @@ def station_level_cross_validation(data, x_column, y_column, spatial_column, sta
         print(f"\n--- 折 {i + 1}/{n_stations}: 验证站点 {test_station} ---")
 
         try:
-            # 修复：增加数据量检查
             train_data = data_standardized[data_standardized[station_column] != test_station]
             val_data = data_standardized[data_standardized[station_column] == test_station]
 
-            # 关键修复：检查验证集是否为空
             if len(val_data) == 0:
                 print(f"⚠️ 跳过站点 {test_station}: 验证集为空")
                 continue
 
-            if len(train_data) < 10:  # 增加训练集最小样本检查
+            if len(train_data) < 10:
                 print(f"⚠️ 跳过站点 {test_station}: 训练数据太少 ({len(train_data)} 行)")
                 continue
 
             print(f"训练集: {len(train_data)} 行, 验证集: {len(val_data)} 行")
 
-            # 原有的数据集初始化（已修复）
+            # 关键修复：使用修复后的初始化函数
             train_set, val_set = safe_dataset_initialization(
                 train_data, val_data, x_column, y_column, spatial_column
             )
 
-            # 简化模型配置以提高稳定性
+            # 原有的模型配置保持不变
             model_name = f"GNNWR_Fold_{i + 1}"
             gnnwr = models.GNNWR(
                 train_dataset=train_set,
                 valid_dataset=val_set,
                 test_dataset=val_set,
-                dense_layers=[128, 64],  # 简化网络结构
+                dense_layers=[128, 64],
                 activate_func=nn.ReLU(),
-                start_lr=0.0005,  # 降低学习率
+                start_lr=0.0005,
                 optimizer="Adam",
                 model_name=model_name,
                 model_save_path="result/cross_validation_models",
@@ -344,7 +354,6 @@ def station_level_cross_validation(data, x_column, y_column, spatial_column, sta
             gnnwr.load_model(f'result/cross_validation_models/{model_name}.pkl')
             val_predictions = gnnwr.predict(val_set)
 
-            # 修复：检查预测结果是否为空
             if len(val_predictions) == 0:
                 print(f"⚠️ 跳过站点 {test_station}: 无预测结果")
                 continue
@@ -375,27 +384,24 @@ def station_level_cross_validation(data, x_column, y_column, spatial_column, sta
             print(f"❌ 折 {i + 1} 失败: {e}")
             continue
 
+    # 原有的结果处理逻辑保持不变
     total_time = time.time() - total_start_time
     print(f"\n=== 交叉验证完成 ===")
     print(f"总耗时: {total_time:.2f}秒")
     print(f"成功完成的折数: {len(fold_results)}/{n_stations}")
 
-    # 原有的结果处理逻辑
     if len(all_true) > 0:
         overall_metrics = calculate_metrics(all_true, all_pred)
 
-        # 保存结果
         results_df = pd.DataFrame({
             'True': all_true,
             'Predicted': all_pred
         })
         results_df.to_csv('result/cross_validation_results.csv', index=False)
 
-        # 保存详细结果
         detailed_results = pd.DataFrame(fold_results)
         detailed_results.to_csv('result/cross_validation_detailed.csv', index=False)
 
-        # 绘图
         plot_aggregated_scatter(all_true, all_pred, 'result/cross_validation_scatter.png')
 
         print("\n总体评估指标:")
