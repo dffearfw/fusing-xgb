@@ -75,65 +75,64 @@ def debug_data_issues(data, x_column, y_column, spatial_column, station_column='
     return True
 
 
-def robust_data_cleaning(data, x_column, y_column, spatial_column, station_column='station_id'):
+def robust_data_cleaning(data, x_column, y_column, spatial_column, station_column):
     """鲁棒的数据清洗"""
     print("开始数据清洗...")
-    monitor_performance("数据清洗前")
-
-    # 1. 创建数据副本
     clean_data = data.copy()
 
-    # 2. 处理缺失值 - 使用更智能的方法
-    all_columns = x_column + y_column + spatial_column + [station_column]
+    # 1. 检查缺失值
+    missing_rates = clean_data[x_column + y_column + spatial_column + [station_column]].isnull().mean()
 
-    # 检查每列的缺失率
-    missing_rates = clean_data[all_columns].isnull().sum() / len(clean_data)
+    print("各列缺失率:")
+    for col, rate in missing_rates.items():
+        print(f"  {col}: {rate:.2%}")
 
-    # 对低缺失率的列进行填充
-    for col in all_columns:
-        if missing_rates[col] > 0 and missing_rates[col] < 0.3:  # 缺失率低于30%
-            if col in y_column:  # 目标变量严格处理
-                clean_data = clean_data.dropna(subset=[col])
-            else:  # 特征变量可以填充
-                if clean_data[col].dtype in ['float64', 'int64']:
-                    clean_data[col].fillna(clean_data[col].median(), inplace=True)
-                else:
-                    clean_data[col].fillna(clean_data[col].mode()[0] if len(clean_data[col].mode()) > 0 else 0,
-                                           inplace=True)
-        elif missing_rates[col] >= 0.3:  # 高缺失率列
-            print(f"警告: 列 '{col}' 缺失率过高 ({missing_rates[col]:.1%})")
+    # 修复这里：使用 .item() 或直接比较
+    for col in x_column + y_column + spatial_column + [station_column]:
+        missing_rate = missing_rates[col]
+        # 如果缺失率是 Series，取第一个值；如果是标量，直接使用
+        if hasattr(missing_rate, 'item'):
+            missing_rate = missing_rate.item()
 
-    # 3. 处理无穷值
-    numeric_cols = clean_data[all_columns].select_dtypes(include=[np.number]).columns
-    for col in numeric_cols:
-        if np.isinf(clean_data[col]).any():
-            # 将无穷值替换为列的最大值/最小值
-            finite_values = clean_data[col][np.isfinite(clean_data[col])]
-            if len(finite_values) > 0:
-                col_max = finite_values.max()
-                col_min = finite_values.min()
-                clean_data[col] = clean_data[col].replace([np.inf], col_max)
-                clean_data[col] = clean_data[col].replace([-np.inf], col_min)
+        if missing_rate > 0 and missing_rate < 0.3:  # 缺失率低于30%
+            if col in ['elevation', 'slope', 'aspect', 'X', 'Y']:  # 数值型特征
+                clean_data[col].fillna(clean_data[col].median(), inplace=True)
+            elif col in ['doy', 'year', 'month']:  # 时间特征
+                clean_data[col].fillna(clean_data[col].mode()[0] if len(clean_data[col].mode()) > 0 else 0,
+                                       inplace=True)
+            else:  # 其他特征
+                clean_data[col].fillna(clean_data[col].median(), inplace=True)
+        elif missing_rate >= 0.3:  # 缺失率过高
+            print(f"⚠️ 列 {col} 缺失率过高 ({missing_rate:.2%})，考虑删除")
 
-    # 4. 移除数据量过少的站点（少于3条记录）
+    # 2. 移除仍有缺失值的行
+    initial_rows = len(clean_data)
+    clean_data = clean_data.dropna(subset=x_column + y_column + spatial_column + [station_column])
+    removed_rows = initial_rows - len(clean_data)
+    print(f"移除 {removed_rows} 个仍有缺失值的行")
+
+    # 3. 检查并处理无穷大值
+    numeric_columns = clean_data[x_column + y_column].select_dtypes(include=[np.number]).columns
+    inf_mask = np.isinf(clean_data[numeric_columns]).any(axis=1)
+    if inf_mask.any():
+        print(f"移除 {inf_mask.sum()} 个包含无穷大值的行")
+        clean_data = clean_data[~inf_mask]
+
+    # 4. 检查站点数据量
     station_counts = clean_data[station_column].value_counts()
-    valid_stations = station_counts[station_counts >= 3].index
+    valid_stations = station_counts[station_counts >= 3].index  # 至少3个样本
     clean_data = clean_data[clean_data[station_column].isin(valid_stations)]
+    print(f"移除数据量少于3的站点，剩余 {len(valid_stations)} 个站点")
 
-    # 5. 最终清理：移除任何剩余的无效值
-    clean_data = clean_data.dropna()
-    for col in numeric_cols:
-        clean_data = clean_data[np.isfinite(clean_data[col])]
+    # 5. 检查特征值范围
+    print("\n特征值范围:")
+    for col in x_column + y_column:
+        if col in clean_data.columns:
+            min_val = clean_data[col].min()
+            max_val = clean_data[col].max()
+            print(f"  {col}: [{min_val:.4f}, {max_val:.4f}]")
 
-    print(f"清洗后数据形状: {clean_data.shape}")
-    print(f"清洗后站点数量: {clean_data[station_column].nunique()}")
-    print(f"数据保留率: {len(clean_data) / len(data):.1%}")
-
-    monitor_performance("数据清洗后")
-
-    if len(clean_data) == 0:
-        raise ValueError("数据清洗后为空，请检查原始数据质量")
-
+    print(f"清洗后数据: {clean_data.shape}")
     return clean_data
 
 
@@ -201,8 +200,14 @@ def plot_aggregated_scatter(all_true, all_pred, metrics, save_path="result/cross
 
     plt.xlabel('真实值')
     plt.ylabel('预测值')
-    plt.title(f'站点级交叉验证结果\nRMSE: {metrics["RMSE"]:.4f}, R²: {metrics["R2"]:.4f}')
+    plt.title('站点级交叉验证结果')
     plt.grid(True, alpha=0.3)
+
+    # 在右上角添加指标文本
+    metrics_text = f"RMSE: {metrics['RMSE']:.4f}\nR²: {metrics['R2']:.4f}\nR: {metrics['R']:.4f}\nMSE: {metrics['MSE']:.4f}"
+    plt.text(0.95, 0.05, metrics_text, transform=plt.gca().transAxes,
+             fontsize=12, verticalalignment='bottom', horizontalalignment='right',
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
     # 残差图
     plt.subplot(2, 2, 2)
@@ -224,12 +229,20 @@ def plot_aggregated_scatter(all_true, all_pred, metrics, save_path="result/cross
     plt.legend()
     plt.grid(True, alpha=0.3)
 
-    # 指标表格
+    # 残差分布图（新增）
     plt.subplot(2, 2, 4)
-    plt.axis('off')
-    metrics_text = f"评估指标:\n\nRMSE: {metrics['RMSE']:.4f}\nMSE: {metrics['MSE']:.4f}\nR: {metrics['R']:.4f}\nR²: {metrics['R2']:.4f}"
-    plt.text(0.1, 0.9, metrics_text, fontsize=12, verticalalignment='top',
-             bbox=dict(boxstyle="round,pad=0.3", facecolor="lightgray"))
+    plt.hist(residuals, bins=50, alpha=0.7, color='green', density=True)
+    plt.axvline(x=0, color='r', linestyle='--', linewidth=2)
+    plt.xlabel('残差')
+    plt.ylabel('密度')
+    plt.title('残差分布')
+    plt.grid(True, alpha=0.3)
+
+    # 在残差分布图中添加统计信息
+    residual_stats = f"残差统计:\n均值: {residuals.mean():.4f}\n标准差: {residuals.std():.4f}"
+    plt.text(0.95, 0.95, residual_stats, transform=plt.gca().transAxes,
+             fontsize=10, verticalalignment='top', horizontalalignment='right',
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
     plt.tight_layout()
     plt.savefig(f"{save_path}/aggregated_scatter_plot.png", dpi=300, bbox_inches='tight')
