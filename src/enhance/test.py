@@ -276,7 +276,7 @@ def quick_2_fold_test(data, x_columns, y_columns, spatial_columns, station_colum
     data_fixed, x_fixed = fix_timestamp_issues(data, x_columns, y_columns)
 
     # 再次确保数据清洗
-    clean_data = enhanced_robust_data_cleaning(data_fixed, x_fixed, y_columns, spatial_columns, station_column)
+    clean_data = robust_data_cleaning(data_fixed, x_fixed, y_columns, spatial_columns, station_column)
 
     # 只取前10个站点测试（更少的数据用于快速测试）
     stations = clean_data[station_column].unique()[:10]
@@ -317,7 +317,7 @@ def quick_2_fold_test(data, x_columns, y_columns, spatial_columns, station_colum
             val_data_std = data_standardized[data_standardized[station_column].isin(val_stations)]
 
             # 数据集初始化
-            train_set, val_set = enhanced_safe_dataset_initialization(
+            train_set, val_set = safe_dataset_initialization(
                 train_data_std, val_data_std, x_fixed, y_columns, spatial_columns
             )
 
@@ -414,18 +414,18 @@ def main():
 
         # 3. 使用增强的数据调试
         print("\n=== 执行增强数据调试 ===")
-        if not enhanced_debug_data_issues(data, x_columns, y_columns, spatial_columns, station_column):
+        if not debug_data_issues(data, x_columns, y_columns, spatial_columns, station_column):
             print("❌ 数据调试发现问题，将尝试修复...")
 
         # 4. 使用增强的数据清洗
         print("\n=== 执行增强数据清洗 ===")
-        clean_data = enhanced_robust_data_cleaning(
+        clean_data = robust_data_cleaning(
             data, x_columns, y_columns, spatial_columns, station_column
         )
 
         # 5. 重新调试清洗后的数据
         print("\n=== 检查清洗后数据 ===")
-        if not enhanced_debug_data_issues(clean_data, x_columns, y_columns, spatial_columns, station_column):
+        if not debug_data_issues(clean_data, x_columns, y_columns, spatial_columns, station_column):
             raise ValueError("数据清洗后仍然存在问题")
 
         print("✅ 数据准备完成，开始模型训练...")
@@ -440,7 +440,7 @@ def main():
             print("✅ 快速测试通过，开始完整10折交叉验证...")
 
             # 7. 执行10折交叉验证
-            overall_metrics, detailed_results = improved_10_fold_cross_validation(
+            overall_metrics, detailed_results = run_10_fold_cross_validation(
                 clean_data, x_columns, y_columns, spatial_columns, station_column
             )
 
@@ -463,7 +463,7 @@ def main():
 
 
 # 添加缺失的函数（保持原有实现）
-def enhanced_debug_data_issues(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
+def debug_data_issues(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
     """增强的数据问题调试"""
     print("=== 增强数据调试 ===")
     print(f"原始数据形状: {data.shape}")
@@ -525,7 +525,7 @@ def enhanced_debug_data_issues(data, x_columns, y_columns, spatial_columns, stat
     return not (missing_stats.sum() > 0 or inf_found)
 
 
-def enhanced_robust_data_cleaning(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
+def robust_data_cleaning(data, x_columns, y_columns, spatial_columns, station_column='station_id'):
     """增强版本的数据清洗，专门处理inf和NaN值"""
     print("开始增强数据清洗...")
     clean_data = data.copy()
@@ -894,12 +894,64 @@ def simple_station_cv_version():
         return None
 
 
+def create_minimal_reproducible_example():
+    """创建最小复现示例"""
+    print("\n=== 创建最小复现示例 ===")
+
+    # 创建有相同坐标的数据
+    coords = np.array([
+        [100.0, 200.0],  # 点1
+        [100.0, 200.0],  # 点2 - 完全相同!
+        [101.0, 201.0],  # 点3
+        [102.0, 202.0]  # 点4
+    ])
+
+    print("坐标数据:")
+    print(coords)
+
+    # 计算距离矩阵
+    from scipy.spatial.distance import cdist
+    dist_matrix = cdist(coords, coords)
+
+    print("\n距离矩阵:")
+    print(dist_matrix)
+
+    print(f"\n零距离位置: {np.where(dist_matrix < 1e-10)}")
+
+    # 模拟GNNWR可能的问题代码
+    print("\n--- 模拟问题场景 ---")
+
+    # 场景1: 直接使用距离的倒数
+    try:
+        inv_dist = 1.0 / dist_matrix
+        print("直接倒数计算成功")
+    except Exception as e:
+        print(f"直接倒数计算失败: {e}")
+
+    # 场景2: 高斯核计算
+    bandwidth = 1.0
+    try:
+        weights = np.exp(-0.5 * (dist_matrix / bandwidth) ** 2)
+        print("高斯权重计算成功")
+    except Exception as e:
+        print(f"高斯权重计算失败: {e}")
+
+    # 场景3: 权重归一化
+    try:
+        row_sums = weights.sum(axis=1)
+        normalized = weights / row_sums[:, np.newaxis]
+        print("权重归一化成功")
+    except Exception as e:
+        print(f"权重归一化失败: {e}")
+
+
 if __name__ == "__main__":
     # 先尝试10折交叉验证版本
+    create_minimal_reproducible_example()
     try:
         main()
     except Exception as e:
         print(f"10折交叉验证版本失败: {e}")
         print("\n尝试简化版本...")
         # 如果10折版本失败，尝试简化版本
-        simple_station_cv_version()
+        # simple_station_cv_version()
