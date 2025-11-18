@@ -11,6 +11,23 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+def setup_memory_optimization():
+    """设置内存优化配置"""
+    import os
+    import torch
+
+    # 限制CPU线程数
+    torch.set_num_threads(4)
+    os.environ['OMP_NUM_THREADS'] = '4'
+    os.environ['MKL_NUM_THREADS'] = '4'
+
+    # PyTorch内存优化
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # 设置更积极的内存管理
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
 def station_based_kfold_cross_validation():
     """基于站点的10折交叉验证"""
     print("=== 基于站点的10折交叉验证 ===")
@@ -113,7 +130,7 @@ def station_based_kfold_cross_validation():
                 x_column=safe_x_columns,
                 y_column=y_column,
                 spatial_column=spatial_column,
-                batch_size=256,
+                batch_size=64,
                 use_model="gnnwr"
             )
 
@@ -276,6 +293,7 @@ def analyze_station_distribution():
 
 if __name__ == "__main__":
     # 首先分析站点分布
+    setup_memory_optimization()
     station_info = analyze_station_distribution()
 
     # 执行基于站点的10折交叉验证
