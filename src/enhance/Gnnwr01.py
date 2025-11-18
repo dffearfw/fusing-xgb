@@ -28,6 +28,23 @@ def setup_memory_optimization():
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
+
+def setup_gpu_optimization():
+    """设置GPU优化配置"""
+    import torch
+
+    if torch.cuda.is_available():
+        # 设置默认设备为GPU
+        torch.set_default_tensor_type(torch.cuda.FloatTensor)
+        # 启用CUDA优化
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+        print(f"使用GPU: {torch.cuda.get_device_name()}")
+    else:
+        print("CUDA不可用，使用CPU")
+
+
+
 def station_based_kfold_cross_validation():
     """基于站点的10折交叉验证"""
     print("=== 基于站点的10折交叉验证 ===")
