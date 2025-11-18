@@ -1,5 +1,9 @@
+import gc
 import os
 import sys
+import traceback
+
+import torch
 from gnnwr import models, datasets, utils
 import pandas as pd
 import torch.nn as nn
@@ -10,44 +14,73 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
+# 保存原始方法
+original_randperm = torch.randperm
 
-def setup_memory_optimization():
-    """设置内存优化配置"""
-    import os
-    import torch
 
-    # 限制CPU线程数
-    torch.set_num_threads(4)
-    os.environ['OMP_NUM_THREADS'] = '4'
-    os.environ['MKL_NUM_THREADS'] = '4'
+def patched_randperm(n, generator=None, out=None, dtype=torch.int64, layout=torch.strided, device=None,
+                     requires_grad=False):
+    """修复设备不匹配的randperm"""
+    if generator is not None:
+        current_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if hasattr(generator, 'device') and generator.device != current_device:
+            # 创建新的生成器
+            generator = torch.Generator(device=current_device)
+            generator.manual_seed(torch.randint(0, 1000000, (1,)).item())
 
-    # PyTorch内存优化
+    return original_randperm(n, generator=generator, out=out, dtype=dtype, layout=layout, device=device,
+                             requires_grad=requires_grad)
+
+
+# 应用补丁
+torch.randperm = patched_randperm
+
+# 立即优化设置
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+torch.cuda.empty_cache()
+
+
+def quick_gpu_fix():
+    """快速GPU修复"""
+    # 设置GPU设备
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+
+    # 清理内存
     if torch.cuda.is_available():
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
-        # 设置更积极的内存管理
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+
+    return device
 
 
-def setup_gpu_optimization():
-    """设置GPU优化配置"""
-    import torch
-
+def setup_device(device_id=0):
+    """设置GPU设备"""
     if torch.cuda.is_available():
-        # 设置默认设备为GPU
-        torch.set_default_tensor_type(torch.cuda.FloatTensor)
-        # 启用CUDA优化
-        torch.backends.cudnn.enabled = True
-        torch.backends.cudnn.benchmark = True
-        print(f"使用GPU: {torch.cuda.get_device_name()}")
+        # 检查可用的GPU数量
+        gpu_count = torch.cuda.device_count()
+        print(f"检测到 {gpu_count} 个GPU")
+
+        # 确保设备ID有效
+        if device_id < gpu_count:
+            device = torch.device(f'cuda:{device_id}')
+            torch.cuda.set_device(device_id)  # 使用整数索引
+            print(f"使用GPU: {torch.cuda.get_device_name(device_id)}")
+        else:
+            device = torch.device('cpu')
+            print(f"设备ID {device_id} 无效，使用CPU")
     else:
+        device = torch.device('cpu')
         print("CUDA不可用，使用CPU")
 
+    return device
 
 
 def station_based_kfold_cross_validation():
-    """基于站点的10折交叉验证"""
-    print("=== 基于站点的10折交叉验证 ===")
+    """基于站点的10折交叉验证 - GPU优化版本"""
+    device = quick_gpu_fix()
+
+    print("=== 基于站点的10折交叉验证 (GPU优化版) ===")
 
     # 读取数据
     data = pd.read_excel('lu_onehot.xlsx')
@@ -138,17 +171,15 @@ def station_based_kfold_cross_validation():
             continue
 
         try:
-            # 创建数据集
+            # 创建数据集（内存优化版本）
             print("创建数据集中...")
-            train_set, val_set, test_set = datasets.init_dataset_split(
+            train_set, val_set, test_set = create_memory_efficient_dataset(
                 train_data=train_data,
                 val_data=val_data,
                 test_data=test_data,
-                x_column=safe_x_columns,
+                safe_x_columns=safe_x_columns,
                 y_column=y_column,
-                spatial_column=spatial_column,
-                batch_size=64,
-                use_model="gnnwr"
+                spatial_column=spatial_column
             )
 
             # 初始化模型
@@ -168,50 +199,65 @@ def station_based_kfold_cross_validation():
                 optimizer_params={}
             )
 
-            # 训练模型
+            # 训练模型（带内存管理）
             print("开始训练...")
-            gnnwr.add_graph()
-            gnnwr.run(max_epoch=300, early_stop=50, print_frequency=50)
+            # gnnwr.add_graph()
 
-            # 评估模型
-            model_path = f'result/station_kfold/fold_{fold + 1}/GNNWR_Station_Fold_{fold + 1}.pkl'
-            if os.path.exists(model_path):
-                print("加载模型进行评估...")
-                gnnwr.load_model(model_path)
-                results = gnnwr.result(return_metrics=True)
+            # 使用安全的GPU训练
+            training_success = safe_gnnwr_training(
+                gnnwr,
+                max_epoch=300,
+                early_stop=50,
+                print_frequency=50
+            )
 
-                # 获取详细预测结果
-                predictions = gnnwr.predict(return_result=True)
-                if predictions is not None:
-                    test_with_pred = test_data.copy()
-                    if hasattr(predictions, 'shape') and len(predictions) == len(test_data):
-                        test_with_pred['predicted_swe'] = predictions
-                        test_with_pred['fold'] = fold + 1
-                        detailed_predictions.append(test_with_pred)
+            if training_success:
+                # 评估模型
+                model_path = f'result/station_kfold/fold_{fold + 1}/GNNWR_Station_Fold_{fold + 1}.pkl'
+                if os.path.exists(model_path):
+                    print("加载模型进行评估...")
+                    gnnwr.load_model(model_path)
+                    results = gnnwr.result(return_metrics=True)
 
-                fold_result = {
-                    'fold': fold + 1,
-                    'train_stations': len(train_stations),
-                    'val_stations': len(val_stations),
-                    'test_stations': len(test_stations),
-                    'train_samples': len(train_data),
-                    'val_samples': len(val_data),
-                    'test_samples': len(test_data),
-                    'metrics': results
-                }
-                fold_results.append(fold_result)
+                    # 获取详细预测结果
+                    predictions = gnnwr.predict(return_result=True)
+                    if predictions is not None:
+                        test_with_pred = test_data.copy()
+                        if hasattr(predictions, 'shape') and len(predictions) == len(test_data):
+                            test_with_pred['predicted_swe'] = predictions
+                            test_with_pred['fold'] = fold + 1
+                            detailed_predictions.append(test_with_pred)
 
-                print(f"✅ 第 {fold + 1} 折完成")
-                print(f"   测试集指标: {results}")
+                    fold_result = {
+                        'fold': fold + 1,
+                        'train_stations': len(train_stations),
+                        'val_stations': len(val_stations),
+                        'test_stations': len(test_stations),
+                        'train_samples': len(train_data),
+                        'val_samples': len(val_data),
+                        'test_samples': len(test_data),
+                        'metrics': results
+                    }
+                    fold_results.append(fold_result)
 
+                    print(f"✅ 第 {fold + 1} 折完成")
+                    print(f"   测试集指标: {results}")
+
+                else:
+                    print(f"❌ 第 {fold + 1} 折模型文件未找到")
             else:
-                print(f"❌ 第 {fold + 1} 折模型文件未找到")
+                print(f"❌ 第 {fold + 1} 折训练失败")
 
         except Exception as e:
             print(f"❌ 第 {fold + 1} 折训练失败: {e}")
-            import traceback
             traceback.print_exc()
             continue
+
+        finally:
+            # 每个折结束后清理内存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
 
     # 汇总结果
     print("\n" + "=" * 80)
@@ -269,6 +315,117 @@ def station_based_kfold_cross_validation():
         return None, None
 
 
+def create_memory_efficient_dataset(train_data, val_data, test_data, safe_x_columns, y_column, spatial_column):
+    """创建内存高效的数据集"""
+    try:
+        # 使用较小的批量大小
+        batch_size = 16
+
+        train_set, val_set, test_set = datasets.init_dataset_split(
+            train_data=train_data,
+            val_data=val_data,
+            test_data=test_data,
+            x_column=safe_x_columns,
+            y_column=y_column,
+            spatial_column=spatial_column,
+            batch_size=batch_size,  # 减少批量大小
+            use_model="gnnwr"
+        )
+
+        print(f"📊 数据集创建完成 - 批量大小: {batch_size}")
+        return train_set, val_set, test_set
+
+    except Exception as e:
+        print(f"❌ 数据集创建失败: {e}")
+        raise
+
+class GPUMemoryManager:
+    """GPU内存管理器"""
+
+    def __init__(self, safety_margin_gb=1.0):
+        self.safety_margin_gb = safety_margin_gb
+
+    def get_available_memory(self):
+        """获取可用GPU内存"""
+        if not torch.cuda.is_available():
+            return 0
+        allocated = torch.cuda.memory_allocated() / 1024 ** 3
+        total = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        return total - allocated - self.safety_margin_gb
+
+    def can_allocate(self, estimated_size_gb):
+        """检查是否可以分配指定大小的内存"""
+        return self.get_available_memory() >= estimated_size_gb
+
+    def optimize_memory(self):
+        """优化内存使用"""
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
+    def handle_oom_error(self, gnnwr_instance, current_batch_size):
+        """处理OOM错误"""
+        print("🔄 处理OOM错误...")
+        self.optimize_memory()
+
+        # 减少批量大小
+        new_batch_size = max(1, current_batch_size // 2)
+        if hasattr(gnnwr_instance, 'batch_size'):
+            gnnwr_instance.batch_size = new_batch_size
+            print(f"🔽 批量大小调整为: {new_batch_size}")
+
+        # 等待内存稳定
+        import time
+        time.sleep(2)
+
+        return new_batch_size
+
+def safe_gnnwr_training(gnnwr_instance, max_epoch=300, early_stop=50, print_frequency=50):
+    """安全的GNNWR训练，带内存管理"""
+    memory_manager = GPUMemoryManager(safety_margin_gb=1.0)
+
+    # 初始内存优化
+    memory_manager.optimize_memory()
+
+    # 设置较小的批量大小
+    current_batch_size = getattr(gnnwr_instance, 'batch_size', 64)
+    if current_batch_size > 16:
+        gnnwr_instance.batch_size = 16
+        print(f"📊 初始批量大小设置为: 16")
+
+    max_retries = 3
+    retry_count = 0
+
+    while retry_count < max_retries:
+        try:
+            # 训练前检查内存
+            if not memory_manager.can_allocate(2.0):  # 预估需要2GB
+                print("⚠️ 内存紧张，清理缓存...")
+                memory_manager.optimize_memory()
+
+            # 训练模型
+            gnnwr_instance.run(max_epoch=max_epoch, early_stop=early_stop, print_frequency=print_frequency)
+            return True
+
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "out of memory" in error_msg.lower():
+                retry_count += 1
+                print(f"💥 OOM错误 (尝试 {retry_count}/{max_retries})")
+
+                if retry_count >= max_retries:
+                    print("❌ 达到最大重试次数，切换到CPU模式")
+                    # return force_cpu_training(gnnwr_instance, max_epoch, early_stop, print_frequency)
+
+                # 处理OOM错误
+                current_batch_size = memory_manager.handle_oom_error(gnnwr_instance, current_batch_size)
+
+            else:
+                print(f"❌ 训练错误: {e}")
+                return False
+
+    return False
+
 def analyze_station_distribution():
     """分析站点数据分布"""
     print("=== 站点数据分布分析 ===")
@@ -310,7 +467,8 @@ def analyze_station_distribution():
 
 if __name__ == "__main__":
     # 首先分析站点分布
-    setup_memory_optimization()
+    device = setup_device(0)
+
     station_info = analyze_station_distribution()
 
     # 执行基于站点的10折交叉验证

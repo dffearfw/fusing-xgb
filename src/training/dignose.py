@@ -136,7 +136,7 @@ def setup_environment():
 
 if __name__ == "__main__":
     # 在导入任何其他模块之前修复
-    lib_path = apply_dll_fix_before_import()
+    # lib_path = apply_dll_fix_before_import()
 
     print("\n=== 现在导入PyTorch ===")
     try:
