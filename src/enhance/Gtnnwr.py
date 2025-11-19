@@ -6,8 +6,12 @@ sys.path.append(os.path.abspath(os.path.join(os.getcwd(), os.pardir)))
 from gnnwr.datasets import init_dataset
 from gnnwr.models import GTNNWR
 
+# 导入我们的可视化模块
+from visualizer import plot_gtnnwr_results, plot_multiple_models_results
+
 os.environ['PYTORCH_UNIFIED'] = '1'
 os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
+
 # ----------------------------------------------------------------------
 data = pd.read_excel('lu_onehot.xlsx')
 
@@ -44,7 +48,7 @@ optimizer_params = {
     "scheduler_gamma":0.8,
 }
 gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [128,64,32]], drop_out=0.4, optimizer='Adadelta', optimizer_params=optimizer_params,
-                write_path = "../demo_result/gtnnwr_runs",  # 这里需要修改
+                write_path = "../demo_result/gtnnwr_runs",
                 model_name="GTNNWR_DSi")
 gtnnwr.add_graph()
 
@@ -52,4 +56,14 @@ gtnnwr.run(400,1000)
 
 gtnnwr.load_model('../demo_result/gtnnwr_models/GTNNWR_DSi.pkl')
 
+# 调用result()来计算诊断结果
 gtnnwr.result()
+
+# 使用可视化模块生成散点图
+print("\n=== 生成可视化结果 ===")
+save_path = "../demo_result/gtnnwr_runs/GTNNWR_DSi_results.png"
+metrics = plot_gtnnwr_results(gtnnwr, save_path=save_path, show_plot=True)
+
+print("\n=== 最终评估指标 ===")
+for key, value in metrics.items():
+    print(f"{key}: {value}")
