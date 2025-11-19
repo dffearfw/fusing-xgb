@@ -14,7 +14,11 @@ os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 
 # ----------------------------------------------------------------------
 # 1. 加载原始数据
-data = pd.read_excel('lu_onehot.xlsx')
+try:
+    data = pd.read_excel('lu_onehot.xlsx')
+except FileNotFoundError:
+    print("错误：找不到文件 'lu_onehot.xlsx'。请检查文件路径。")
+    sys.exit(1)
 
 # 2. 创建一个唯一的站点标识符
 data['station_id'] = data['X'].astype(str) + '_' + data['Y'].astype(str)
@@ -23,70 +27,117 @@ data['station_id'] = data['X'].astype(str) + '_' + data['Y'].astype(str)
 if 'id' not in data.columns:
     data['id'] = np.arange(len(data))
 
-# 4. 获取所有唯一的站点ID并分割
+# 4. 定义所有需要的列名
+# 为了清晰，我们在这里明确定义所有列
+x_columns = [
+    'aspect', 'slope', 'eastness', 'tpi', 'curvature1',
+    'curvature2', 'elevation', 'std_slope',
+    'std_eastness', 'std_tpi', 'std_curvature1',
+    'std_curvature2', 'std_high', 'std_aspect', 'glsnow',
+    'cswe', 'snow_depth_snow_depth',
+    'ERA5温度_ERA5温度', 'era5_swe', 'gldas',
+    'scp_start', 'scp_end', 'd1', 'd2',
+    'Z', 'da', 'db', 'dc', 'dd',
+    'landuse_11', 'landuse_12', 'landuse_21',
+    'landuse_22', 'landuse_23', 'landuse_24',
+    'landuse_31', 'landuse_32', 'landuse_33',
+    'landuse_41', 'landuse_42', 'landuse_43',
+    'landuse_46', 'landuse_51', 'landuse_52',
+    'landuse_53', 'landuse_62', 'landuse_63',
+    'landuse_64'
+]
+y_column = ['swe']
+spatial_columns = ['X', 'Y']
+temporal_columns = ['year', 'month', 'doy']
+id_column = ['id']  # 明确使用列表
+
+# ----------------------------------------------------------------------
+# --- 2. 按站点分割数据（空间独立性分割） ---
+
+# 1. 获取所有唯一的站点ID并分割
 unique_stations = data['station_id'].unique()
-np.random.seed(48)
+np.random.seed(48)  # 使用一个固定的随机种子，确保结果可复现
 np.random.shuffle(unique_stations)
 
 total_stations = len(unique_stations)
 test_ratio = 0.15
 valid_ratio = 0.1
 
+# 2. 计算每个集合的站点数量
 train_stations_count = int(total_stations * (1 - test_ratio - valid_ratio))
 valid_stations_count = int(total_stations * valid_ratio)
 
+# 3. 根据站点ID进行分割
 train_stations = unique_stations[:train_stations_count]
 valid_stations = unique_stations[train_stations_count : train_stations_count + valid_stations_count]
 test_stations = unique_stations[train_stations_count + valid_stations_count:]
 
-# 5. 根据分割的站点ID，创建训练、验证、测试DataFrame
+# 4. 根据分割的站点ID，创建训练、验证、测试DataFrame
 # 使用 .copy() 来避免 pandas 的 SettingWithCopyWarning
 train_data = data[data['station_id'].isin(train_stations)].copy()
 valid_data = data[data['station_id'].isin(valid_stations)].copy()
 test_data = data[data['station_id'].isin(test_stations)].copy()
 
-# 6. 使用 init_dataset_split 来处理已经分割好的数据
+# ----------------------------------------------------------------------
+# --- 3. 调用库函数创建数据集和模型 ---
+
+# 1. 导入必要的库和函数
 from gnnwr.datasets import init_dataset_split, baseDataset, BasicDistance, ManhattanDistance
+from gnnwr.models import GTNNWR
 
-# --- 【核心修复】确保 id_column 是一个列表 ---
-# 确保 id_column 是一个包含正确列名的列表
-# 例如，如果 'id' 是你的ID列，那么就应该是 ['id']
-id_column_for_split = ['id']
-
-train_dataset, val_dataset, test_dataset = init_dataset_split(
-    train_data=train_data,
-    val_data=valid_data,
-    test_data=test_data,
-    x_column=[...], # 填入你实际的x_column列表
-    y_column=['swe'],
-    spatial_column=['X', 'Y'],
-    temp_column=['year', 'month','doy'],
-    id_column=id_column_for_split, # <--- 修正这里
-    # ... 其他参数保持不变
-)
-
-# 7. 添加数据质量检查，以帮助诊断 RuntimeWarning
-print("--- 检查分割后的数据集大小 ---")
-print(f"训练集站点数: {len(train_stations)}, 样本数: {len(train_data)}")
-print(f"验证集站点数: {len(valid_stations)}, 样本数: {len(valid_data)}")
-print(f"测试集站点数: {len(test_stations)}, 样本数: {len(test_data)}")
-
-# 8. 检查每个数据子集的 'swe' 列是否为常数
-# 这可以帮助诊断 RuntimeWarning 的来源
-print("\n--- 检查 'swe' 列的唯一值数量 ---")
-print(f"训练集 'swe' 的唯一值数量: {train_data['swe'].nunique()}")
-print(f"验证集 'swe' 的唯一值数量: {valid_data['swe'].nunique()}")
-print(f"测试集 'swe' 的唯一值数量: {test_data['swe'].nunique()}")
-print("---------------------\n")
-
+# 2. 定义模型参数
+# 注意：这里我们使用显式导入的函数，而不是依赖默认值
 optimizer_params = {
-    "scheduler":"MultiStepLR",
-    "scheduler_milestones":[1000, 2000, 3000, 4000],
-    "scheduler_gamma":0.8,
+    'lr': 0.1,
+    'rho': 0.95,
+    'eps': 1e-8
 }
-gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [128,64,32]], drop_out=0.4, optimizer='Adadelta', optimizer_params=optimizer_params,
-                write_path = "../demo_result/gtnnwr_runs",
-                model_name="GTNNWR_DSi")
+dense_layers = [[3], [128, 64, 32]]  # 网络层结构
+
+# ----------------------------------------------------------------------
+# --- 4. 初始化数据集和模型 ---
+
+# 1. 初始化数据集
+# 使用 try-except 块来捕获任何在初始化过程中可能发生的错误
+try:
+    print("\n--- 正在初始化数据集 ---")
+    train_dataset, val_dataset, test_dataset = init_dataset_split(
+        train_data=train_data,
+        val_data=valid_data,
+        test_data=test_data,
+        x_column=x_columns,
+        y_column=y_column,
+        spatial_column=spatial_columns,
+        temp_column=temporal_columns,
+        id_column=id_column,  # 使用明确定义的列表
+        process_fn="minmax_scale",
+        process_var=["x", "y"],
+        batch_size=64,
+        shuffle=True,
+        use_model="gtnnwr",
+        spatial_fun=BasicDistance,      # 明确传入函数
+        temporal_fun=ManhattanDistance,  # 明确传入函数
+        simple_distance=True,
+        dropna=True
+    )
+    print("数据集初始化成功！")
+    print(f"训练集大小: {len(train_dataset)}")
+    print(f"验证集大小: {len(val_dataset)}")
+    print(f"测试集大小: {len(test_dataset)}")
+
+# 2. 初始化模型
+print("\n--- 正在初始化 GTNNWR 模型 ---")
+gtnnwr = GTNNWR(
+    train_dataset=train_dataset,
+    val_dataset=val_dataset,
+    test_dataset=test_dataset,
+    dense_layers=dense_layers,
+    drop_out=0.4,
+    optimizer='Adadelta',
+    optimizer_params=optimizer_params
+)
+print("GTNNWR 模型初始化成功！")
+
 gtnnwr.add_graph()
 
 gtnnwr.run(400,1000)
