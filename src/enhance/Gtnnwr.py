@@ -5,8 +5,11 @@ import pandas as pd
 import torch
 import warnings
 
+
+
 # 假设 visualizer 模块在 python 路径中
-# from visualizer import plot_gtnnwr_results, plot_multiple_models_results
+from visualizer import plot_gtnnwr_results, plot_multiple_models_results
+
 
 # ----------------------------------------------------------------------
 # --- 1. 加载和准备原始数据 ---
@@ -125,7 +128,7 @@ optimizer_params = {
     'rho': 0.95,
     'eps': 1e-8
 }
-dense_layers = [[3], [128, 64, 32]]  # 网络层结构
+dense_layers = [[3], [512,256,64]]  # 网络层结构
 
 # ----------------------------------------------------------------------
 # --- 5. 初始化数据集和模型 ---
@@ -166,13 +169,37 @@ try:
         dense_layers=dense_layers,
         drop_out=0.4,
         optimizer='Adadelta',
-        optimizer_params=optimizer_params
+        optimizer_params=optimizer_params,
+        log_path='.'
     )
     print("GTNNWR 模型初始化成功！")
 
     gtnnwr.add_graph()
 
-    gtnnwr.run(400, 1000)
+    # 保存原始的 rescale 方法
+    original_rescale = baseDataset.rescale
+
+
+    # 定义一个修复后的新方法
+    def patched_rescale(self, x, y):
+        # 核心修复：检查 y 是否为多列 DataFrame
+        # 如果是，则认为它是不应该被反归一化的系数矩阵。
+        # 为了让调用方 reg_result 的赋值操作不报错，我们返回 None。
+        if isinstance(y, pd.DataFrame) and y.shape[1] > 1:
+            # print("检测到多列DataFrame，跳过反归一化并返回 None 以避免赋值错误。")
+            return x, None
+
+        # 否则（y 是单列 DataFrame/Series 或其他类型），调用原始方法
+        return original_rescale(self, x, y)
+
+
+    # 用我们的新方法替换掉原始方法
+    baseDataset.rescale = patched_rescale
+    print("已应用 gtnnwr 库 rescale 方法的最终修复补丁。")
+
+    # ----------------------------------------------------------------------
+
+    gtnnwr.run(10, 1000)
 
     # 根据之前的分析，这里你可能想用新训练的模型，所以注释掉 load_model
     # gtnnwr.load_model('../demo_result/gtnnwr_models/GTNNWR_DSi.pkl')
@@ -187,8 +214,8 @@ try:
     save_path = "../demo_result/gtnnwr_runs/GTNNWR_DSi_results.png"
 
     # 暂时注释掉可视化，以防 visualizer 模块有问题
-    # metrics = plot_gtnnwr_results(gtnnwr, save_path=save_path, show_plot=True)
-    print("模型训练和评估完成。可视化部分已暂时注释。")
+    metrics = plot_gtnnwr_results(gtnnwr, save_path=save_path, show_plot=True)
+    print("模型训练和评估完成")
 
 except Exception as e:
     # 捕获任何异常，并打印详细的错误信息
