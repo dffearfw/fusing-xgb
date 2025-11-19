@@ -6,7 +6,8 @@ sys.path.append(os.path.abspath(os.path.join(os.getcwd(), os.pardir)))
 from gnnwr.datasets import init_dataset
 from gnnwr.models import GTNNWR
 
-os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+os.environ['PYTORCH_UNIFIED'] = '1'
+os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
 # ----------------------------------------------------------------------
 data = pd.read_excel('lu_onehot.xlsx')
 
@@ -36,18 +37,18 @@ train_dataset, val_dataset, test_dataset = init_dataset(data=data,
                                                         id_column=['id'],
                                                         use_model="gtnnwr",
                                                         sample_seed=48,
-                                                        batch_size=8)
+                                                        batch_size=64)
 optimizer_params = {
     "scheduler":"MultiStepLR",
     "scheduler_milestones":[1000, 2000, 3000, 4000],
     "scheduler_gamma":0.8,
 }
-gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [64,32]], drop_out=0.4, optimizer='Adadelta', optimizer_params=optimizer_params,
+gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [128,64,32]], drop_out=0.4, optimizer='Adadelta', optimizer_params=optimizer_params,
                 write_path = "../demo_result/gtnnwr_runs",  # 这里需要修改
                 model_name="GTNNWR_DSi")
 gtnnwr.add_graph()
 
-gtnnwr.run(15000,1000)
+gtnnwr.run(400,1000)
 
 gtnnwr.load_model('../demo_result/gtnnwr_models/GTNNWR_DSi.pkl')
 
