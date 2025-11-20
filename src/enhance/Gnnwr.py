@@ -32,7 +32,7 @@ train_set, val_set, test_set = datasets.init_dataset_split(
                                             x_column=x_column,
                                             y_column=y_column,
                                             spatial_column=spatial_column,
-                                            batch_size = 1024,
+                                            batch_size = 128,
                                             use_model="gnnwr")
 
 optimizer_params = {

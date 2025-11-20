@@ -13,25 +13,45 @@ data["id"] = np.arange(len(data))
 # 添加混合分割策略
 data['station_id'] = data['X'].astype(str) + '_' + data['Y'].astype(str)
 
-# 第一阶段：站点分割，划出测试集
+# --- 第1步：站点划分 (保证空间完全独立) ---
 unique_stations = data['station_id'].unique()
-np.random.seed(48)
+
 np.random.shuffle(unique_stations)
 
 test_stations = unique_stations[:int(len(unique_stations) * 0.1)]
-remaining_stations = unique_stations[int(len(unique_stations) * 0.1):]
+train_val_stations = unique_stations[int(len(unique_stations) * 0.1):]
 
-test_data = data[data['station_id'].isin(test_stations)].copy()
-remaining_data = data[data['station_id'].isin(remaining_stations)].copy()
+# --- 第2步：为训练/验证集准备数据 ---
+train_val_df = data[data['station_id'].isin(train_val_stations)].copy()
+train_val_df_sorted = train_val_df.sort_values(by=['year', 'month', 'doy'])
 
-# 第二阶段：时间分割，划出训练和验证集
-remaining_data_sorted = remaining_data.sort_values(by=['year', 'month', 'doy'])
-valid_sample_count = int(len(remaining_data_sorted) * 0.15)
-valid_data = remaining_data_sorted.iloc[:valid_sample_count].copy()
-train_data = remaining_data_sorted.iloc[valid_sample_count:].copy()
+# --- 第3步：时间划分 (保证验证集的时间外推能力) ---
+valid_sample_count = int(len(train_val_df_sorted) * 0.15)
+val_data = train_val_df_sorted.iloc[:valid_sample_count].copy() # 最早的数据
+train_data = train_val_df_sorted.iloc[valid_sample_count:].copy() # 最晚的数据
+
+# --- 第4步：为测试集准备数据 (🔥 最终修复：使用与验证集相同的时间窗口) ---
+test_df = data[data['station_id'].isin(test_stations)].copy()
+test_df_sorted = test_df.sort_values(by=['year', 'month', 'doy'])
+
+# 🔥 获取验证集的时间范围
+val_start_time = val_data['year'].min()
+val_end_time = val_data['year'].max()
+
+# 🔥 从测试站点中筛选出与验证集时间窗口相同的数据
+# 这保证了测试集不为空，且时间上不泄露训练集的信息
+test_data = test_df_sorted[
+    (test_df_sorted['year'] >= val_start_time) & (test_df_sorted['year'] <= val_end_time)
+].copy()
+
+# 打印一下数据集大小，确认非空
+print(f"训练集样本数: {len(train_data)}")
+print(f"验证集样本数: {len(val_data)}")
+print(f"测试集样本数: {len(test_data)}") # 这个数现在应该 > 0 了
+
 
 train_dataset, val_dataset, test_dataset = init_dataset_split(train_data=train_data,
-                                                              val_data=valid_data,
+                                                              val_data=val_data,
                                                               test_data=test_data,
                                                               x_column=[
                                                                   'aspect', 'slope', 'eastness', 'tpi', 'curvature1',
@@ -40,18 +60,18 @@ train_dataset, val_dataset, test_dataset = init_dataset_split(train_data=train_d
                                                                   'std_curvature2', 'std_high', 'std_aspect', 'glsnow',
                                                                   'cswe', 'snow_depth_snow_depth',
                                                                   'ERA5温度_ERA5温度', 'era5_swe', 'gldas',
-                                                                  'scp_start', 'scp_end', 'd1', 'd2',
-                                                                  'Z', 'da', 'db', 'dc', 'dd',
+                                                                  'scp_start', 'scp_end',
+                                                                    'd1', 'd2','da', 'db', 'dc', 'dd',
                                                                   'landuse_11', 'landuse_12', 'landuse_21',
                                                                   'landuse_22', 'landuse_23', 'landuse_24',
                                                                   'landuse_31', 'landuse_32', 'landuse_33',
-                                                                  'landuse_41', 'landuse_42', 'landuse_43',
+                                                                  'landuse_41',  'landuse_43',
                                                                   'landuse_46', 'landuse_51', 'landuse_52',
-                                                                  'landuse_53', 'landuse_62', 'landuse_63',
+                                                                  'landuse_53', 'landuse_62',
                                                                   'landuse_64'
                                                               ],
                                                               y_column=['swe'],
-                                                              spatial_column=['X', 'Y'],
+                                                              spatial_column=['X', 'Y','Z'],
                                                               temp_column=['doy','year','month'],
                                                               id_column=['id'],
                                                               use_model="gtnnwr",
@@ -68,7 +88,7 @@ gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [512,256,64]],dr
                 model_name="GTNNWR_Di")
 gtnnwr.add_graph()
 
-gtnnwr.run(10,1000)
+gtnnwr.run(100,1000)
 
 gtnnwr.result()
 save_path = "../demo_result/gtnnwr_runs/GTNNWR_DSi_results.png"
