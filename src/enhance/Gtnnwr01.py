@@ -13,42 +13,71 @@ data["id"] = np.arange(len(data))
 # 添加混合分割策略
 data['station_id'] = data['X'].astype(str) + '_' + data['Y'].astype(str)
 
-# --- 第1步：站点划分 (保证空间完全独立) ---
-unique_stations = data['station_id'].unique()
+# --- 第1步：基于地形特征对站点进行聚类 ---
+# 1.1 选择用于聚类的静态特征
+clustering_features = ['elevation', 'slope', 'aspect', 'tpi']
 
-np.random.shuffle(unique_stations)
+# 1.2 为每个站点计算这些特征的平均值（按站点聚合）
+station_features = data.groupby('station_id')[clustering_features].mean().reset_index()
 
-test_stations = unique_stations[:int(len(unique_stations) * 0.1)]
-train_val_stations = unique_stations[int(len(unique_stations) * 0.1):]
+# 1.3 使用K-Means进行聚类
+n_clusters = 4  # 可以尝试3, 4, 5，这是一个超参数
+kmeans = KMeans(n_clusters=n_clusters, random_state=48, n_init=10)
+station_features['cluster'] = kmeans.fit_predict(station_features[clustering_features])
 
-# --- 第2步：为训练/验证集准备数据 ---
-train_val_df = data[data['station_id'].isin(train_val_stations)].copy()
-train_val_df_sorted = train_val_df.sort_values(by=['year', 'month', 'doy'])
+print(f"站点已聚类为 {n_clusters} 类。")
+print(station_features['cluster'].value_counts())
 
-# --- 第3步：时间划分 (保证验证集的时间外推能力) ---
-valid_sample_count = int(len(train_val_df_sorted) * 0.15)
-val_data = train_val_df_sorted.iloc[:valid_sample_count].copy() # 最早的数据
-train_data = train_val_df_sorted.iloc[valid_sample_count:].copy() # 最晚的数据
+# 1.4 将聚类标签合并回原始数据
+data = pd.merge(data, station_features[['station_id', 'cluster']], on='station_id', how='left')
 
-# --- 第4步：为测试集准备数据 (🔥 最终修复：使用与验证集相同的时间窗口) ---
-test_df = data[data['station_id'].isin(test_stations)].copy()
-test_df_sorted = test_df.sort_values(by=['year', 'month', 'doy'])
+# --- 第2步：在每个簇内进行分层空间采样 ---
+train_stations, val_stations, test_stations = [], [], []
 
-# 🔥 获取验证集的时间范围
+# 对每个簇进行独立的随机采样
+for cluster_id in range(n_clusters):
+    cluster_stations = station_features[station_features['cluster'] == cluster_id]['station_id'].unique()
+    np.random.shuffle(cluster_stations)  # 打乱顺序
+
+    # 按比例划分
+    n = len(cluster_stations)
+    test_set = cluster_stations[:int(n * 0.1)]
+    val_set = cluster_stations[int(n * 0.1):int(n * 0.2)]
+    train_set = cluster_stations[int(n * 0.2):]
+
+    train_stations.extend(train_set)
+    val_stations.extend(val_set)
+    test_stations.extend(test_set)
+
+print(f"\n分层采样后：")
+print(f"训练集站点数: {len(train_stations)}")
+print(f"验证集站点数: {len(val_stations)}")
+print(f"测试集站点数: {len(test_stations)}")
+
+# --- 第3步：根据划分好的站点创建数据集 ---
+train_data_full = data[data['station_id'].isin(train_stations)].copy()
+val_data_full = data[data['station_id'].isin(val_stations)].copy()
+test_data_full = data[data['station_id'].isin(test_stations)].copy()
+
+# --- 第4步：在空间划分的基础上，进行时间划分 ---
+# 训练/验证集：时间划分
+train_val_df_sorted = train_data_full.sort_values(by=['year', 'month', 'doy'])
+val_sample_count = int(len(val_data_full))  # 使用验证集的样本数作为划分标准，保持比例
+val_data = train_val_df_sorted.iloc[:val_sample_count].copy()
+train_data = train_val_df_sorted.iloc[val_sample_count:].copy()
+
+# 测试集：使用与验证集相同的时间窗口，防止泄露
 val_start_time = val_data['year'].min()
 val_end_time = val_data['year'].max()
-
-# 🔥 从测试站点中筛选出与验证集时间窗口相同的数据
-# 这保证了测试集不为空，且时间上不泄露训练集的信息
+test_df_sorted = test_data_full.sort_values(by=['year', 'month', 'doy'])
 test_data = test_df_sorted[
     (test_df_sorted['year'] >= val_start_time) & (test_df_sorted['year'] <= val_end_time)
-].copy()
+    ].copy()
 
-# 打印一下数据集大小，确认非空
+print(f"\n最终数据集样本数：")
 print(f"训练集样本数: {len(train_data)}")
 print(f"验证集样本数: {len(val_data)}")
-print(f"测试集样本数: {len(test_data)}") # 这个数现在应该 > 0 了
-
+print(f"测试集样本数: {len(test_data)}")
 
 train_dataset, val_dataset, test_dataset = init_dataset_split(train_data=train_data,
                                                               val_data=val_data,
