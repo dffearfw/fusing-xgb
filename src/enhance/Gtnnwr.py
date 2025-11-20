@@ -5,7 +5,7 @@ import pandas as pd
 import torch
 import warnings
 
-
+from torch import nn
 
 # 假设 visualizer 模块在 python 路径中
 from visualizer import plot_gtnnwr_results, plot_multiple_models_results
@@ -176,26 +176,106 @@ try:
 
     gtnnwr.add_graph()
 
-    # 保存原始的 rescale 方法
-    original_rescale = baseDataset.rescale
+    original_reg_result = GTNNWR.reg_result
 
 
     # 定义一个修复后的新方法
-    def patched_rescale(self, x, y):
-        # 核心修复：检查 y 是否为多列 DataFrame
-        # 如果是，则认为它是不应该被反归一化的系数矩阵。
-        # 为了让调用方 reg_result 的赋值操作不报错，我们返回 None。
-        if isinstance(y, pd.DataFrame) and y.shape[1] > 1:
-            # print("检测到多列DataFrame，跳过反归一化并返回 None 以避免赋值错误。")
-            return x, None
+    def patched_reg_result(self, filename=None, model_path=None, use_dict=False, only_return=False, map_location=None):
+        """
+        这是修复后的 reg_result 版本。
+        它只对预测列进行反归一化，解决了原始版本的 bug。
+        """
+        # --- 复制原始方法的前半部分逻辑（加载模型、遍历数据集生成 result DataFrame）---
+        if model_path is None:
+            model_path = self._modelSavePath + "/" + self._modelName + ".pkl"
 
-        # 否则（y 是单列 DataFrame/Series 或其他类型），调用原始方法
-        return original_rescale(self, x, y)
+        if use_dict:
+            data = torch.load(model_path, map_location=map_location, weights_only=False)
+            self._model.load_state_dict(data)
+        else:
+            self._model = torch.load(model_path, map_location=map_location, weights_only=False)
+
+        if self._use_gpu:
+            self._model = nn.DataParallel(module=self._model)
+            self._model, self._out = self._model.cuda(), self._out.cuda()
+        else:
+            self._model, self._out = self._model.cpu(), self._out.cpu()
+
+        device = torch.device('cuda') if self._use_gpu else torch.device('cpu')
+        result = torch.tensor([]).to(torch.float32).to(device)
+        train_data_size = valid_data_size = 0
+
+        with torch.no_grad():
+            # ... (这里省略，和原始代码完全一样，直到生成 result DataFrame) ...
+            # calculate the result of train dataset
+            for data, coef, label, data_index in self._train_dataset.dataloader:
+                data, coef, label, data_index = data.to(device), coef.to(device), label.to(device), data_index.to(
+                    device)
+                output = self._out(self._model(data).mul(coef.to(torch.float32)))
+                coefficient = self._model(data).mul(torch.tensor(self._coefficient).to(torch.float32).to(device))
+                output = torch.cat((coefficient, output, data_index), dim=1)
+                result = torch.cat((result, output), 0)
+            train_data_size = len(result)
+            # calculate the result of valid dataset
+            for data, coef, label, data_index in self._valid_dataset.dataloader:
+                data, coef, label, data_index = data.to(device), coef.to(device), label.to(device), data_index.to(
+                    device)
+                output = self._out(self._model(data).mul(coef.to(torch.float32)))
+                coefficient = self._model(data).mul(torch.tensor(self._coefficient).to(torch.float32).to(device))
+                output = torch.cat((coefficient, output, data_index), dim=1)
+                result = torch.cat((result, output), 0)
+            valid_data_size = len(result) - train_data_size
+            # calculate the result of test dataset
+            for data, coef, label, data_index in self._test_dataset.dataloader:
+                data, coef, label, data_index = data.to(device), coef.to(device), label.to(device), data_index.to(
+                    device)
+                output = self._out(self._model(data).mul(coef.to(torch.float32)))
+                coefficient = self._model(data).mul(torch.tensor(self._coefficient).to(torch.float32).to(device))
+                output = torch.cat((coefficient, output, data_index), dim=1)
+                result = torch.cat((result, output), 0)
+
+        result = result.cpu().detach().numpy()
+        columns = list(self._train_dataset.x)
+        for i in range(len(columns)):
+            columns[i] = "coef_" + columns[i]
+        columns.append("bias")
+        columns = columns + ["Pred_" + self._train_dataset.y[0]] + self._train_dataset.id
+        result = pd.DataFrame(result, columns=columns)
+        result[self._train_dataset.id] = result[self._train_dataset.id].astype(np.int32)
+        result["Pred_" + self._train_dataset.y[0]] = result["Pred_" + self._train_dataset.y[0]].astype(np.float32)
+
+        # set dataset belong to postprocess
+        result['dataset_belong'] = np.concatenate([
+            np.full(train_data_size, 'train'),
+            np.full(valid_data_size, 'valid'),
+            np.full(len(result) - train_data_size - valid_data_size, 'test')
+        ])
+
+        # --- 关键修复：只对预测列进行反归一化 ---
+        pred_col_name = "Pred_" + self._train_dataset.y[0]
+        if self._train_dataset.y_scale_info:
+            # 只传递预测列（作为单列DataFrame）给 rescale
+            _, denormalized_pred = self._train_dataset.rescale(None, result[pred_col_name].to_frame())
+            # 将反归一化后的结果（单列DataFrame）赋值给新列
+            result['denormalized_pred_result'] = denormalized_pred.iloc[:, 0]
+        else:
+            result['denormalized_pred_result'] = result[pred_col_name]
+
+        if only_return:
+            return result
+
+        if filename is not None:
+            result.to_csv(filename, index=False)
+        else:
+            warnings.warn(
+                "Warning! The input write file path is not set. Result is returned by function but not saved as file.",
+                RuntimeWarning)
+        return result
 
 
     # 用我们的新方法替换掉原始方法
-    baseDataset.rescale = patched_rescale
-    print("已应用 gtnnwr 库 rescale 方法的最终修复补丁。")
+    GTNNWR.reg_result =  original_reg_result
+    print("已应用基于源码的精准修复补丁。")
 
     # ----------------------------------------------------------------------
 
