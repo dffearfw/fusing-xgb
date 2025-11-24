@@ -10,10 +10,82 @@ from gnnwr.datasets import init_dataset_split
 from gnnwr.models import GTNNWR
 from visualizer import plot_gtnnwr_results, plot_multiple_models_results
 
+# ----------------------------------------------------------------------
+# --- 🔥【封装的修复补丁】修复 gnnwr 库的内部 bug ---
+# ----------------------------------------------------------------------
+def patched_reg_result(self, filename=None, model_path=None, use_dict=False, only_return=False, map_location=None):
+    if model_path is None:
+        model_path = self._modelSavePath + "/" + self._modelName + ".pkl"
+    if use_dict:
+        data = torch.load(model_path, map_location=map_location, weights_only=False)
+        self._model.load_state_dict(data)
+    else:
+        self._model = torch.load(model_path, map_location=map_location, weights_only=False)
+    if self._use_gpu:
+        self._model = nn.DataParallel(module=self._model)
+        self._model, self._out = self._model.cuda(), self._out.cuda()
+    else:
+        self._model, self._out = self._model.cpu(), self._out.cpu()
+    device = torch.device('cuda') if self._use_gpu else torch.device('cpu')
+    result = torch.tensor([]).to(torch.float32).to(device)
+    train_data_size = valid_data_size = 0
+    with torch.no_grad():
+        for data, coef, label, data_index in self._train_dataset.dataloader:
+            data, coef, label, data_index = data.to(device), coef.to(device), label.to(device), data_index.to(device)
+            output = self._out(self._model(data).mul(coef.to(torch.float32)))
+            coefficient = self._model(data).mul(torch.tensor(self._coefficient).to(torch.float32).to(device))
+            output = torch.cat((coefficient, output, data_index), dim=1)
+            result = torch.cat((result, output), 0)
+        train_data_size = len(result)
+        for data, coef, label, data_index in self._valid_dataset.dataloader:
+            data, coef, label, data_index = data.to(device), coef.to(device), label.to(device), data_index.to(device)
+            output = self._out(self._model(data).mul(coef.to(torch.float32)))
+            coefficient = self._model(data).mul(torch.tensor(self._coefficient).to(torch.float32).to(device))
+            output = torch.cat((coefficient, output, data_index), dim=1)
+            result = torch.cat((result, output), 0)
+        valid_data_size = len(result) - train_data_size
+        for data, coef, label, data_index in self._test_dataset.dataloader:
+            data, coef, label, data_index = data.to(device), coef.to(device), label.to(device), data_index.to(device)
+            output = self._out(self._model(data).mul(coef.to(torch.float32)))
+            coefficient = self._model(data).mul(torch.tensor(self._coefficient).to(torch.float32).to(device))
+            output = torch.cat((coefficient, output, data_index), dim=1)
+            result = torch.cat((result, output), 0)
+    result = result.cpu().detach().numpy()
+    columns = list(self._train_dataset.x)
+    for i in range(len(columns)):
+        columns[i] = "coef_" + columns[i]
+    columns.append("bias")
+    columns = columns + ["Pred_" + self._train_dataset.y[0]] + self._train_dataset.id
+    result = pd.DataFrame(result, columns=columns)
+    result[self._train_dataset.id] = result[self._train_dataset.id].astype(np.int32)
+    result["Pred_" + self._train_dataset.y[0]] = result["Pred_" + self._train_dataset.y[0]].astype(np.float32)
+    result['dataset_belong'] = np.concatenate([
+        np.full(train_data_size, 'train'),
+        np.full(valid_data_size, 'valid'),
+        np.full(len(result) - train_data_size - valid_data_size, 'test')
+    ])
+    pred_col_name = "Pred_" + self._train_dataset.y[0]
+    if self._train_dataset.y_scale_info:
+        _, denormalized_pred = self._train_dataset.rescale(None, result[pred_col_name].to_frame())
+        result['denormalized_pred_result'] = denormalized_pred.iloc[:, 0]
+    else:
+        result['denormalized_pred_result'] = result[pred_col_name]
+    if only_return:
+        return result
+    if filename is not None:
+        result.to_csv(filename, index=False)
+    else:
+        warnings.warn("Warning! The input write file path is not set. Result is returned by function but not saved as file.", RuntimeWarning)
+    return result
+
+# ----------------------------------------------------------------------
+# --- 主流程 ---
+# ----------------------------------------------------------------------
+# 🔥【关键】在创建任何模型之前，应用修复补丁
+GTNNWR.reg_result = patched_reg_result
 
 data = pd.read_excel('lu_onehot.xlsx')
 data["id"] = np.arange(len(data))
-# 添加混合分割策略
 data['station_id'] = data['X'].astype(str) + '_' + data['Y'].astype(str)
 
 # 定义特征列，以便教师模型和最终模型共用
@@ -58,14 +130,12 @@ teacher_model = GTNNWR(
     write_path="../demo_result/teacher_model",
     model_name="Teacher_Model"
 )
-teacher_model.run(10, 500)
+teacher_model.run(50, 500)
 
 # 0.5.4 提取模型系数作为聚类特征
 print("提取模型学习到的空间系数作为聚类特征...")
-# 假设 teacher_model.result() 返回一个包含系数的 DataFrame
-teacher_results = teacher_model.result()
-# 如果 result() 是保存文件，你需要先读取它，例如：
-# teacher_results = pd.read_csv("../demo_result/teacher_model/Teacher_Model_results.csv")
+# 使用修复后的 result 方法，并直接获取返回值
+teacher_results = teacher_model.result(only_return=True)
 
 coef_columns = [col for col in teacher_results.columns if col.startswith('coef_')]
 station_coefs = teacher_results.groupby('id')[coef_columns].mean().reset_index()
@@ -166,13 +236,13 @@ optimizer_params = {
     "scheduler_gamma":0.8,
 }
 gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [256,128,64]],drop_out=0.4,optimizer='Adadelta',optimizer_params=optimizer_params,
-                write_path = "../demo_result/gtnnwr_runs", # 这里需要修改
-                model_name="GTNNWR_Di")
+                write_path = "../demo_result/gtnnwr_runs",
+                model_name="GTNNWR_Final")
 gtnnwr.add_graph()
 
 gtnnwr.run(100,1000)
 
 gtnnwr.result()
-save_path = "../demo_result/gtnnwr_runs/GTNNWR_DSi_results.png"
+save_path = "../demo_result/gtnnwr_runs/GTNNWR_Final_results.png"
 
 metrics = plot_gtnnwr_results(gtnnwr, save_path=save_path, show_plot=True)
