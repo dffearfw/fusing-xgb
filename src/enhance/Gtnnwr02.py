@@ -107,17 +107,17 @@ x_columns = [
 
 # --- 【新增】第0.5步：训练教师模型，为聚类提供高质量特征 ---
 print("=== 步骤0.5: 训练教师模型以生成聚类特征 ===")
-# 0.5.1 划分教师模型数据 (随机抽取80%的站点)
-unique_stations = data['station_id'].unique()
-np.random.shuffle(unique_stations)
-teacher_stations = unique_stations[:int(0.8 * len(unique_stations))]
-teacher_data = data[data['station_id'].isin(teacher_stations)].copy()
+# 0.5.1 🔥【修改】使用全体数据作为教师模型的数据源
+teacher_data = data.copy()
 
-# 0.5.2 教师模型数据集初始化 (简单按时间划分)
+# 0.5.2 🔥【修改】教师模型数据集初始化 (仅按时间划分，不进行空间划分)
+# 对全体数据按时间排序
 teacher_data_sorted = teacher_data.sort_values(by=['year', 'month', 'doy'])
-val_size = int(len(teacher_data) * 0.2)
-teacher_train = teacher_data_sorted.iloc[:-val_size]
-teacher_val = teacher_data_sorted.iloc[-val_size:]
+
+# 按时间顺序划分训练集和验证集（例如，用最后20%的时间段作为验证集）
+val_size = int(len(teacher_data_sorted) * 0.2)
+teacher_train = teacher_data_sorted.iloc[:-val_size].copy()
+teacher_val = teacher_data_sorted.iloc[-val_size:].copy()
 
 teacher_train_dataset, teacher_val_dataset, _ = init_dataset_split(
     train_data=teacher_train, val_data=teacher_val, test_data=teacher_val,
@@ -136,7 +136,7 @@ teacher_model = GTNNWR(
     write_path="../demo_result/teacher_model",
     model_name="Teacher_Model"
 )
-teacher_model.run(5, 500)
+teacher_model.run(500, 500)
 
 # 0.5.4 提取模型系数作为聚类特征
 print("提取模型学习到的空间系数作为聚类特征...")
@@ -283,7 +283,7 @@ gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [256,128,64]],dr
                 model_name="GTNNWR_Final")
 gtnnwr.add_graph()
 
-gtnnwr.run(100,1000)
+gtnnwr.run(500,1000)
 
 gtnnwr.result()
 save_path = "../demo_result/gtnnwr_runs/GTNNWR_Final_results.png"
