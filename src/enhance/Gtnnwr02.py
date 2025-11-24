@@ -1,7 +1,7 @@
 import os
 import sys
 import warnings
-
+from sklearn.cluster import AgglomerativeClustering
 import numpy as np
 import pandas as pd
 import torch
@@ -9,6 +9,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import DBSCAN
 import matplotlib.pyplot as plt
 from torch import nn
+from scipy.spatial import distance
 
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), os.pardir)))
 from gnnwr.datasets import init_dataset_split
@@ -142,50 +143,75 @@ print("提取模型学习到的空间系数作为聚类特征...")
 # 使用修复后的 result 方法，并直接获取返回值
 teacher_results = teacher_model.reg_result(only_return=True)
 
-
 coef_columns = [col for col in teacher_results.columns if col.startswith('coef_')]
-station_coefs = teacher_results.groupby('id')[coef_columns].mean().reset_index()
-# 将 id 映射回 station_id
-id_to_station = teacher_train[['id', 'station_id']].drop_duplicates()
-station_coefs = pd.merge(station_coefs, id_to_station, on='id', how='left')
-print(f"成功为 {len(station_coefs)} 个站点提取了系数特征。")
+
+# --- 🔥【关键修复1】获取完整的 id -> station_id 映射并聚合到站点级别 ---
+# 1. 从教师模型使用的完整数据中获取映射
+id_to_station_full = teacher_data[['id', 'station_id']].drop_duplicates()
+
+# 2. 将 station_id 合并到模型结果中
+results_with_station_id = pd.merge(teacher_results, id_to_station_full, on='id', how='left')
+
+# 3. 按 station_id 聚合系数，得到每个站点的代表性系数
+station_level_coefs = results_with_station_id.groupby('station_id')[coef_columns].mean().reset_index()
+
+# 4. 清理可能因合并产生的 NaN 行（如果有的话）
+station_level_coefs.dropna(inplace=True)
+
+print(f"成功为 {len(station_level_coefs)} 个站点聚合了系数特征。")
 
 
 # --- 第1步：基于【教师模型特征】对站点进行聚类 ---
-# 1.1 🔥【修改】使用教师模型的系数作为聚类特征
+# 1.1 🔥【修改】使用聚合后的站点系数作为聚类特征
 clustering_features = coef_columns
-station_features = station_coefs[['station_id'] + clustering_features].copy()
+station_features_for_clustering = station_level_coefs[['station_id'] + clustering_features].copy()
 
 # 1.2 🔥【关键】对特征进行标准化
 scaler = StandardScaler()
-features_scaled = scaler.fit_transform(station_features[clustering_features])
+features_scaled = scaler.fit_transform(station_features_for_clustering[clustering_features])
 
 # 1.3 使用DBSCAN进行聚类
 dbscan = DBSCAN(eps=0.5, min_samples=5)
-station_features['cluster'] = dbscan.fit_predict(features_scaled)
+station_features_for_clustering['cluster'] = dbscan.fit_predict(features_scaled)
 
 # 1.4 处理噪声点并统计结果
-station_features['cluster'] = station_features['cluster'].apply(
-    lambda x: x if x != -1 else station_features['cluster'].max() + 1)
-n_clusters = station_features['cluster'].nunique()
+station_features_for_clustering['cluster'] = station_features_for_clustering['cluster'].apply(
+    lambda x: x if x != -1 else station_features_for_clustering['cluster'].max() + 1)
+n_clusters = station_features_for_clustering['cluster'].nunique()
 
 print(f"\n站点已聚类为 {n_clusters} 类。")
 print("各簇站点数量：")
-print(station_features['cluster'].value_counts().sort_index())
+print(station_features_for_clustering['cluster'].value_counts().sort_index())
 
-# 1.5 将聚类标签合并回原始数据
-data = pd.merge(data, station_features[['station_id', 'cluster']], on='station_id', how='left')
+# 1.5 🔥【关键修复2】安全地将聚类标签合并回原始数据，避免笛卡尔积
+# station_features_for_clustering 的 'station_id' 现在是唯一的，可以安全 merge
+data = pd.merge(data, station_features_for_clustering[['station_id', 'cluster']], on='station_id', how='left')
+
+# 处理未被聚类的站点（例如，在教师模型中未出现的20%的站点）
+# 这里我们将它们归为一个新的簇
+if data['cluster'].isnull().any():
+    max_cluster_id = data['cluster'].max()
+    data['cluster'].fillna(max_cluster_id + 1, inplace=True)
+    print(f"将 {data['cluster'].isnull().sum()} 个未聚类站点归入新簇 {int(max_cluster_id + 1)}。")
+
 
 # --- 第2步：在每个簇内进行分层空间采样 ---
 train_stations, val_stations, test_stations = [], [], []
 
-# 对每个簇进行独立的随机采样
-for cluster_id in station_features['cluster'].unique():
-    cluster_stations = station_features[station_features['cluster'] == cluster_id]['station_id'].unique()
-    np.random.shuffle(cluster_stations)  # 打乱顺序
+# 🔥【修改】从正确的聚类结果中获取唯一的站点和簇
+clustered_stations_df = station_features_for_clustering
 
-    # 按比例划分 (可以调整为 8:1:1)
+for cluster_id in clustered_stations_df['cluster'].unique():
+    cluster_stations = clustered_stations_df[clustered_stations_df['cluster'] == cluster_id]['station_id'].unique()
+    np.random.shuffle(cluster_stations)
+
     n = len(cluster_stations)
+    # 确保有足够的数据点进行划分
+    if n < 10: # 如果簇太小，可以全部放入训练集
+        train_stations.extend(cluster_stations)
+        print(f"簇 {cluster_id} 太小 ({n}个站点)，已全部放入训练集。")
+        continue
+
     test_set = cluster_stations[:int(n * 0.1)]
     val_set = cluster_stations[int(n * 0.1):int(n * 0.2)]
     train_set = cluster_stations[int(n * 0.2):]
@@ -200,6 +226,7 @@ print(f"验证集站点数: {len(val_stations)}")
 print(f"测试集站点数: {len(test_stations)}")
 
 # --- 第3步：根据划分好的站点创建数据集 ---
+# (这里的代码保持不变，因为它现在基于正确的站点列表)
 train_data_full = data[data['station_id'].isin(train_stations)].copy()
 val_data_full = data[data['station_id'].isin(val_stations)].copy()
 test_data_full = data[data['station_id'].isin(test_stations)].copy()
