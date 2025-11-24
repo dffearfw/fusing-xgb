@@ -1,10 +1,15 @@
 import os
 import sys
+import warnings
+
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import DBSCAN
 import matplotlib.pyplot as plt
+from torch import nn
+
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), os.pardir)))
 from gnnwr.datasets import init_dataset_split
 from gnnwr.models import GTNNWR
@@ -130,12 +135,13 @@ teacher_model = GTNNWR(
     write_path="../demo_result/teacher_model",
     model_name="Teacher_Model"
 )
-teacher_model.run(50, 500)
+teacher_model.run(5, 500)
 
 # 0.5.4 提取模型系数作为聚类特征
 print("提取模型学习到的空间系数作为聚类特征...")
 # 使用修复后的 result 方法，并直接获取返回值
-teacher_results = teacher_model.result(only_return=True)
+teacher_results = teacher_model.reg_result(only_return=True)
+
 
 coef_columns = [col for col in teacher_results.columns if col.startswith('coef_')]
 station_coefs = teacher_results.groupby('id')[coef_columns].mean().reset_index()
