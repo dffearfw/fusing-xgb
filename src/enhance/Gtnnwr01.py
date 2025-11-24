@@ -2,6 +2,9 @@ import os
 import sys
 import numpy as np
 import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import DBSCAN
+import matplotlib.pyplot as plt
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), os.pardir)))
 from gnnwr.datasets import init_dataset_split
 from gnnwr.models import GTNNWR
@@ -15,31 +18,44 @@ data['station_id'] = data['X'].astype(str) + '_' + data['Y'].astype(str)
 
 # --- 第1步：基于地形特征对站点进行聚类 ---
 # 1.1 选择用于聚类的静态特征
-clustering_features = ['elevation', 'slope', 'aspect', 'tpi']
+clustering_features = ['longitude','latitude','Altitude','snowDensity','snowDepth']
 
 # 1.2 为每个站点计算这些特征的平均值（按站点聚合）
 station_features = data.groupby('station_id')[clustering_features].mean().reset_index()
 
-# 1.3 使用K-Means进行聚类
-n_clusters = 4  # 可以尝试3, 4, 5，这是一个超参数
-kmeans = KMeans(n_clusters=n_clusters, random_state=48, n_init=10)
-station_features['cluster'] = kmeans.fit_predict(station_features[clustering_features])
+# 1.3 🔥【关键】对特征进行标准化
+# DBSCAN对特征的尺度非常敏感，必须先标准化，让所有特征在同一量级上
+scaler = StandardScaler()
+features_scaled = scaler.fit_transform(station_features[clustering_features])
+
+# 1.4 使用DBSCAN进行聚类
+# eps和min_samples是需要调试的核心参数，下面会详细解释
+# 我们先给一个初始值
+dbscan = DBSCAN(eps=0.5, min_samples=5)
+station_features['cluster'] = dbscan.fit_predict(features_scaled)
+
+# 1.5 处理噪声点并统计结果
+# DBSCAN会将噪声点标记为-1，我们将它们归为一个单独的簇，保证所有站点都被使用
+station_features['cluster'] = station_features['cluster'].apply(
+    lambda x: x if x != -1 else station_features['cluster'].max() + 1)
+n_clusters = station_features['cluster'].nunique()
 
 print(f"站点已聚类为 {n_clusters} 类。")
-print(station_features['cluster'].value_counts())
+print("各簇站点数量：")
+print(station_features['cluster'].value_counts().sort_index())
 
-# 1.4 将聚类标签合并回原始数据
+# 1.6 将聚类标签合并回原始数据
 data = pd.merge(data, station_features[['station_id', 'cluster']], on='station_id', how='left')
 
 # --- 第2步：在每个簇内进行分层空间采样 ---
 train_stations, val_stations, test_stations = [], [], []
 
 # 对每个簇进行独立的随机采样
-for cluster_id in range(n_clusters):
+for cluster_id in station_features['cluster'].unique():
     cluster_stations = station_features[station_features['cluster'] == cluster_id]['station_id'].unique()
     np.random.shuffle(cluster_stations)  # 打乱顺序
 
-    # 按比例划分
+    # 按比例划分 (可以调整为 8:1:1)
     n = len(cluster_stations)
     test_set = cluster_stations[:int(n * 0.1)]
     val_set = cluster_stations[int(n * 0.1):int(n * 0.2)]
@@ -112,7 +128,7 @@ optimizer_params = {
     "scheduler_milestones":[1000, 2000, 3000, 4000],
     "scheduler_gamma":0.8,
 }
-gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [512,256,64]],drop_out=0.4,optimizer='Adadelta',optimizer_params=optimizer_params,
+gtnnwr = GTNNWR(train_dataset, val_dataset, test_dataset, [[3], [256,128,64]],drop_out=0.4,optimizer='Adadelta',optimizer_params=optimizer_params,
                 write_path = "../demo_result/gtnnwr_runs", # 这里需要修改
                 model_name="GTNNWR_Di")
 gtnnwr.add_graph()
