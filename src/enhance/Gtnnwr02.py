@@ -166,17 +166,27 @@ print(f"成功为 {len(station_level_coefs)} 个站点聚合了系数特征。")
 clustering_features = coef_columns
 station_features_for_clustering = station_level_coefs[['station_id'] + clustering_features].copy()
 
+
 # 1.2 🔥【关键】对特征进行标准化
 scaler = StandardScaler()
 features_scaled = scaler.fit_transform(station_features_for_clustering[clustering_features])
 
-# 1.3 使用DBSCAN进行聚类
-dbscan = DBSCAN(eps=0.5, min_samples=5)
-station_features_for_clustering['cluster'] = dbscan.fit_predict(features_scaled)
+# --- 【绕过方案】使用 AgglomerativeClustering 替代 DBSCAN ---
+from sklearn.cluster import AgglomerativeClustering
 
-# 1.4 处理噪声点并统计结果
-station_features_for_clustering['cluster'] = station_features_for_clustering['cluster'].apply(
-    lambda x: x if x != -1 else station_features_for_clustering['cluster'].max() + 1)
+# 🔥【关键】您需要预先指定簇的数量
+# DBSCAN 可以自动发现，但 AgglomerativeClustering 需要您指定。
+# 您可以根据领域知识设定，或者先用一个合理的猜测值（例如 5-10）进行实验。
+# 这里我们先用 5 个簇作为示例。
+N_CLUSTERS = 5
+
+print(f"\n使用 AgglomerativeClustering 进行聚类，预设簇数量为: {N_CLUSTERS}")
+
+# 1.3 使用层次聚类
+agglo = AgglomerativeClustering(n_clusters=N_CLUSTERS)
+station_features_for_clustering['cluster'] = agglo.fit_predict(features_scaled)
+
+# 1.4 统计结果 (层次聚类没有噪声点，无需处理)
 n_clusters = station_features_for_clustering['cluster'].nunique()
 
 print(f"\n站点已聚类为 {n_clusters} 类。")
