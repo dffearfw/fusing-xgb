@@ -58,7 +58,7 @@ teacher_model = GTNNWR(
     write_path="../demo_result/teacher_model",
     model_name="Teacher_Model"
 )
-teacher_model.run(50, 500)
+teacher_model.run(10, 500)
 
 # 0.5.4 提取模型系数作为聚类特征
 print("提取模型学习到的空间系数作为聚类特征...")
