@@ -149,7 +149,7 @@ teacher_model = GTNNWR(
     write_path="../demo_result/teacher_model",
     model_name="Teacher_Model"
 )
-teacher_model.run(100, 500)
+teacher_model.run(10, 500)
 
 # 0.5.4 提取模型系数作为聚类特征
 print("提取模型学习到的空间系数作为聚类特征...")
@@ -300,25 +300,26 @@ gtnnwr.run(100,1000)
 
 gtnnwr.result()
 
-# --- 🔥【关键修复】从这里开始替换 ---
-# 1. 获取对数尺度的预测结果 (在gtnnwr.result()之后，它已经存储在 _test_dataset.pred 中)
-pred_log = gtnnwr._test_dataset.pred
+# 🔥【正确获取预测结果】
+results_df = gtnnwr.reg_result(only_return=True)
 
-# 2. 将对数预测结果还原为原始尺度
+# 🔥【获取测试集的预测结果】
+test_results = results_df[results_df['dataset_belong'] == 'test']
+pred_log = test_results['Pred_swe_log'].values  # 对数尺度的预测结果
+
+# 🔥【还原到原始尺度】
 pred_original_scale = np.expm1(pred_log)
 
-# 3. 获取原始尺度的真实值
+# 🔥【获取真实值】
 true_original_scale = test_data['swe'].values
 
-# 4. 🔥【关键一步】将原始尺度的真实值和预测值都更新回模型对象
+# 🔥【更新测试集数据】
 gtnnwr._test_dataset.y = true_original_scale
-gtnnwr._test_dataset.pred = pred_original_scale
+gtnnwr._test_dataset.pred = pred_original_scale  # 直接设置pred属性
 
 print("已将测试集的真实值和预测值都还原为原始尺度，准备进行最终评估。")
-# --- 替换结束 ---
-
 
 save_path = "../demo_result/gtnnwr_runs/GTNNWR_Final_results.png"
-
 metrics = plot_gtnnwr_results(gtnnwr, save_path=save_path, show_plot=True)
+
 

@@ -1,8 +1,8 @@
-# visualizer.py
 import matplotlib.pyplot as plt
 import numpy as np
 import os
 import matplotlib
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
 matplotlib.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
 matplotlib.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
@@ -11,6 +11,7 @@ matplotlib.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 def plot_gtnnwr_results(gtnnwr_model, save_path=None, show_plot=True):
     """
     为GTNNWR模型生成真实值vs预测值的散点图
+    (已修复对数变换还原问题)
 
     Parameters
     ----------
@@ -31,18 +32,31 @@ def plot_gtnnwr_results(gtnnwr_model, save_path=None, show_plot=True):
     if not hasattr(gtnnwr_model, '_test_diagnosis'):
         raise ValueError("请先调用 gtnnwr_model.result() 方法来获取诊断结果")
 
-    # 从诊断对象中获取真实值和预测值
+    # 从诊断对象中获取真实值和预测值 (这些目前是对数尺度的)
     test_diagnosis = gtnnwr_model._test_diagnosis
+    y_true_log = test_diagnosis._DIAGNOSIS__y_data.cpu().numpy().flatten()
+    y_pred_log = test_diagnosis._DIAGNOSIS__y_pred.cpu().numpy().flatten()
 
-    # 获取真实值和预测值
-    y_true = test_diagnosis._DIAGNOSIS__y_data.cpu().numpy().flatten()
-    y_pred = test_diagnosis._DIAGNOSIS__y_pred.cpu().numpy().flatten()
-
-    # 计算评估指标
-    r2 = test_diagnosis.R2().item()
-    rmse = test_diagnosis.RMSE().item()
-    mae = test_diagnosis.MAE().item()
-    aicc = test_diagnosis.AICc()
+    # 🔥【关键修复】检查目标变量是否为对数变换过的，并进行反向变换
+    target_variable_name = gtnnwr_model._train_dataset.y[0]
+    if target_variable_name == 'swe_log':
+        print("检测到对数变换目标，正在将绘图数据还原为原始尺度...")
+        y_true = np.expm1(y_true_log)
+        y_pred = np.expm1(y_pred_log)
+        # 因为数据尺度变了，所以所有指标都需要重新计算
+        r2 = r2_score(y_true, y_pred)
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mae = mean_absolute_error(y_true, y_pred)
+        # AICc 是在对数尺度上基于似然计算的，直接转换无意义，故标记为N/A
+        aicc = "N/A (尺度已变换)"
+    else:
+        # 如果不是对数变换，则直接使用原始数据
+        y_true = y_true_log
+        y_pred = y_pred_log
+        r2 = test_diagnosis.R2().item()
+        rmse = test_diagnosis.RMSE().item()
+        mae = test_diagnosis.MAE().item()
+        aicc = test_diagnosis.AICc()
 
     # 创建散点图
     plt.figure(figsize=(10, 8))
@@ -63,7 +77,9 @@ def plot_gtnnwr_results(gtnnwr_model, save_path=None, show_plot=True):
     plt.title(f'{gtnnwr_model._modelName} 预测结果', fontsize=16, fontweight='bold')
 
     # 在右上角添加指标值文本框
-    metrics_text = f'R² = {r2:.4f}\nRMSE = {rmse:.4f}\nMAE = {mae:.4f}\nAICc = {aicc:.4f}\n样本数 = {len(y_true)}'
+    # 🔥【修复】aicc可能是字符串，需要处理
+    aicc_str = f'{aicc:.4f}' if isinstance(aicc, (int, float)) else str(aicc)
+    metrics_text = f'R² = {r2:.4f}\nRMSE = {rmse:.4f}\nMAE = {mae:.4f}\nAICc = {aicc_str}\n样本数 = {len(y_true)}'
     plt.text(0.05, 0.95, metrics_text,
              transform=plt.gca().transAxes,
              fontsize=12,
@@ -106,6 +122,7 @@ def plot_gtnnwr_results(gtnnwr_model, save_path=None, show_plot=True):
 def plot_multiple_models_results(model_results_dict, save_path=None, show_plot=True):
     """
     绘制多个模型的对比散点图
+    (注意：此函数未进行对数变换修复，如需使用请参考 plot_gtnnwr_results 的修复逻辑)
 
     Parameters
     ----------
