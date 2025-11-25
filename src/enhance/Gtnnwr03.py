@@ -300,12 +300,25 @@ gtnnwr.run(100,1000)
 
 gtnnwr.result()
 
-# 🔥【对数变换】修改5：在绘图前，将测试集的真实值替换为原始尺度，以便进行公平评估
-# 这是为了让绘图函数比较的是原始尺度的真实值和预测值
-original_y_test = test_data['swe'].values
-gtnnwr._test_dataset.y = original_y_test
-print("已将测试集的真实值替换为原始尺度，准备进行最终评估。")
+# --- 🔥【关键修复】从这里开始替换 ---
+# 1. 获取对数尺度的预测结果 (在gtnnwr.result()之后，它已经存储在 _test_dataset.pred 中)
+pred_log = gtnnwr._test_dataset.pred
+
+# 2. 将对数预测结果还原为原始尺度
+pred_original_scale = np.expm1(pred_log)
+
+# 3. 获取原始尺度的真实值
+true_original_scale = test_data['swe'].values
+
+# 4. 🔥【关键一步】将原始尺度的真实值和预测值都更新回模型对象
+gtnnwr._test_dataset.y = true_original_scale
+gtnnwr._test_dataset.pred = pred_original_scale
+
+print("已将测试集的真实值和预测值都还原为原始尺度，准备进行最终评估。")
+# --- 替换结束 ---
+
 
 save_path = "../demo_result/gtnnwr_runs/GTNNWR_Final_results.png"
 
 metrics = plot_gtnnwr_results(gtnnwr, save_path=save_path, show_plot=True)
+
