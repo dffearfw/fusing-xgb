@@ -151,19 +151,11 @@ def objective(trial):
     Optuna 的目标函数：定义搜索空间和交叉验证逻辑。
     """
     # 1. 定义超参数的搜索空间
-    # trial.suggest_float('参数名', 下限, 上限)
-    # trial.suggest_int('参数名', 下限, 上限)
-    # trial.suggest_categorical('参数名', [选项1, 选项2])
-
-    # 学习率
     lr = trial.suggest_float('lr', 1e-3, 1e-1, log=True)
-    # Dropout率
     dropout = trial.suggest_float('dropout', 0.1, 0.5)
-    # 隐藏层结构
     n_layers = trial.suggest_int('n_layers', 1, 3)
     layers = []
     for i in range(n_layers):
-        # 每层的神经元数量，建议逐层递减
         num_units = trial.suggest_int(f'n_units_l{i}', 32, 256, step=32)
         layers.append(num_units)
     hidden_dims = [[3], layers]
@@ -195,7 +187,7 @@ def objective(trial):
             "scheduler": "MultiStepLR",
             "scheduler_milestones": [50, 100, 150, 200],
             "scheduler_gamma": 0.8,
-            "lr": lr  # 🔥【关键】使用 trial 建议的学习率
+            "lr": lr
         }
 
         model_cv = GTNNWR(
@@ -207,7 +199,8 @@ def objective(trial):
         )
         model_cv.run(50, 200)  # 为了演示速度，减少epoch
 
-        score = model_cv._best_valid_loss
+        # 🔥【关键修复】使用正确的属性名
+        score = model_cv._valid_loss
         fold_scores.append(score)
 
         del model_cv
