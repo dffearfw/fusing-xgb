@@ -164,7 +164,7 @@ def objective(trial):
     print(f"  LR: {lr:.4f}, Dropout: {dropout:.2f}, Layers: {hidden_dims}")
 
     # 2. 设置交叉验证
-    N_SPLITS = 5  # 为了演示速度，用5折。实际中可以用10折。
+    N_SPLITS = 5
     gkf = GroupKFold(n_splits=N_SPLITS)
     fold_scores = []
 
@@ -197,9 +197,21 @@ def objective(trial):
             write_path=f"../demo_result/optuna_runs/trial_{trial.number}",
             model_name=f"fold_{fold + 1}"
         )
-        model_cv.run(50, 200)  # 为了演示速度，减少epoch
 
-        # 🔥【关键修复】使用正确的属性名，并获取列表的最后一个元素
+        # 🔥【关键修复】添加异常处理
+        try:
+            model_cv.run(50, 200)  # 为了演示速度，减少epoch
+        except torch._C._LinAlgError as e:
+            print(f"    !!! Fold {fold + 1} failed due to a singular matrix error. Pruning this trial.")
+            # 当发生这个错误时，我们告诉 Optuna 这个 trial 失败了
+            # raise optuna.exceptions.TrialPruned() 会停止当前 trial 的其余部分
+            raise optuna.exceptions.TrialPruned()
+        except Exception as e:
+            # 也可以捕获其他未知错误
+            print(f"    !!! Fold {fold + 1} failed with an unexpected error: {e}. Pruning this trial.")
+            raise optuna.exceptions.TrialPruned()
+
+        # 如果训练成功，继续获取分数
         score = model_cv._validLossList[-1]
         fold_scores.append(score)
 
