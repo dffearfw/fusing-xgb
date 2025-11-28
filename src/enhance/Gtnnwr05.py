@@ -199,8 +199,8 @@ def objective(trial):
         )
         model_cv.run(50, 200)  # 为了演示速度，减少epoch
 
-        # 🔥【关键修复】使用正确的属性名
-        score = model_cv._valid_loss
+        # 🔥【关键修复】使用正确的属性名，并获取列表的最后一个元素
+        score = model_cv._validLossList[-1]
         fold_scores.append(score)
 
         del model_cv
