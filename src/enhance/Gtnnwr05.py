@@ -198,20 +198,17 @@ def objective(trial):
             model_name=f"fold_{fold + 1}"
         )
 
-        # 🔥【关键修复】添加异常处理
+        # 🔥【关键修复1】捕获 LinAlgError 和其他异常，防止搜索中断
         try:
-            model_cv.run(50, 200)  # 为了演示速度，减少epoch
-        except torch._C._LinAlgError as e:
-            print(f"    !!! Fold {fold + 1} failed due to a singular matrix error. Pruning this trial.")
-            # 当发生这个错误时，我们告诉 Optuna 这个 trial 失败了
-            # raise optuna.exceptions.TrialPruned() 会停止当前 trial 的其余部分
+            model_cv.run(50, 200)
+        except torch._C._LinAlgError:
+            print(f"    !!! Fold {fold + 1} failed due to a singular matrix. Pruning this trial.")
             raise optuna.exceptions.TrialPruned()
         except Exception as e:
-            # 也可以捕获其他未知错误
             print(f"    !!! Fold {fold + 1} failed with an unexpected error: {e}. Pruning this trial.")
             raise optuna.exceptions.TrialPruned()
 
-        # 如果训练成功，继续获取分数
+        # 🔥【关键修复2】使用正确的属性名 _validLossList
         score = model_cv._validLossList[-1]
         fold_scores.append(score)
 
@@ -290,18 +287,55 @@ final_model.add_graph()
 final_model.run(100, 1000)  # 使用更多的epoch进行充分训练
 
 # ----------------------------------------------------------------------
-# --- 🔥【最终评估】在独立测试集上评估最终模型 ---
-# ----------------------------------------------------------------------
 print("\n=== 在独立测试集上评估最终模型 ===")
-pred_log = final_model._test_dataset.pred
-pred_original_scale = np.expm1(pred_log)
-true_original_scale = test_data['swe'].values
-final_model._test_dataset.y = true_original_scale
-final_model._test_dataset.pred = pred_original_scale
 
-save_path = "../demo_result/final_model_optuna/GTNNWR_Optuna_Best_Results.png"
-metrics = plot_gtnnwr_results(final_model, save_path=save_path, show_plot=True)
+# 🔥【关键修复3】使用 reg_result 来获取所有预测结果，而不是访问不存在的 _test_dataset.pred
+final_results_df = final_model.reg_result(only_return=True)
+
+# 从结果DataFrame中筛选出测试集的预测和真实值
+test_results_df = final_results_df[final_results_df['dataset_belong'] == 'test'].copy()
+
+# 获取对数尺度的预测值和真实值
+pred_log = test_results_df['Pred_swe_log'].values
+# 假设原始数据里有 'swe_log' 列，如果没有，你需要从其他地方获取
+true_log = test_results_df['swe_log'].values
+
+# 将对数预测结果还原为原始尺度
+pred_original_scale = np.expm1(pred_log)
+
+# 获取原始尺度的真实值
+# 假设原始数据列名为 'swe'
+true_original_scale = test_data['swe'].values
+
+print("已获取测试集的真实值和预测值，并还原为原始尺度，准备进行最终评估。")
+
+# 使用 visualizer 进行评估和绘图
+# 注意：plot_gtnnwr_results 函数可能需要调整，因为它期望的是一个模型对象
+# 如果不能直接修改，我们可以手动计算指标
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+r2 = r2_score(true_original_scale, pred_original_scale)
+rmse = np.sqrt(mean_squared_error(true_original_scale, pred_original_scale))
+mae = mean_absolute_error(true_original_scale, pred_original_scale)
 
 print("\n=== 最终评估指标 ===")
-for metric, value in metrics.items():
-    print(f"{metric}: {value:.4f}")
+print(f"R2: {r2:.4f}")
+print(f"RMSE: {rmse:.4f}")
+print(f"MAE: {mae:.4f}")
+
+# 如果你仍然想用 plot_gtnnwr_results，可能需要创建一个虚拟的模型对象来传递数据
+# 或者修改该函数以接受 DataFrame 作为输入。这里我们先手动计算并绘图。
+import matplotlib.pyplot as plt
+
+plt.figure(figsize=(10, 10))
+plt.scatter(true_original_scale, pred_original_scale, alpha=0.5, label='Data Points')
+plt.plot([min(true_original_scale), max(true_original_scale)], [min(true_original_scale), max(true_original_scale)], '--', color='red', label='Ideal Fit')
+plt.xlabel('True Values (Original Scale)')
+plt.ylabel('Predictions (Original Scale)')
+plt.title('True vs. Predicted Values on Test Set')
+plt.legend()
+plt.grid(True)
+save_path = "../demo_result/final_model_optuna/GTNNWR_Optuna_Best_Results.png"
+os.makedirs(os.path.dirname(save_path), exist_ok=True)
+plt.savefig(save_path)
+plt.show()
