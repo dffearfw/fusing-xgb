@@ -200,7 +200,9 @@ def objective(trial):
 
         # 🔥【关键修复1】捕获 LinAlgError 和其他异常，防止搜索中断
         try:
-            model_cv.run(50, 200)
+            # 🔥【关键修复2】为了让早停起作用，这里传入 early_stop 参数
+            # 假设我们希望在验证集连续 20 个 epoch 没有提升时就停止
+            model_cv.run(max_epoch=200, early_stop=20)
         except torch._C._LinAlgError:
             print(f"    !!! Fold {fold + 1} failed due to a singular matrix. Pruning this trial.")
             raise optuna.exceptions.TrialPruned()
@@ -208,7 +210,7 @@ def objective(trial):
             print(f"    !!! Fold {fold + 1} failed with an unexpected error: {e}. Pruning this trial.")
             raise optuna.exceptions.TrialPruned()
 
-        # 🔥【关键修复2】使用正确的属性名 _validLossList
+        # 🔥【关键修复3】使用正确的属性名
         score = model_cv._validLossList[-1]
         fold_scores.append(score)
 
@@ -289,23 +291,21 @@ final_model.run(100, 1000)  # 使用更多的epoch进行充分训练
 # ----------------------------------------------------------------------
 print("\n=== 在独立测试集上评估最终模型 ===")
 
-# 🔥【关键修复3】使用 reg_result 来获取所有预测结果，而不是访问不存在的 _test_dataset.pred
+# 🔥【关键修复4】使用 reg_result 来获取所有预测结果，而不是访问不存在的 _test_dataset.pred
 final_results_df = final_model.reg_result(only_return=True)
 
 # 从结果DataFrame中筛选出测试集的预测和真实值
 test_results_df = final_results_df[final_results_df['dataset_belong'] == 'test'].copy()
 
-# 获取对数尺度的预测值和真实值
+# 🔥【关键修复5】使用正确的列名 'Pred_swe_log' 来获取预测值
+# 你的 y_column_transformed 是 ['swe_log']，所以预测列名是 'Pred_' + 'swe_log'
 pred_log = test_results_df['Pred_swe_log'].values
-# 假设原始数据里有 'swe_log' 列，如果没有，你需要从其他地方获取
-true_log = test_results_df['swe_log'].values
+# 🔥【关键修复6】从原始数据中获取真实值，而不是 DataFrame
+# 假设你的原始数据 test_data 中有 'swe' 列
+true_original_scale = test_data['swe'].values
 
 # 将对数预测结果还原为原始尺度
 pred_original_scale = np.expm1(pred_log)
-
-# 获取原始尺度的真实值
-# 假设原始数据列名为 'swe'
-true_original_scale = test_data['swe'].values
 
 print("已获取测试集的真实值和预测值，并还原为原始尺度，准备进行最终评估。")
 
