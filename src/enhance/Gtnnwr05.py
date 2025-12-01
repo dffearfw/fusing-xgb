@@ -173,6 +173,9 @@ train_val_data_full = data[data['station_id'].isin(train_val_stations)].copy()
 # ----------------------------------------------------------------------
 # --- 🔥【优化版】使用 Optuna 进行超参数搜索 ---
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# --- 🔥【优化版】使用 Optuna 进行超参数搜索 ---
+# ----------------------------------------------------------------------
 def objective(trial):
     """
     一个更健壮的 Optuna 目标函数，包含更广泛的搜索空间、剪枝和错误处理。
@@ -208,7 +211,8 @@ def objective(trial):
         # 动态建议 2 到 4 个里程碑点
         n_milestones = trial.suggest_int('n_milestones', 2, 4)
         milestones = sorted(
-            [int(m * 200) for m in trial.suggest_float(f'milestone_{i}', 0.2, 0.8, step=0.2) for i in range(n_milestones)])
+            [int(m * 200) for m in trial.suggest_float(f'milestone_{i}', 0.2, 0.8, step=0.2) for i in
+             range(n_milestones)])
         scheduler_gamma = trial.suggest_float('scheduler_gamma', 0.5, 0.9)
     elif scheduler_name == 'CosineAnnealingLR':
         scheduler_T_max = trial.suggest_int('scheduler_T_max', 100, 500)
@@ -224,7 +228,10 @@ def objective(trial):
 
     # 2. 设置交叉验证
     N_SPLITS = 5  # 增加折数，使评估更稳定
-    gkf = GroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=trial.number)  # 使用 trial.number 作为随机种子
+
+    # 🔥【修复】GroupKFold 不支持 shuffle 和 random_state，直接移除
+    gkf = GroupKFold(n_splits=N_SPLITS)
+
     fold_scores = []
 
     # 3. 遍历每一折
