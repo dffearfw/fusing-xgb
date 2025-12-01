@@ -102,15 +102,24 @@ def patched_reg_result(self, filename=None, model_path=None, use_dict=False, onl
 # 🔥【关键】在创建任何模型之前，应用修复补丁
 GTNNWR.reg_result = patched_reg_result
 
-# --- 【前置步骤：数据准备、教师模型训练、聚类、站点划分】---
-# (这部分代码与之前完全相同，为了简洁我省略了，请确保它在这里运行)
-# ... (代码从 data = pd.read_excel('lu_onehot.xlsx') 到 test_data = test_df_sorted[...].copy() )
-# ... (确保 train_val_data_full 和 test_data 已经准备好)
-# --- 为了代码完整性，我将这部分复制过来 ---
+# --- 【前置步骤：数据准备、基于 zone_id 的空间分区和站点划分】---
+# ----------------------------------------------------------------------
+print("=== 1. 加载并预处理数据 ===")
 data = pd.read_excel('lu_onehot.xlsx')
+# 确保数据中包含 zone_id 列
+if 'zone_id' not in data.columns:
+    raise ValueError("数据文件 'lu_onehot.xlsx' 中未找到 'zone_id' 列。")
+
 data["id"] = np.arange(len(data))
 data['station_id'] = data['X'].astype(str) + '_' + data['Y'].astype(str)
 data['swe_log'] = np.log1p(data['swe'])
+
+# 🔥【核心修改】直接使用 zone_id 作为空间分区（cluster）的依据
+# 将 zone_id 转换为从0开始的整数类别，方便后续处理
+data['cluster'] = data['zone_id'].astype('category').cat.codes
+print(f"数据已根据 'zone_id' 划分为 {data['cluster'].nunique()} 个空间分区。")
+
+# 定义特征和目标列
 x_columns = ['aspect', 'slope', 'eastness', 'tpi', 'curvature1', 'curvature2', 'elevation', 'std_slope', 'std_eastness',
              'std_tpi', 'std_curvature1', 'std_curvature2', 'std_high', 'std_aspect', 'glsnow', 'cswe',
              'snow_depth_snow_depth', 'ERA5温度_ERA5温度', 'era5_swe', 'gldas', 'scp_start', 'scp_end', 'd1', 'd2',
@@ -118,54 +127,104 @@ x_columns = ['aspect', 'slope', 'eastness', 'tpi', 'curvature1', 'curvature2', '
              'landuse_31', 'landuse_32', 'landuse_33', 'landuse_41', 'landuse_43', 'landuse_46', 'landuse_51',
              'landuse_52', 'landuse_53', 'landuse_62', 'landuse_64']
 y_column_transformed = ['swe_log']
-# ... (省略教师模型和聚类代码，假设 `data` 表已经有了 `cluster` 列)
-# 为了演示，这里用一个简化的站点划分，请替换为你自己的聚类和划分逻辑
-# 假设已经完成了聚类和站点划分
-all_stations = data['station_id'].unique()
-np.random.shuffle(all_stations)
-test_stations = all_stations[:int(len(all_stations) * 0.1)]
-train_val_stations = all_stations[int(len(all_stations) * 0.1):]
-train_val_data_full = data[data['station_id'].isin(train_val_stations)].copy()
-test_data_full = data[data['station_id'].isin(test_stations)].copy()
-# 时间划分
+
+print("\n=== 2. 基于 zone_id (cluster) 划分训练/验证集和测试集 ===")
+# 🔥【核心修改】按空间分区（cluster）来划分测试集，以评估空间外推能力
+all_clusters = sorted(data['cluster'].unique())
+np.random.seed(42) # 设置随机种子以保证结果可复现
+np.random.shuffle(all_clusters)
+
+# 选择 20% 的分区作为测试区域
+test_clusters = all_clusters[:int(len(all_clusters) * 0.2)]
+train_val_clusters = all_clusters[int(len(all_clusters) * 0.2):]
+
+print(f"测试分区: {sorted(test_clusters)}")
+print(f"训练/验证分区: {sorted(train_val_clusters)}")
+
+train_val_data_full = data[data['cluster'].isin(train_val_clusters)].copy()
+test_data_full = data[data['cluster'].isin(test_clusters)].copy()
+
+print(f"训练/验证集样本数: {len(train_val_data_full)}")
+print(f"测试集样本数: {len(test_data_full)}")
+
+print("\n=== 3. 在训练/验证集和测试集内部按时间划分 ===")
+# 训练/验证集的时间划分：取最后20%的时间作为验证集
 train_val_df_sorted = train_val_data_full.sort_values(by=['year', 'month', 'doy'])
 val_sample_count = int(len(train_val_df_sorted) * 0.2)
-val_data_full = train_val_df_sorted.iloc[:val_sample_count].copy()
-train_data_full = train_val_df_sorted.iloc[val_sample_count:].copy()
+val_data_full = train_val_df_sorted.iloc[-val_sample_count:].copy() # 使用最后一段时间作为验证集
+train_data_full = train_val_df_sorted.iloc[:-val_sample_count].copy()
+
+# 测试集的时间划分：确保测试集的时间范围与验证集有重叠，以进行公平比较
 test_df_sorted = test_data_full.sort_values(by=['year', 'month', 'doy'])
-test_data = test_df_sorted[(test_df_sorted['year'] >= val_data_full['year'].min()) & (
-            test_df_sorted['year'] <= val_data_full['year'].max())].copy()
-# 合并用于交叉验证
+# 筛选出与验证集年份相同的测试数据
+min_year, max_year = val_data_full['year'].min(), val_data_full['year'].max()
+test_data = test_df_sorted[(test_df_sorted['year'] >= min_year) & (test_df_sorted['year'] <= max_year)].copy()
+
+print(f"最终训练集样本数: {len(train_data_full)}")
+print(f"最终验证集样本数: {len(val_data_full)}")
+print(f"最终测试集样本数 (时间筛选后): {len(test_data)}")
+
+# 合并训练集和验证集的站点信息，为 GroupKFold 交叉验证做准备
 train_val_stations = list(set(train_data_full['station_id'].unique()) | set(val_data_full['station_id'].unique()))
 train_val_data_full = data[data['station_id'].isin(train_val_stations)].copy()
-
-
 # --- 前置步骤结束 ---
 
 
 # ----------------------------------------------------------------------
-# --- 🔥【核心修改】使用 Optuna 进行超参数搜索 ---
+# --- 🔥【优化版】使用 Optuna 进行超参数搜索 ---
 # ----------------------------------------------------------------------
 def objective(trial):
     """
-    Optuna 的目标函数：定义搜索空间和交叉验证逻辑。
+    一个更健壮的 Optuna 目标函数，包含更广泛的搜索空间、剪枝和错误处理。
     """
-    # 1. 定义超参数的搜索空间
-    lr = trial.suggest_float('lr', 1e-3, 1e-1, log=True)
+    # 1. 定义更广泛的超参数搜索空间
+    # 🔥【优化器选择】让 Optuna 选择优化器
+    optimizer_name = trial.suggest_categorical('optimizer', ['Adam', 'Adadelta', 'AdamW'])
+
+    # 🔥【学习率选择】为不同优化器设置不同的合理范围
+    if optimizer_name == 'Adam':
+        lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
+    elif optimizer_name == 'AdamW':
+        lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
+    else:  # Adadelta
+        lr = trial.suggest_float('lr', 1e-3, 1e-1, log=True)
+
     dropout = trial.suggest_float('dropout', 0.1, 0.5)
-    n_layers = trial.suggest_int('n_layers', 1, 3)
+    weight_decay = trial.suggest_float('weight_decay', 1e-5, 1e-2, log=True)
+
+    # 🔥【网络结构】动态定义网络层数和单元数
+    n_layers = trial.suggest_int('n_layers', 1, 4)
     layers = []
     for i in range(n_layers):
-        num_units = trial.suggest_int(f'n_units_l{i}', 32, 256, step=32)
+        num_units = trial.suggest_int(f'n_units_l{i}', 32, 512, step=32)
         layers.append(num_units)
-    hidden_dims = [[3], layers]
+    hidden_dims = [[3], layers]  # STPNN 和 SWNN 的结构
+
+    # 🔥【调度器选择】让 Optuna 选择学习率调度器
+    scheduler_name = trial.suggest_categorical('scheduler', ['MultiStepLR', 'CosineAnnealingLR'])
+
+    # 🔥【调度器参数】根据选择的调度器动态配置参数
+    if scheduler_name == 'MultiStepLR':
+        # 动态建议 2 到 4 个里程碑点
+        n_milestones = trial.suggest_int('n_milestones', 2, 4)
+        milestones = sorted(
+            [int(m * 200) for m in trial.suggest_float(f'milestone_{i}', 0.2, 0.8, step=0.2) for i in range(n_milestones)])
+        scheduler_gamma = trial.suggest_float('scheduler_gamma', 0.5, 0.9)
+    elif scheduler_name == 'CosineAnnealingLR':
+        scheduler_T_max = trial.suggest_int('scheduler_T_max', 100, 500)
+        scheduler_eta_min = trial.suggest_float('scheduler_eta_min', 1e-4, 1e-2, log=True)
 
     print(f"\n--- Trial {trial.number}: Testing params ---")
-    print(f"  LR: {lr:.4f}, Dropout: {dropout:.2f}, Layers: {hidden_dims}")
+    print(f"  Optimizer: {optimizer_name}, LR: {lr:.5f}, Dropout: {dropout:.2f}, Weight Decay: {weight_decay:.2e}")
+    print(f"  Layers: {hidden_dims}, Scheduler: {scheduler_name}")
+    if scheduler_name == 'MultiStepLR':
+        print(f"  Milestones: {milestones}, Gamma: {scheduler_gamma:.2f}")
+    else:
+        print(f"  T_max: {scheduler_T_max}, Eta_min: {scheduler_eta_min:.5f}")
 
     # 2. 设置交叉验证
-    N_SPLITS = 5
-    gkf = GroupKFold(n_splits=N_SPLITS)
+    N_SPLITS = 5  # 增加折数，使评估更稳定
+    gkf = GroupKFold(n_splits=N_SPLITS, shuffle=True, random_state=trial.number)  # 使用 trial.number 作为随机种子
     fold_scores = []
 
     # 3. 遍历每一折
@@ -176,6 +235,7 @@ def objective(trial):
         fold_train_data = train_val_data_full.iloc[train_idx]
         fold_val_data = train_val_data_full.iloc[val_idx]
 
+        # 🔥【关键修复】确保每次试验的数据划分都是基于该试验的随机种子
         fold_train_dataset, fold_val_dataset, _ = init_dataset_split(
             train_data=fold_train_data, val_data=fold_val_data, test_data=fold_val_data,
             x_column=x_columns, y_column=y_column_transformed,
@@ -183,43 +243,70 @@ def objective(trial):
             id_column=['id'], use_model="gtnnwr", batch_size=128, dropna=True
         )
 
+        # 🔥【关键修复】构建 optimizer_params 字典
         optimizer_params_cv = {
-            "scheduler": "MultiStepLR",
-            "scheduler_milestones": [50, 100, 150, 200],
-            "scheduler_gamma": 0.8,
-            "lr": lr
+            "weight_decay": weight_decay,
+            "scheduler": scheduler_name,
         }
+        if scheduler_name == 'MultiStepLR':
+            optimizer_params_cv["scheduler_milestones"] = milestones
+            optimizer_params_cv["scheduler_gamma"] = scheduler_gamma
+        elif scheduler_name == 'CosineAnnealingLR':
+            optimizer_params_cv["scheduler_T_max"] = scheduler_T_max
+            optimizer_params_cv["scheduler_eta_min"] = scheduler_eta_min
 
+        # 🔥【关键修复】通过 start_lr=lr 传递学习率
         model_cv = GTNNWR(
             fold_train_dataset, fold_val_dataset, fold_val_dataset,
             hidden_dims, drop_out=dropout,
-            optimizer='Adadelta', optimizer_params=optimizer_params_cv,
+            optimizer=optimizer_name, start_lr=lr, optimizer_params=optimizer_params_cv,
             write_path=f"../demo_result/optuna_runs/trial_{trial.number}",
             model_name=f"fold_{fold + 1}"
         )
 
-        # 🔥【关键修复1】捕获 LinAlgError 和其他异常，防止搜索中断
         try:
-            # 🔥【关键修复2】为了让早停起作用，这里传入 early_stop 参数
-            # 假设我们希望在验证集连续 20 个 epoch 没有提升时就停止
-            model_cv.run(max_epoch=200, early_stop=20)
+            # 运行模型，设置早停
+            model_cv.run(max_epoch=200, early_stop=30)  # 增加早停的耐心值
+
+            # 🔥【剪枝核心】向 Optuna 报告中间结果
+            # 我们使用验证损失作为剪枝的依据
+            current_val_loss = model_cv._validLossList[-1]
+            trial.report(current_val_loss, fold + 1)
+
+            # 🔥【剪枝判断】检查是否应该剪枝
+            if trial.should_prune():
+                print(f"    !!! Fold {fold + 1} was pruned.")
+                raise optuna.exceptions.TrialPruned()
+
         except torch._C._LinAlgError:
             print(f"    !!! Fold {fold + 1} failed due to a singular matrix. Pruning this trial.")
+            raise optuna.exceptions.TrialPruned()
+        except RuntimeError as e:
+            # 捕获如 CUDA OOM 等运行时错误
+            print(f"    !!! Fold {fold + 1} failed with a RuntimeError: {e}. Pruning this trial.")
             raise optuna.exceptions.TrialPruned()
         except Exception as e:
             print(f"    !!! Fold {fold + 1} failed with an unexpected error: {e}. Pruning this trial.")
             raise optuna.exceptions.TrialPruned()
 
-        # 🔥【关键修复3】使用正确的属性名
+        # 记录当前折的最终验证损失
         score = model_cv._validLossList[-1]
         fold_scores.append(score)
+        print(f"    >> Fold {fold + 1} finished with validation loss: {score:.6f}")
 
+        # 🔥【资源清理】彻底清理模型和缓存
         del model_cv
         torch.cuda.empty_cache()
 
     # 4. 返回当前超参数组合的平均验证损失
+    # 如果有折被剪枝，fold_scores 可能不完整，需要处理
+    if len(fold_scores) < N_SPLITS:
+        print(f"  >> Trial {trial.number} was pruned early.")
+        raise optuna.exceptions.TrialPruned()
+
     mean_score = np.mean(fold_scores)
-    print(f"  >> Trial {trial.number} finished with mean validation loss: {mean_score:.6f}")
+    std_score = np.std(fold_scores)
+    print(f"  >> Trial {trial.number} finished. Mean Loss: {mean_score:.6f}, Std: {std_score:.6f}")
 
     return mean_score
 
@@ -230,8 +317,8 @@ def objective(trial):
 print("\n=== 开始 Optuna 超参数搜索 ===")
 # 创建一个 study 对象，目标是 'minimize' (最小化验证损失)
 study = optuna.create_study(direction='minimize')
-# 运行优化，例如尝试 20 次不同的超参数组合
-study.optimize(objective, n_trials=20)
+# 运行优化，例如尝试 50 次不同的超参数组合
+study.optimize(objective, n_trials=50, timeout=3600) # 增加一个超时时间（秒）
 
 print("\n=== Optuna 搜索完成 ===")
 print(f"最优参数: {study.best_params}")
@@ -259,34 +346,40 @@ for i in range(best_params['n_layers']):
     final_hidden_dims[1].append(best_params[f'n_units_l{i}'])
 
 # 为了在最终训练时监控性能，我们从 train_val_data_full 中再划分一个小的验证集
-final_val_size = int(len(train_val_data_full) * 0.1)
-final_train_data_sorted = train_val_data_full.sort_values(by=['year', 'month', 'doy'])
-final_val_data = final_train_data_sorted.iloc[:final_val_size].copy()
-final_train_data = final_train_data_sorted.iloc[final_val_size:].copy()
-
+# 注意：这里的划分方式需要与交叉验证时一致，即按站点分组
+# 但为了简单，我们直接使用之前划分好的 train_data_full 和 val_data_full
 final_train_dataset, final_val_dataset, final_test_dataset = init_dataset_split(
-    train_data=final_train_data, val_data=final_val_data, test_data=test_data,
+    train_data=train_data_full, val_data=val_data_full, test_data=test_data,
     x_column=x_columns, y_column=y_column_transformed,
     spatial_column=['X', 'Y', 'Z'], temp_column=['doy', 'year', 'month'],
     id_column=['id'], use_model="gtnnwr", batch_size=128, dropna=True
 )
 
+# 🔥【关键】根据 Optuna 找到的最佳调度器类型来构建参数
 optimizer_params_final = {
-    "scheduler": "MultiStepLR",
-    "scheduler_milestones": [1000, 2000, 3000, 4000],
-    "scheduler_gamma": 0.8,
-    "lr": best_params['lr']
+    "weight_decay": best_params['weight_decay'],
+    "scheduler": best_params['scheduler'],
 }
+if best_params['scheduler'] == 'MultiStepLR':
+    # 在最终训练中，可以使用更通用的milestones
+    optimizer_params_final["scheduler_milestones"] = [200, 400, 600, 800]
+    optimizer_params_final["scheduler_gamma"] = 0.7
+elif best_params['scheduler'] == 'CosineAnnealingLR':
+    optimizer_params_final["scheduler_T_max"] = 500
+    optimizer_params_final["scheduler_eta_min"] = 1e-5
+
 
 final_model = GTNNWR(
     final_train_dataset, final_val_dataset, final_test_dataset,
     final_hidden_dims, drop_out=best_params['dropout'],
-    optimizer='Adadelta', optimizer_params=optimizer_params_final,
+    optimizer=best_params['optimizer'], optimizer_params=optimizer_params_final,
+    # 🔥【关键修复】通过 start_lr=best_params['lr'] 传递学习率
+    start_lr=best_params['lr'],
     write_path="../demo_result/final_model_optuna",
     model_name="GTNNWR_Optuna_Best"
 )
 final_model.add_graph()
-final_model.run(100, 1000)  # 使用更多的epoch进行充分训练
+final_model.run(max_epoch=1000, early_stop=100) # 使用更多的epoch进行充分训练
 
 # ----------------------------------------------------------------------
 print("\n=== 在独立测试集上评估最终模型 ===")
