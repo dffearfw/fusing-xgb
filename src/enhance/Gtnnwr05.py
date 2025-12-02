@@ -210,9 +210,13 @@ def objective(trial):
     if scheduler_name == 'MultiStepLR':
         # 动态建议 2 到 4 个里程碑点
         n_milestones = trial.suggest_int('n_milestones', 2, 4)
-        milestones = sorted(
-            [int(m * 200) for m in trial.suggest_float(f'milestone_{i}', 0.2, 0.8, step=0.2) for i in
-             range(n_milestones)])
+
+        # 🔥【修复】分两步生成 milestones
+        # 第一步：收集所有建议的浮点数
+        milestone_floats = [trial.suggest_float(f'milestone_{i}', 0.2, 0.8, step=0.2) for i in range(n_milestones)]
+        # 第二步：将浮点数转换为整数并排序
+        milestones = sorted([int(m * 200) for m in milestone_floats])
+
         scheduler_gamma = trial.suggest_float('scheduler_gamma', 0.5, 0.9)
     elif scheduler_name == 'CosineAnnealingLR':
         scheduler_T_max = trial.suggest_int('scheduler_T_max', 100, 500)
