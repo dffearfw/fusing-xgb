@@ -10,7 +10,7 @@ from sklearn.cluster import DBSCAN
 import matplotlib.pyplot as plt
 from torch import nn
 from scipy.spatial import distance
-
+from gtnnwr_validation import GTNNWRValidator
 sys.path.append(os.path.abspath(os.path.join(os.getcwd(), os.pardir)))
 from gnnwr.datasets import init_dataset_split
 from gnnwr.models import GTNNWR
