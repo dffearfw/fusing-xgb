@@ -298,6 +298,19 @@ gtnnwr.add_graph()
 
 gtnnwr.run(100,1000)
 
+validator = GTNNWRValidator(
+    gtnnwr=gtnnwr,
+    train_data=train_data,
+    val_data=val_data,
+    test_data=test_data,
+    x_columns=x_columns
+)
+
+# 运行完整验证
+validation_results = validator.run_comprehensive_validation()
+
+
+
 gtnnwr.result()
 
 # 🔥【正确获取预测结果】
@@ -321,5 +334,6 @@ print("已将测试集的真实值和预测值都还原为原始尺度，准备�
 
 save_path = "../demo_result/gtnnwr_runs/GTNNWR_Final_results.png"
 metrics = plot_gtnnwr_results(gtnnwr, save_path=save_path, show_plot=True)
-
+# 获取最终建议
+print(f"\n最终建议: {validation_results['recommendation']}")
 
