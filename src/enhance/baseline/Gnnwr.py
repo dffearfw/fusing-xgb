@@ -4,7 +4,7 @@ from gnnwr import models,datasets,utils
 import pandas as pd
 import torch.nn as nn
 
-data = pd.read_excel('lu_onehot.xlsx')
+data = pd.read_excel('D:/pyworkspace/fusing xgb/src/pre-process/aggregated_station_data.xlsx')
 data.head(5)
 
 data = data.sample(frac=1,random_state=42)
@@ -19,9 +19,7 @@ test_data = data.loc[test_idx]
 
 x_column=['aspect','slope','eastness','tpi','curvature1','curvature2','elevation','std_slope','std_eastness','std_tpi','std_curvature1',
           'std_curvature2','std_high','std_aspect','glsnow','cswe','snow_depth_snow_depth','ERA5温度_ERA5温度','era5_swe','doy','gldas',
-          'year','month','scp_start','scp_end','d1','d2','X','Y','Z','da','db','dc','dd','landuse_11','landuse_12','landuse_21','landuse_22',
-          'landuse_23','landuse_24','landuse_31','landuse_32','landuse_33','landuse_41','landuse_42','landuse_43','landuse_46',
-          'landuse_51','landuse_52','landuse_53','landuse_62','landuse_63','landuse_64']
+          'year','month','scp_start','scp_end','d1','d2','X','Y','Z','da','db','dc','dd']
 y_column=['swe']
 spatial_column=['longitude'	,'latitude']
 
@@ -57,6 +55,6 @@ gnnwr.add_graph()
 
 gnnwr.run(max_epoch = 4000,early_stop=1000,print_frequency = 500)
 
-gnnwr.load_model('result/gnnwr_models/GNNWR_PM25.pkl')
+
 
 gnnwr.result()
