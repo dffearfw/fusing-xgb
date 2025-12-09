@@ -77,375 +77,376 @@ gnnwr.run(max_epoch=4000, early_stop=1000, print_frequency=500)
 gnnwr.result()
 
 
+## ==========================================
+# 修复和验证部分
 # ==========================================
-# 新增代码：提取特征维度的空间变权重矩阵
+
+# 首先，让我们检查模型输出的实际内容
+print("\n" + "=" * 60)
+print("检查模型输出类型")
+print("=" * 60)
+
+# 获取一个批次的数据进行检查
+for batch_idx, batch in enumerate(train_set.dataloader):
+    if len(batch) >= 2:
+        distances, features = batch[:2]
+        break
+
+# 获取模型输出
+model = gnnwr._model
+model.eval()
+device = gnnwr._device
+distances_device = distances.to(device)
+
+with torch.no_grad():
+    model_output = model(distances_device)
+
+print(f"输入距离矩阵形状: {distances.shape}")
+print(f"输入特征形状: {features.shape}")
+print(f"模型输出形状: {model_output.shape}")
+print(f"模型输出范围: [{model_output.min().item():.4f}, {model_output.max().item():.4f}]")
+print(f"模型输出均值: {model_output.mean().item():.4f}")
+print(f"模型输出标准差: {model_output.std().item():.4f}")
+
+# 检查模型输出是否可能是权重（应该每个样本有35个值）
+if model_output.shape[1] == 35:
+    print("✅ 模型输出维度与特征数匹配（35）")
+    # 检查权重特性
+    weights_sample = model_output[0].cpu().numpy()
+    print(f"第一个样本的权重统计:")
+    print(f"  权重和: {weights_sample.sum():.4f}")
+    print(f"  权重均值的绝对值: {np.abs(weights_sample).mean():.4f}")
+    print(f"  权重标准差: {weights_sample.std():.4f}")
+
+    # 检查前5个权重值
+    print(f"  前5个权重值:")
+    for i in range(5):
+        print(f"    w_{i}: {weights_sample[i]:.4f}")
+else:
+    print(f"⚠️ 模型输出维度({model_output.shape[1]})不等于特征数(35)")
+
 # ==========================================
+# 方法1：尝试直接验证预测公式
+# ==========================================
+print("\n" + "=" * 60)
+print("方法1：直接验证预测公式")
+print("=" * 60)
 
-def extract_feature_space_weights(gnnwr_instance, dataset, dataset_name="dataset"):
+# 使用提取的"权重"计算预测
+with torch.no_grad():
+    # 获取模型输出的"权重"
+    weights = model(distances_device)
+
+    # 将数据移到CPU进行计算
+    features_tensor = features.float()
+    weights_cpu = weights.cpu()
+
+    # 获取OLS系数
+    if isinstance(gnnwr._coefficient, list):
+        ols_coeff = np.array(gnnwr._coefficient)
+    else:
+        ols_coeff = gnnwr._coefficient
+
+    ols_tensor = torch.tensor(ols_coeff).float()
+
+    # 计算预测值：y = sum(w_ij * β_ols_j * x_ij)
+    # 注意：特征矩阵的最后一列是偏置项（全1）
+    weighted_coeff = weights_cpu * ols_tensor
+    predictions = torch.sum(weighted_coeff * features_tensor, dim=1)
+
+    print(f"计算得到的预测值形状: {predictions.shape}")
+    print(f"预测值范围: [{predictions.min():.4f}, {predictions.max():.4f}]")
+    print(f"预测值均值: {predictions.mean():.4f}")
+
+    # 获取该批次的实际标签
+    if len(batch) >= 3:
+        labels = batch[2]
+        print(f"实际标签范围: [{labels.min():.4f}, {labels.max():.4f}]")
+        print(f"实际标签均值: {labels.mean():.4f}")
+
+        # 计算误差
+        mse = torch.mean((predictions - labels) ** 2).item()
+        mae = torch.mean(torch.abs(predictions - labels)).item()
+        print(f"该批次预测误差:")
+        print(f"  MSE: {mse:.4f}")
+        print(f"  MAE: {mae:.4f}")
+
+# ==========================================
+# 方法2：检查GNNWR原始预测
+# ==========================================
+print("\n" + "=" * 60)
+print("方法2：检查GNNWR原始预测")
+print("=" * 60)
+
+# 获取原始预测
+original_pred = gnnwr.predict(train_set)
+print(f"原始预测结果形状: {original_pred.shape}")
+print(f"原始预测值统计:")
+print(f"  均值: {original_pred['pred_result'].mean():.4f}")
+print(f"  标准差: {original_pred['pred_result'].std():.4f}")
+print(f"  范围: [{original_pred['pred_result'].min():.4f}, {original_pred['pred_result'].max():.4f}]")
+
+# ==========================================
+# 方法3：重新设计验证函数
+# ==========================================
+def verify_prediction_with_debug(gnnwr_instance, dataset, dataset_name="dataset"):
     """
-    提取特征维度的空间变权重矩阵
-
-    参数:
-    gnnwr_instance: 训练好的GNNWR实例
-    dataset: 数据集（train_set, val_set, test_set）
-    dataset_name: 数据集名称，用于输出信息
-
-    返回:
-    feature_weights: (n_samples, n_features+1) 特征空间变权重矩阵
-    ids: 对应的样本ID
+    带调试信息的预测验证
     """
-    print(f"\n=== 提取 {dataset_name} 的特征空间变权重矩阵 ===")
+    print(f"\n=== 调试验证：{dataset_name} ===")
 
-    # 获取模型
     model = gnnwr_instance._model
     model.eval()
-
-    # 获取设备信息
     device = gnnwr_instance._device
-    use_gpu = gnnwr_instance._use_gpu
-
-    all_feature_weights = []
-    all_ids = []
-
-    with torch.no_grad():
-        for batch_idx, batch in enumerate(dataset.dataloader):
-            if len(batch) == 4:
-                distances, features, labels, ids = batch
-            else:
-                distances, features = batch[:2]
-                ids = batch[-1] if len(batch) > 2 else None
-
-            # 移动到设备
-            distances = distances.to(device)
-
-            # 获取特征空间变权重（SWNN的输出）
-            # 这就是每个样本的特征权重向量
-            feature_weights = model(distances)
-
-            # 存储结果
-            all_feature_weights.append(feature_weights.cpu().numpy())
-            if ids is not None:
-                all_ids.append(ids.cpu().numpy())
-
-            # 打印第一批信息
-            if batch_idx == 0:
-                print(f"第一批数据:")
-                print(f"  输入距离矩阵形状: {distances.shape}")
-                print(f"  输入特征形状: {features.shape}")
-                print(f"  输出特征权重形状: {feature_weights.shape}")
-                print(f"  特征权重范围: [{feature_weights.min().item():.4f}, {feature_weights.max().item():.4f}]")
-                print(f"  特征权重均值: {feature_weights.mean().item():.4f}")
-
-                # 检查权重矩阵的特性
-                print(f"\n  第一个样本的特征权重（前5个）:")
-                sample_weights = feature_weights[0].cpu().numpy()
-                for i in range(min(5, len(sample_weights))):
-                    print(f"    权重{i + 1}: {sample_weights[i]:.4f}")
-
-    # 合并所有batch的结果
-    if all_feature_weights:
-        feature_weights_matrix = np.concatenate(all_feature_weights, axis=0)
-        if all_ids:
-            ids_array = np.concatenate(all_ids, axis=0)
-        else:
-            ids_array = np.arange(len(feature_weights_matrix))
-    else:
-        feature_weights_matrix = np.array([])
-        ids_array = np.array([])
-
-    print(f"\n{dataset_name} 特征空间变权重矩阵:")
-    print(f"  形状: {feature_weights_matrix.shape}")
-    print(f"  总样本数: {len(feature_weights_matrix)}")
-    print(f"  每个样本的特征权重数: {feature_weights_matrix.shape[1] if len(feature_weights_matrix.shape) > 1 else 0}")
-
-    return feature_weights_matrix, ids_array
-
-
-def save_feature_weights_analysis(feature_weights, dataset_name, output_dir='result/weights'):
-    """
-    保存特征权重矩阵并进行分析
-
-    参数:
-    feature_weights: 特征权重矩阵
-    dataset_name: 数据集名称
-    output_dir: 输出目录
-    """
-    os.makedirs(output_dir, exist_ok=True)
-
-    if len(feature_weights) == 0:
-        print(f"警告: {dataset_name} 的特征权重矩阵为空")
-        return
-
-    # 1. 保存原始权重矩阵
-    npy_path = os.path.join(output_dir, f'{dataset_name}_feature_weights.npy')
-    np.save(npy_path, feature_weights)
-    print(f"  原始权重矩阵已保存: {npy_path}")
-
-    # 2. 保存为CSV（便于查看）
-    n_features = feature_weights.shape[1]
-    columns = [f'weight_feature_{i}' for i in range(n_features)]
-
-    weights_df = pd.DataFrame(feature_weights, columns=columns)
-    csv_path = os.path.join(output_dir, f'{dataset_name}_feature_weights.csv')
-    weights_df.to_csv(csv_path, index=False)
-    print(f"  CSV格式已保存: {csv_path}")
-
-    # 3. 创建统计分析报告
-    stats = {}
-    for i in range(n_features):
-        col_name = f'weight_feature_{i}'
-        col_data = feature_weights[:, i]
-        stats[col_name] = {
-            'mean': np.mean(col_data),
-            'std': np.std(col_data),
-            'min': np.min(col_data),
-            'max': np.max(col_data),
-            'median': np.median(col_data),
-            'q25': np.percentile(col_data, 25),
-            'q75': np.percentile(col_data, 75)
-        }
-
-    # 转换为DataFrame
-    stats_df = pd.DataFrame(stats).T
-    stats_path = os.path.join(output_dir, f'{dataset_name}_feature_weights_statistics.csv')
-    stats_df.to_csv(stats_path)
-    print(f"  统计分析已保存: {stats_path}")
-
-    # 4. 打印摘要信息
-    print(f"\n  {dataset_name} 特征权重统计摘要:")
-    print(f"    整体均值: {np.mean(feature_weights):.4f}")
-    print(f"    整体标准差: {np.std(feature_weights):.4f}")
-    print(f"    整体最小值: {np.min(feature_weights):.4f}")
-    print(f"    整体最大值: {np.max(feature_weights):.4f}")
-
-    # 检查权重分布
-    negative_ratio = np.sum(feature_weights < 0) / feature_weights.size
-    zero_ratio = np.sum(np.abs(feature_weights) < 0.01) / feature_weights.size
-    print(f"    负值比例: {negative_ratio:.2%}")
-    print(f"    接近零值比例: {zero_ratio:.2%}")
-
-
-# ==========================================
-# 执行特征权重提取
-# ==========================================
-print("\n" + "=" * 60)
-print("开始提取特征维度的空间变权重矩阵")
-print("=" * 60)
-
-# 提取训练集特征权重
-feature_weights_train, train_ids = extract_feature_space_weights(gnnwr, train_set, "训练集")
-save_feature_weights_analysis(feature_weights_train, "train")
-
-# 提取验证集特征权重
-feature_weights_val, val_ids = extract_feature_space_weights(gnnwr, val_set, "验证集")
-save_feature_weights_analysis(feature_weights_val, "val")
-
-# 提取测试集特征权重
-feature_weights_test, test_ids = extract_feature_space_weights(gnnwr, test_set, "测试集")
-save_feature_weights_analysis(feature_weights_test, "test")
-
-# ==========================================
-# 验证权重矩阵的数学性质
-# ==========================================
-print("\n" + "=" * 60)
-print("验证特征权重矩阵的数学性质")
-print("=" * 60)
-
-# 1. 验证与OLS系数的关系
-print("\n1. OLS系数验证:")
-# 将列表转换为numpy数组
-if isinstance(gnnwr._coefficient, list):
-    coefficient_array = np.array(gnnwr._coefficient)
-    print(f"   OLS系数类型: 列表 -> 已转换为numpy数组")
-else:
-    coefficient_array = gnnwr._coefficient
-    print(f"   OLS系数类型: {type(coefficient_array).__name__}")
-
-print(f"   OLS系数形状: {coefficient_array.shape}")
-print(f"   OLS系数值（前5个）:")
-for i in range(min(5, len(coefficient_array))):
-    print(f"    系数{i + 1}: {coefficient_array[i]:.4f}")
-
-# 检查维度是否匹配
-if len(feature_weights_train.shape) > 1:
-    n_features = feature_weights_train.shape[1]
-    if n_features == len(coefficient_array):
-        print(f"   ✅ 特征权重维度({n_features})与OLS系数维度({len(coefficient_array)})匹配")
-    else:
-        print(f"   ⚠️  特征权重维度({n_features})与OLS系数维度({len(coefficient_array)})不匹配")
-
-
-# 2. 验证预测一致性（可选）
-def verify_prediction_consistency(gnnwr_instance, dataset, feature_weights, dataset_name):
-    """
-    验证使用提取的权重是否能重现原始预测
-    """
-    print(f"\n2. {dataset_name} 预测一致性验证:")
 
     # 获取OLS系数
     if isinstance(gnnwr_instance._coefficient, list):
-        coefficient_array = np.array(gnnwr_instance._coefficient)
+        ols_coeff = np.array(gnnwr_instance._coefficient)
     else:
-        coefficient_array = gnnwr_instance._coefficient
+        ols_coeff = gnnwr_instance._coefficient
 
-    # 获取原始预测
-    original_pred = gnnwr_instance.predict(dataset)
-    original_y = original_pred['pred_result'].values
+    all_predictions = []
+    all_labels = []
+    all_weights = []
+    all_features = []
 
-    # 使用提取的权重计算预测
-    reconstructed_y = []
-    start_idx = 0
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataset.dataloader):
+            if len(batch) >= 3:
+                distances, features, labels = batch[:3]
 
-    for batch_idx, batch in enumerate(dataset.dataloader):
-        if len(batch) == 4:
-            distances, features, labels, ids = batch
-            batch_size = features.shape[0]
+                # 移动到设备
+                distances_device = distances.to(device)
+                features_tensor = features.float()
 
-            # 获取对应的特征权重
-            end_idx = start_idx + batch_size
-            batch_weights = feature_weights[start_idx:end_idx]
-            start_idx = end_idx  # 更新索引
+                # 获取模型输出
+                model_output = model(distances_device)
+                weights = model_output.cpu()
 
-            # 转换为tensor
-            features_tensor = torch.tensor(features).float()
-            weights_tensor = torch.tensor(batch_weights).float()
-            ols_tensor = torch.tensor(coefficient_array).float()
+                # 存储数据用于分析
+                all_weights.append(weights.numpy())
+                all_features.append(features.numpy())
 
-            # 计算预测值: y = sum(w_ij * β_ols_j * x_ij)
-            # 注意：features_tensor包含了偏置项（最后一列全1）
-            weighted_coeff = weights_tensor * ols_tensor
-            predictions = torch.sum(weighted_coeff * features_tensor, dim=1)
+                # 使用提取的权重计算预测
+                ols_tensor = torch.tensor(ols_coeff).float()
+                weighted_coeff = weights * ols_tensor
+                batch_predictions = torch.sum(weighted_coeff * features_tensor, dim=1)
 
-            reconstructed_y.extend(predictions.numpy())
+                all_predictions.append(batch_predictions.numpy())
+                all_labels.append(labels.numpy())
 
-    reconstructed_y = np.array(reconstructed_y)
+                # 只打印第一批的详细信息
+                if batch_idx == 0:
+                    print(f"第一批数据:")
+                    print(f"  距离矩阵形状: {distances.shape}")
+                    print(f"  特征形状: {features.shape}")
+                    print(f"  模型输出形状: {model_output.shape}")
+                    print(f"  模型输出均值: {model_output.mean().item():.4f}")
 
-    # 比较预测结果
-    if len(original_y) == len(reconstructed_y):
-        mse = np.mean((original_y - reconstructed_y) ** 2)
-        mae = np.mean(np.abs(original_y - reconstructed_y))
-        corr = np.corrcoef(original_y, reconstructed_y)[0, 1]
+                    # 检查一个样本的计算过程
+                    sample_idx = 0
+                    print(f"\n  样本{sample_idx}的详细计算:")
+                    print(f"    特征值（前5个）: {features_tensor[sample_idx, :5].numpy()}")
+                    print(f"    权重值（前5个）: {weights[sample_idx, :5].numpy()}")
+                    print(f"    OLS系数（前5个）: {ols_coeff[:5]}")
 
-        print(f"   原始预测样本数: {len(original_y)}")
-        print(f"   重建预测样本数: {len(reconstructed_y)}")
-        print(f"   均方误差(MSE): {mse:.6f}")
-        print(f"   平均绝对误差(MAE): {mae:.6f}")
-        print(f"   相关系数: {corr:.6f}")
+                    # 计算加权系数
+                    weighted = weights[sample_idx].numpy() * ols_coeff
+                    print(f"    加权系数（前5个）: {weighted[:5]}")
+
+                    # 计算贡献
+                    contributions = weighted * features_tensor[sample_idx].numpy()
+                    print(f"    特征贡献（前5个）: {contributions[:5]}")
+
+                    # 预测值
+                    pred_value = batch_predictions[sample_idx].item()
+                    true_value = labels[sample_idx].item() if len(labels) > sample_idx else None
+                    print(f"    计算预测值: {pred_value:.4f}")
+                    if true_value is not None:
+                        print(f"    实际标签值: {true_value:.4f}")
+                        print(f"    误差: {abs(pred_value - true_value):.4f}")
+
+    # 合并所有批次
+    if all_predictions:
+        predictions_array = np.concatenate(all_predictions, axis=0)
+        labels_array = np.concatenate(all_labels, axis=0)
+
+        print(f"\n整体统计:")
+        print(f"  总样本数: {len(predictions_array)}")
+        print(f"  预测值均值: {np.mean(predictions_array):.4f}")
+        print(f"  预测值标准差: {np.std(predictions_array):.4f}")
+        print(f"  标签均值: {np.mean(labels_array):.4f}")
+        print(f"  标签标准差: {np.std(labels_array):.4f}")
+
+        # 计算误差
+        mse = np.mean((predictions_array - labels_array) ** 2)
+        mae = np.mean(np.abs(predictions_array - labels_array))
+        corr = np.corrcoef(predictions_array, labels_array)[0, 1]
+
+        print(f"\n误差分析:")
+        print(f"  MSE: {mse:.6f}")
+        print(f"  RMSE: {np.sqrt(mse):.6f}")
+        print(f"  MAE: {mae:.6f}")
+        print(f"  相关系数: {corr:.6f}")
+
+        # 检查权重统计
+        if all_weights:
+            weights_array = np.concatenate(all_weights, axis=0)
+            print(f"\n权重统计:")
+            print(f"  权重均值: {np.mean(weights_array):.4f}")
+            print(f"  权重标准差: {np.std(weights_array):.4f}")
+            print(f"  权重范围: [{np.min(weights_array):.4f}, {np.max(weights_array):.4f}]")
+
+            # 检查每个特征的权重统计
+            print(f"\n各特征权重统计（前5个特征）:")
+            for i in range(min(5, weights_array.shape[1])):
+                w_col = weights_array[:, i]
+                print(f"  特征{i}: 均值={np.mean(w_col):.4f}, 标准差={np.std(w_col):.4f}, 范围=[{np.min(w_col):.4f}, {np.max(w_col):.4f}]")
+
+        return predictions_array, labels_array
+    else:
+        print("没有数据")
+        return None, None
+
+# ==========================================
+# 执行验证
+# ==========================================
+print("\n" + "=" * 60)
+print("执行综合验证")
+print("=" * 60)
+
+# 对训练集进行验证
+train_pred, train_labels = verify_prediction_with_debug(gnnwr, train_set, "训练集")
+
+# 获取原始预测进行比较
+if train_pred is not None:
+    original_train_pred = gnnwr.predict(train_set)['pred_result'].values
+
+    print("\n" + "=" * 60)
+    print("比较提取权重预测 vs 原始GNNWR预测")
+    print("=" * 60)
+
+    print(f"提取权重预测样本数: {len(train_pred)}")
+    print(f"原始GNNWR预测样本数: {len(original_train_pred)}")
+
+    # 确保长度一致
+    min_len = min(len(train_pred), len(original_train_pred))
+    if min_len > 0:
+        train_pred_trimmed = train_pred[:min_len]
+        original_pred_trimmed = original_train_pred[:min_len]
+
+        mse = np.mean((train_pred_trimmed - original_pred_trimmed) ** 2)
+        mae = np.mean(np.abs(train_pred_trimmed - original_pred_trimmed))
+        corr = np.corrcoef(train_pred_trimmed, original_pred_trimmed)[0, 1]
+
+        print(f"\n比较结果:")
+        print(f"  MSE (与原始预测): {mse:.6f}")
+        print(f"  RMSE: {np.sqrt(mse):.6f}")
+        print(f"  MAE: {mae:.6f}")
+        print(f"  相关系数: {corr:.6f}")
+
+        # 分析差异
+        diff = train_pred_trimmed - original_pred_trimmed
+        print(f"\n差异分析:")
+        print(f"  差异均值: {np.mean(diff):.6f}")
+        print(f"  差异标准差: {np.std(diff):.6f}")
+        print(f"  最大正向差异: {np.max(diff):.6f}")
+        print(f"  最大负向差异: {np.min(diff):.6f}")
 
         if mse < 1e-4:
-            print("   ✅ 预测一致性验证通过！")
+            print("✅ 预测一致性验证通过！")
         else:
-            print(f"   ⚠️  预测存在差异，MSE={mse:.6f}")
+            print(f"❌ 预测存在显著差异，MSE={mse:.6f}")
+
+# ==========================================
+# 诊断可能的问题
+# ==========================================
+print("\n" + "=" * 60)
+print("问题诊断")
+print("=" * 60)
+
+# 检查几个可能性：
+
+# 1. 检查权重是否可能是经过变换的
+print("\n1. 检查权重特性:")
+if 'all_weights' in locals() and len(all_weights) > 0:
+    weights_sample = all_weights[0][0]  # 第一个批次的第一个样本
+    print(f"  样本权重和: {weights_sample.sum():.4f}")
+    print(f"  样本权重均值的绝对值: {np.abs(weights_sample).mean():.4f}")
+
+    # 检查权重是否接近1（如果是乘法权重）
+    abs_diff_from_one = np.abs(weights_sample - 1.0)
+    print(f"  与1的平均绝对偏差: {np.mean(abs_diff_from_one):.4f}")
+
+    # 检查权重是否可能是加法项而不是乘法项
+    print(f"  权重平方和: {np.sum(weights_sample**2):.4f}")
+
+# 2. 尝试不同的解释
+print("\n2. 尝试不同的解释:")
+print("  可能性1: model(distances) 输出的是 w_ij * β_ols_j 的乘积")
+print("  可能性2: model(distances) 输出的是经过某种变换的权重")
+print("  可能性3: 预测公式可能不是简单的 w_ij * β_ols_j * x_ij")
+
+# 3. 建议的解决方案
+print("\n3. 建议的解决方案:")
+print("  方案A: 检查GNNWR论文中的确切公式")
+print("  方案B: 查看GNNWR库的源代码，了解model(distances)的具体含义")
+print("  方案C: 尝试 model(distances) * ols_coefficient * features 的不同组合")
+print("  方案D: 可能权重需要归一化或经过激活函数")
+
+# ==========================================
+# 尝试方案C：不同的组合
+# ==========================================
+print("\n" + "=" * 60)
+print("尝试不同的预测公式组合")
+print("=" * 60)
+
+# 用第一批数据测试
+for batch_idx, batch in enumerate(train_set.dataloader):
+    if len(batch) >= 3:
+        distances, features, labels = batch[:3]
+        break
+
+with torch.no_grad():
+    distances_device = distances.to(device)
+    model_output = model(distances_device).cpu()
+    features_tensor = features.float()
+    ols_tensor = torch.tensor(ols_coeff).float()
+
+    print(f"测试不同公式组合:")
+
+    # 组合1: y = sum(model_output * features)  # 假设model_output已经是加权系数
+    pred1 = torch.sum(model_output * features_tensor, dim=1)
+    error1 = torch.mean((pred1 - labels) ** 2).item()
+    print(f"  公式1: y = sum(model_output * features)")
+    print(f"    MSE: {error1:.4f}")
+
+    # 组合2: y = sum((model_output * ols_coeff) * features)
+    pred2 = torch.sum((model_output * ols_tensor) * features_tensor, dim=1)
+    error2 = torch.mean((pred2 - labels) ** 2).item()
+    print(f"  公式2: y = sum((model_output * β_ols) * features)")
+    print(f"    MSE: {error2:.4f}")
+
+    # 组合3: y = sum(model_output) + sum(β_ols * features)  # 加法形式
+    pred3 = torch.sum(model_output, dim=1) + torch.sum(ols_tensor * features_tensor, dim=1)
+    error3 = torch.mean((pred3 - labels) ** 2).item()
+    print(f"  公式3: y = sum(model_output) + sum(β_ols * features)")
+    print(f"    MSE: {error3:.4f}")
+
+    # 组合4: y = sum(model_output) * sum(β_ols * features)  # 乘法形式
+    pred4 = torch.sum(model_output, dim=1) * torch.sum(ols_tensor * features_tensor, dim=1)
+    error4 = torch.mean((pred4 - labels) ** 2).item()
+    print(f"  公式4: y = sum(model_output) * sum(β_ols * features)")
+    print(f"    MSE: {error4:.4f}")
+
+    # 找出最佳组合
+    errors = [error1, error2, error3, error4]
+    best_idx = np.argmin(errors)
+    best_formula = [1, 2, 3, 4][best_idx]
+    print(f"\n  最佳公式: 公式{best_formula}, MSE={errors[best_idx]:.4f}")
+
+    # 如果最佳公式是公式2，说明我们的原始理解可能是正确的
+    if best_idx == 1:
+        print("  ✅ 公式2表现最好，说明原始理解可能正确")
     else:
-        print(f"   样本数不匹配: 原始={len(original_y)}, 重建={len(reconstructed_y)}")
-        print(f"   差异: {abs(len(original_y) - len(reconstructed_y))} 个样本")
-
-
-# 执行验证
-verify_prediction_consistency(gnnwr, train_set, feature_weights_train, "训练集")
-
-# ==========================================
-# 为GNNW-XGBoost准备数据
-# ==========================================
-print("\n" + "=" * 60)
-print("为GNNW-XGBoost准备数据")
-print("=" * 60)
-
-
-def prepare_gnnw_xgboost_data(gnnwr_instance, dataset, feature_weights, dataset_name):
-    """
-    为GNNW-XGBoost准备输入数据
-
-    返回:
-    X_combined: 组合特征 [原始特征, 特征权重]
-    y: 目标变量
-    """
-    print(f"\n准备 {dataset_name} 的GNNW-XGBoost数据:")
-
-    all_features = []
-    all_labels = []
-
-    for batch_idx, batch in enumerate(dataset.dataloader):
-        if len(batch) == 4:
-            distances, features, labels, ids = batch
-
-            # 获取对应的特征权重
-            start_idx = batch_idx * features.shape[0]
-            end_idx = start_idx + features.shape[0]
-            batch_weights = feature_weights[start_idx:end_idx]
-
-            # 原始特征（去除偏置项，因为偏置已包含在特征权重中）
-            # features形状: (batch, 35)，其中最后一列是偏置（全1）
-            original_features = features[:, :-1].numpy()  # (batch, 34)
-
-            # 组合特征: [原始特征, 特征权重]
-            combined_features = np.hstack([original_features, batch_weights])
-
-            all_features.append(combined_features)
-            all_labels.append(labels.numpy())
-
-    if all_features:
-        X_combined = np.concatenate(all_features, axis=0)
-        y = np.concatenate(all_labels, axis=0)
-
-        print(f"  原始特征维度: {original_features.shape[1]}")
-        print(f"  特征权重维度: {batch_weights.shape[1]}")
-        print(f"  组合特征总维度: {X_combined.shape[1]}")
-        print(f"  总样本数: {X_combined.shape[0]}")
-
-        return X_combined, y
-    else:
-        return np.array([]), np.array([])
-
-
-# 准备训练数据
-X_train_gnnw, y_train = prepare_gnnw_xgboost_data(gnnwr, train_set, feature_weights_train, "训练集")
-X_val_gnnw, y_val = prepare_gnnw_xgboost_data(gnnwr, val_set, feature_weights_val, "验证集")
-X_test_gnnw, y_test = prepare_gnnw_xgboost_data(gnnwr, test_set, feature_weights_test, "测试集")
-
-# 保存GNNW-XGBoost数据
-if len(X_train_gnnw) > 0:
-    np.save('result/weights/X_train_gnnw_xgboost.npy', X_train_gnnw)
-    np.save('result/weights/y_train.npy', y_train)
-    np.save('result/weights/X_val_gnnw_xgboost.npy', X_val_gnnw)
-    np.save('result/weights/y_val.npy', y_val)
-    np.save('result/weights/X_test_gnnw_xgboost.npy', X_test_gnnw)
-    np.save('result/weights/y_test.npy', y_test)
-
-    print("\nGNNW-XGBoost数据已保存:")
-    print(f"  训练集: X={X_train_gnnw.shape}, y={y_train.shape}")
-    print(f"  验证集: X={X_val_gnnw.shape}, y={y_val.shape}")
-    print(f"  测试集: X={X_test_gnnw.shape}, y={y_test.shape}")
-
-# ==========================================
-# 总结报告
-# ==========================================
-print("\n" + "=" * 60)
-print("特征权重提取完成总结")
-print("=" * 60)
-
-print(f"\n1. 提取的特征权重矩阵维度:")
-print(f"   训练集: {feature_weights_train.shape} (样本数×特征权重数)")
-print(f"   验证集: {feature_weights_val.shape}")
-print(f"   测试集: {feature_weights_test.shape}")
-
-print(f"\n2. 特征权重统计:")
-print(f"   训练集 - 均值: {np.mean(feature_weights_train):.4f}, 标准差: {np.std(feature_weights_train):.4f}")
-print(f"   验证集 - 均值: {np.mean(feature_weights_val):.4f}, 标准差: {np.std(feature_weights_val):.4f}")
-print(f"   测试集 - 均值: {np.mean(feature_weights_test):.4f}, 标准差: {np.std(feature_weights_test):.4f}")
-
-print(f"\n3. GNNW-XGBoost输入特征维度:")
-if len(X_train_gnnw) > 0:
-    print(f"   原始特征数: {len(x_column)} = {len(x_column)}")
-    print(f"   特征权重数: {feature_weights_train.shape[1]}")
-    print(f"   总特征数: {X_train_gnnw.shape[1]}")
-    print(f"   GNNW-XGBoost特征 = 原始特征 + GNNWR特征权重")
-
-print(f"\n4. 输出文件:")
-print(f"   特征权重矩阵: result/weights/*_feature_weights.npy")
-print(f"   统计分析: result/weights/*_feature_weights_statistics.csv")
-print(f"   GNNW-XGBoost数据: result/weights/*_gnnw_xgboost.npy")
-
-print("\n" + "=" * 60)
-print("完成！现在可以基于这些特征权重构建GNNW-XGBoost模型")
-print("=" * 60)
+        print(f"  ⚠️  公式{best_formula}表现最好，可能需要调整理解")
