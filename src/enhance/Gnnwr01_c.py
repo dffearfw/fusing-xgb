@@ -71,7 +71,7 @@ gnnwr = models.GNNWR(
 gnnwr.add_graph()
 
 # 训练模型
-gnnwr.run(max_epoch=4000, early_stop=1000, print_frequency=500)
+gnnwr.run(max_epoch=11, early_stop=1000, print_frequency=500)
 
 # 显示结果
 gnnwr.result()
