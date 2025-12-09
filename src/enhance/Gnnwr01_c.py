@@ -76,124 +76,25 @@ gnnwr.run(max_epoch=11, early_stop=1000, print_frequency=500)
 # 显示结果
 gnnwr.result()
 
-
-## ==========================================
-# 修复和验证部分
 # ==========================================
-
-# 首先，让我们检查模型输出的实际内容
-print("\n" + "=" * 60)
-print("检查模型输出类型")
-print("=" * 60)
-
-# 获取一个批次的数据进行检查
-for batch_idx, batch in enumerate(train_set.dataloader):
-    if len(batch) >= 2:
-        distances, features = batch[:2]
-        break
-
-# 获取模型输出
-model = gnnwr._model
-model.eval()
-device = gnnwr._device
-distances_device = distances.to(device)
-
-with torch.no_grad():
-    model_output = model(distances_device)
-
-print(f"输入距离矩阵形状: {distances.shape}")
-print(f"输入特征形状: {features.shape}")
-print(f"模型输出形状: {model_output.shape}")
-print(f"模型输出范围: [{model_output.min().item():.4f}, {model_output.max().item():.4f}]")
-print(f"模型输出均值: {model_output.mean().item():.4f}")
-print(f"模型输出标准差: {model_output.std().item():.4f}")
-
-# 检查模型输出是否可能是权重（应该每个样本有35个值）
-if model_output.shape[1] == 35:
-    print("✅ 模型输出维度与特征数匹配（35）")
-    # 检查权重特性
-    weights_sample = model_output[0].cpu().numpy()
-    print(f"第一个样本的权重统计:")
-    print(f"  权重和: {weights_sample.sum():.4f}")
-    print(f"  权重均值的绝对值: {np.abs(weights_sample).mean():.4f}")
-    print(f"  权重标准差: {weights_sample.std():.4f}")
-
-    # 检查前5个权重值
-    print(f"  前5个权重值:")
-    for i in range(5):
-        print(f"    w_{i}: {weights_sample[i]:.4f}")
-else:
-    print(f"⚠️ 模型输出维度({model_output.shape[1]})不等于特征数(35)")
-
-# ==========================================
-# 方法1：尝试直接验证预测公式
+# 核心验证：检查权重提取是否正确
 # ==========================================
 print("\n" + "=" * 60)
-print("方法1：直接验证预测公式")
+print("核心验证：检查权重提取是否正确")
 print("=" * 60)
 
-# 使用提取的"权重"计算预测
-with torch.no_grad():
-    # 获取模型输出的"权重"
-    weights = model(distances_device)
 
-    # 将数据移到CPU进行计算
-    features_tensor = features.float()
-    weights_cpu = weights.cpu()
-
-    # 获取OLS系数
-    if isinstance(gnnwr._coefficient, list):
-        ols_coeff = np.array(gnnwr._coefficient)
-    else:
-        ols_coeff = gnnwr._coefficient
-
-    ols_tensor = torch.tensor(ols_coeff).float()
-
-    # 计算预测值：y = sum(w_ij * β_ols_j * x_ij)
-    # 注意：特征矩阵的最后一列是偏置项（全1）
-    weighted_coeff = weights_cpu * ols_tensor
-    predictions = torch.sum(weighted_coeff * features_tensor, dim=1)
-
-    print(f"计算得到的预测值形状: {predictions.shape}")
-    print(f"预测值范围: [{predictions.min():.4f}, {predictions.max():.4f}]")
-    print(f"预测值均值: {predictions.mean():.4f}")
-
-    # 获取该批次的实际标签
-    if len(batch) >= 3:
-        labels = batch[2]
-        print(f"实际标签范围: [{labels.min():.4f}, {labels.max():.4f}]")
-        print(f"实际标签均值: {labels.mean():.4f}")
-
-        # 计算误差
-        mse = torch.mean((predictions - labels) ** 2).item()
-        mae = torch.mean(torch.abs(predictions - labels)).item()
-        print(f"该批次预测误差:")
-        print(f"  MSE: {mse:.4f}")
-        print(f"  MAE: {mae:.4f}")
-
-# ==========================================
-# 方法2：检查GNNWR原始预测
-# ==========================================
-print("\n" + "=" * 60)
-print("方法2：检查GNNWR原始预测")
-print("=" * 60)
-
-# 获取原始预测
-original_pred = gnnwr.predict(train_set)
-print(f"原始预测结果形状: {original_pred.shape}")
-print(f"原始预测值统计:")
-print(f"  均值: {original_pred['pred_result'].mean():.4f}")
-print(f"  标准差: {original_pred['pred_result'].std():.4f}")
-print(f"  范围: [{original_pred['pred_result'].min():.4f}, {original_pred['pred_result'].max():.4f}]")
-
-# ==========================================
-# 方法3：重新设计验证函数
-# ==========================================
-def verify_prediction_with_debug(gnnwr_instance, dataset, dataset_name="dataset"):
+def verify_weight_extraction_core(gnnwr_instance, dataset, dataset_name="dataset"):
     """
-    带调试信息的预测验证
+    核心验证：检查提取的权重是否能重现模型预测
+
+    逻辑：
+    1. 用模型直接预测一批数据得到 y_model
+    2. 提取该批数据的权重矩阵 W
+    3. 计算 y_calc = Σ(W_ij × β_ols_j × x_ij)
+    4. 比较 y_model 和 y_calc
     """
-    print(f"\n=== 调试验证：{dataset_name} ===")
+    print(f"\n=== 核心验证：{dataset_name} ===")
 
     model = gnnwr_instance._model
     model.eval()
@@ -205,248 +106,223 @@ def verify_prediction_with_debug(gnnwr_instance, dataset, dataset_name="dataset"
     else:
         ols_coeff = gnnwr_instance._coefficient
 
-    all_predictions = []
+    # 收集所有批次的验证结果
+    all_model_preds = []
+    all_calc_preds = []
     all_labels = []
-    all_weights = []
-    all_features = []
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataset.dataloader):
             if len(batch) >= 3:
                 distances, features, labels = batch[:3]
 
-                # 移动到设备
+                # 1. 用模型直接预测
                 distances_device = distances.to(device)
+                model_output = model(distances_device)  # 这就是权重矩阵 W
+                model_output_cpu = model_output.cpu()
+
+                # 2. 计算模型预测的y（假设model(distances)返回的就是权重）
+                # 我们需要先确认模型是如何预测的
+                # 暂时先跳过这步，直接计算验证
+
+                # 3. 用提取的权重计算预测
                 features_tensor = features.float()
-
-                # 获取模型输出
-                model_output = model(distances_device)
-                weights = model_output.cpu()
-
-                # 存储数据用于分析
-                all_weights.append(weights.numpy())
-                all_features.append(features.numpy())
-
-                # 使用提取的权重计算预测
                 ols_tensor = torch.tensor(ols_coeff).float()
-                weighted_coeff = weights * ols_tensor
-                batch_predictions = torch.sum(weighted_coeff * features_tensor, dim=1)
 
-                all_predictions.append(batch_predictions.numpy())
+                # 计算 y_calc = Σ(W_ij × β_ols_j × x_ij)
+                weighted_coeff = model_output_cpu * ols_tensor  # W × β
+                y_calc = torch.sum(weighted_coeff * features_tensor, dim=1)
+
+                # 存储结果
+                all_calc_preds.append(y_calc.numpy())
                 all_labels.append(labels.numpy())
 
-                # 只打印第一批的详细信息
+                # 4. 获取模型的实际预测值（通过gnnwr.predict）
+                # 我们稍后统一比较
+
+                # 只分析第一批
                 if batch_idx == 0:
-                    print(f"第一批数据:")
+                    print(f"第一批数据验证:")
                     print(f"  距离矩阵形状: {distances.shape}")
-                    print(f"  特征形状: {features.shape}")
-                    print(f"  模型输出形状: {model_output.shape}")
-                    print(f"  模型输出均值: {model_output.mean().item():.4f}")
+                    print(f"  特征矩阵形状: {features.shape}")
+                    print(f"  提取的权重W形状: {model_output.shape}")
 
-                    # 检查一个样本的计算过程
+                    # 检查第一个样本
                     sample_idx = 0
-                    print(f"\n  样本{sample_idx}的详细计算:")
-                    print(f"    特征值（前5个）: {features_tensor[sample_idx, :5].numpy()}")
-                    print(f"    权重值（前5个）: {weights[sample_idx, :5].numpy()}")
-                    print(f"    OLS系数（前5个）: {ols_coeff[:5]}")
+                    print(f"\n  样本{sample_idx}详细计算:")
 
-                    # 计算加权系数
-                    weighted = weights[sample_idx].numpy() * ols_coeff
-                    print(f"    加权系数（前5个）: {weighted[:5]}")
+                    # 获取数据
+                    w_sample = model_output_cpu[sample_idx].numpy()  # 权重向量
+                    x_sample = features_tensor[sample_idx].numpy()  # 特征向量
+                    beta = ols_coeff  # OLS系数
 
-                    # 计算贡献
-                    contributions = weighted * features_tensor[sample_idx].numpy()
-                    print(f"    特征贡献（前5个）: {contributions[:5]}")
+                    print(f"    权重W范围: [{w_sample.min():.4f}, {w_sample.max():.4f}]")
+                    print(f"    特征X范围: [{x_sample.min():.4f}, {x_sample.max():.4f}]")
+                    print(f"    系数β范围: [{beta.min():.4f}, {beta.max():.4f}]")
 
-                    # 预测值
-                    pred_value = batch_predictions[sample_idx].item()
-                    true_value = labels[sample_idx].item() if len(labels) > sample_idx else None
-                    print(f"    计算预测值: {pred_value:.4f}")
-                    if true_value is not None:
-                        print(f"    实际标签值: {true_value:.4f}")
-                        print(f"    误差: {abs(pred_value - true_value):.4f}")
+                    # 计算各项
+                    w_beta = w_sample * beta  # W × β
+                    contributions = w_beta * x_sample  # (W × β) × X
+
+                    print(f"\n    计算过程:")
+                    print(f"      sum(W): {w_sample.sum():.4f}")
+                    print(f"      sum(β): {beta.sum():.4f}")
+                    print(f"      sum(X): {x_sample.sum():.4f}")
+                    print(f"      sum(W×β): {w_beta.sum():.4f}")
+                    print(f"      sum((W×β)×X): {contributions.sum():.4f}")
+
+                    y_calc_sample = y_calc[sample_idx].item()
+                    y_true_sample = labels[sample_idx].item()
+                    print(f"\n    结果:")
+                    print(f"      计算预测值 y_calc: {y_calc_sample:.4f}")
+                    print(f"      实际标签 y_true: {y_true_sample:.4f}")
+                    print(f"      绝对误差: {abs(y_calc_sample - y_true_sample):.4f}")
 
     # 合并所有批次
-    if all_predictions:
-        predictions_array = np.concatenate(all_predictions, axis=0)
-        labels_array = np.concatenate(all_labels, axis=0)
+    if all_calc_preds:
+        y_calc_all = np.concatenate(all_calc_preds, axis=0)
+        y_labels_all = np.concatenate(all_labels, axis=0)
 
-        print(f"\n整体统计:")
-        print(f"  总样本数: {len(predictions_array)}")
-        print(f"  预测值均值: {np.mean(predictions_array):.4f}")
-        print(f"  预测值标准差: {np.std(predictions_array):.4f}")
-        print(f"  标签均值: {np.mean(labels_array):.4f}")
-        print(f"  标签标准差: {np.std(labels_array):.4f}")
+        # 计算与真实标签的误差
+        mse_vs_true = np.mean((y_calc_all - y_labels_all) ** 2)
+        mae_vs_true = np.mean(np.abs(y_calc_all - y_labels_all))
 
-        # 计算误差
-        mse = np.mean((predictions_array - labels_array) ** 2)
-        mae = np.mean(np.abs(predictions_array - labels_array))
-        corr = np.corrcoef(predictions_array, labels_array)[0, 1]
+        print(f"\n整体统计（计算预测 vs 真实标签）:")
+        print(f"  总样本数: {len(y_calc_all)}")
+        print(f"  MSE: {mse_vs_true:.6f}")
+        print(f"  RMSE: {np.sqrt(mse_vs_true):.6f}")
+        print(f"  MAE: {mae_vs_true:.6f}")
 
-        print(f"\n误差分析:")
-        print(f"  MSE: {mse:.6f}")
-        print(f"  RMSE: {np.sqrt(mse):.6f}")
-        print(f"  MAE: {mae:.6f}")
-        print(f"  相关系数: {corr:.6f}")
-
-        # 检查权重统计
-        if all_weights:
-            weights_array = np.concatenate(all_weights, axis=0)
-            print(f"\n权重统计:")
-            print(f"  权重均值: {np.mean(weights_array):.4f}")
-            print(f"  权重标准差: {np.std(weights_array):.4f}")
-            print(f"  权重范围: [{np.min(weights_array):.4f}, {np.max(weights_array):.4f}]")
-
-            # 检查每个特征的权重统计
-            print(f"\n各特征权重统计（前5个特征）:")
-            for i in range(min(5, weights_array.shape[1])):
-                w_col = weights_array[:, i]
-                print(f"  特征{i}: 均值={np.mean(w_col):.4f}, 标准差={np.std(w_col):.4f}, 范围=[{np.min(w_col):.4f}, {np.max(w_col):.4f}]")
-
-        return predictions_array, labels_array
+        return y_calc_all
     else:
         print("没有数据")
-        return None, None
+        return None
+
 
 # ==========================================
-# 执行验证
+# 关键验证：与模型原始预测比较
 # ==========================================
 print("\n" + "=" * 60)
-print("执行综合验证")
+print("关键验证：计算预测 vs 模型原始预测")
 print("=" * 60)
 
 # 对训练集进行验证
-train_pred, train_labels = verify_prediction_with_debug(gnnwr, train_set, "训练集")
+print("\n1. 对训练集验证:")
+y_calc_train = verify_weight_extraction_core(gnnwr, train_set, "训练集")
 
-# 获取原始预测进行比较
-if train_pred is not None:
-    original_train_pred = gnnwr.predict(train_set)['pred_result'].values
+# 获取模型对训练集的原始预测
+print("\n2. 获取模型原始预测:")
+original_train_pred = gnnwr.predict(train_set)
+original_y_train = original_train_pred['pred_result'].values
 
-    print("\n" + "=" * 60)
-    print("比较提取权重预测 vs 原始GNNWR预测")
-    print("=" * 60)
+print(f"原始模型预测样本数: {len(original_y_train)}")
+print(f"原始预测统计:")
+print(f"  均值: {original_y_train.mean():.4f}")
+print(f"  标准差: {original_y_train.std():.4f}")
+print(f"  范围: [{original_y_train.min():.4f}, {original_y_train.max():.4f}]")
 
-    print(f"提取权重预测样本数: {len(train_pred)}")
-    print(f"原始GNNWR预测样本数: {len(original_train_pred)}")
+# 比较计算预测和模型预测
+if y_calc_train is not None and len(y_calc_train) == len(original_y_train):
+    print("\n3. 比较结果:")
 
-    # 确保长度一致
-    min_len = min(len(train_pred), len(original_train_pred))
-    if min_len > 0:
-        train_pred_trimmed = train_pred[:min_len]
-        original_pred_trimmed = original_train_pred[:min_len]
+    mse = np.mean((y_calc_train - original_y_train) ** 2)
+    mae = np.mean(np.abs(y_calc_train - original_y_train))
+    corr = np.corrcoef(y_calc_train, original_y_train)[0, 1]
 
-        mse = np.mean((train_pred_trimmed - original_pred_trimmed) ** 2)
-        mae = np.mean(np.abs(train_pred_trimmed - original_pred_trimmed))
-        corr = np.corrcoef(train_pred_trimmed, original_pred_trimmed)[0, 1]
+    print(f"  MSE（计算预测 vs 模型预测）: {mse:.8f}")
+    print(f"  RMSE: {np.sqrt(mse):.8f}")
+    print(f"  MAE: {mae:.8f}")
+    print(f"  相关系数: {corr:.8f}")
 
-        print(f"\n比较结果:")
-        print(f"  MSE (与原始预测): {mse:.6f}")
-        print(f"  RMSE: {np.sqrt(mse):.6f}")
-        print(f"  MAE: {mae:.6f}")
-        print(f"  相关系数: {corr:.6f}")
+    # 检查差异
+    diff = y_calc_train - original_y_train
+    print(f"\n  差异分析:")
+    print(f"    差异均值: {diff.mean():.8f}")
+    print(f"    差异标准差: {diff.std():.8f}")
+    print(f"    最大正向差异: {diff.max():.8f}")
+    print(f"    最大负向差异: {diff.min():.8f}")
 
-        # 分析差异
-        diff = train_pred_trimmed - original_pred_trimmed
-        print(f"\n差异分析:")
-        print(f"  差异均值: {np.mean(diff):.6f}")
-        print(f"  差异标准差: {np.std(diff):.6f}")
-        print(f"  最大正向差异: {np.max(diff):.6f}")
-        print(f"  最大负向差异: {np.min(diff):.6f}")
-
-        if mse < 1e-4:
-            print("✅ 预测一致性验证通过！")
-        else:
-            print(f"❌ 预测存在显著差异，MSE={mse:.6f}")
-
-# ==========================================
-# 诊断可能的问题
-# ==========================================
-print("\n" + "=" * 60)
-print("问题诊断")
-print("=" * 60)
-
-# 检查几个可能性：
-
-# 1. 检查权重是否可能是经过变换的
-print("\n1. 检查权重特性:")
-if 'all_weights' in locals() and len(all_weights) > 0:
-    weights_sample = all_weights[0][0]  # 第一个批次的第一个样本
-    print(f"  样本权重和: {weights_sample.sum():.4f}")
-    print(f"  样本权重均值的绝对值: {np.abs(weights_sample).mean():.4f}")
-
-    # 检查权重是否接近1（如果是乘法权重）
-    abs_diff_from_one = np.abs(weights_sample - 1.0)
-    print(f"  与1的平均绝对偏差: {np.mean(abs_diff_from_one):.4f}")
-
-    # 检查权重是否可能是加法项而不是乘法项
-    print(f"  权重平方和: {np.sum(weights_sample**2):.4f}")
-
-# 2. 尝试不同的解释
-print("\n2. 尝试不同的解释:")
-print("  可能性1: model(distances) 输出的是 w_ij * β_ols_j 的乘积")
-print("  可能性2: model(distances) 输出的是经过某种变换的权重")
-print("  可能性3: 预测公式可能不是简单的 w_ij * β_ols_j * x_ij")
-
-# 3. 建议的解决方案
-print("\n3. 建议的解决方案:")
-print("  方案A: 检查GNNWR论文中的确切公式")
-print("  方案B: 查看GNNWR库的源代码，了解model(distances)的具体含义")
-print("  方案C: 尝试 model(distances) * ols_coefficient * features 的不同组合")
-print("  方案D: 可能权重需要归一化或经过激活函数")
-
-# ==========================================
-# 尝试方案C：不同的组合
-# ==========================================
-print("\n" + "=" * 60)
-print("尝试不同的预测公式组合")
-print("=" * 60)
-
-# 用第一批数据测试
-for batch_idx, batch in enumerate(train_set.dataloader):
-    if len(batch) >= 3:
-        distances, features, labels = batch[:3]
-        break
-
-with torch.no_grad():
-    distances_device = distances.to(device)
-    model_output = model(distances_device).cpu()
-    features_tensor = features.float()
-    ols_tensor = torch.tensor(ols_coeff).float()
-
-    print(f"测试不同公式组合:")
-
-    # 组合1: y = sum(model_output * features)  # 假设model_output已经是加权系数
-    pred1 = torch.sum(model_output * features_tensor, dim=1)
-    error1 = torch.mean((pred1 - labels) ** 2).item()
-    print(f"  公式1: y = sum(model_output * features)")
-    print(f"    MSE: {error1:.4f}")
-
-    # 组合2: y = sum((model_output * ols_coeff) * features)
-    pred2 = torch.sum((model_output * ols_tensor) * features_tensor, dim=1)
-    error2 = torch.mean((pred2 - labels) ** 2).item()
-    print(f"  公式2: y = sum((model_output * β_ols) * features)")
-    print(f"    MSE: {error2:.4f}")
-
-    # 组合3: y = sum(model_output) + sum(β_ols * features)  # 加法形式
-    pred3 = torch.sum(model_output, dim=1) + torch.sum(ols_tensor * features_tensor, dim=1)
-    error3 = torch.mean((pred3 - labels) ** 2).item()
-    print(f"  公式3: y = sum(model_output) + sum(β_ols * features)")
-    print(f"    MSE: {error3:.4f}")
-
-    # 组合4: y = sum(model_output) * sum(β_ols * features)  # 乘法形式
-    pred4 = torch.sum(model_output, dim=1) * torch.sum(ols_tensor * features_tensor, dim=1)
-    error4 = torch.mean((pred4 - labels) ** 2).item()
-    print(f"  公式4: y = sum(model_output) * sum(β_ols * features)")
-    print(f"    MSE: {error4:.4f}")
-
-    # 找出最佳组合
-    errors = [error1, error2, error3, error4]
-    best_idx = np.argmin(errors)
-    best_formula = [1, 2, 3, 4][best_idx]
-    print(f"\n  最佳公式: 公式{best_formula}, MSE={errors[best_idx]:.4f}")
-
-    # 如果最佳公式是公式2，说明我们的原始理解可能是正确的
-    if best_idx == 1:
-        print("  ✅ 公式2表现最好，说明原始理解可能正确")
+    # 判断标准
+    if mse < 1e-6:
+        print("\n✅ 权重提取验证通过！MSE < 1e-6")
+        print("  说明：提取的权重矩阵 W 是正确的")
+        print("  公式：y = Σ(W_ij × β_ols_j × x_ij) 成立")
+    elif mse < 1e-4:
+        print("\n⚠️ 权重提取基本正确，但有轻微误差")
+        print(f"  MSE = {mse:.8f}，可能存在数值精度问题")
     else:
-        print(f"  ⚠️  公式{best_formula}表现最好，可能需要调整理解")
+        print("\n❌ 权重提取不正确！")
+        print(f"  MSE = {mse:.8f} 太大")
+        print("  可能原因：")
+        print("    1. model(distances) 返回的不是权重矩阵 W")
+        print("    2. 预测公式不是 y = Σ(W_ij × β_ols_j × x_ij)")
+        print("    3. 需要额外的处理（如激活函数、归一化）")
+else:
+    print(f"\n⚠️ 样本数不匹配：")
+    print(f"  计算预测样本数: {len(y_calc_train) if y_calc_train is not None else 'None'}")
+    print(f"  模型预测样本数: {len(original_y_train)}")
+
+# ==========================================
+# 诊断：检查几个关键样本
+# ==========================================
+print("\n" + "=" * 60)
+print("诊断：检查关键样本")
+print("=" * 60)
+
+# 找到差异最大的样本
+if y_calc_train is not None and len(y_calc_train) == len(original_y_train):
+    diff_abs = np.abs(y_calc_train - original_y_train)
+    max_diff_idx = np.argmax(diff_abs)
+
+    print(f"\n差异最大的样本（索引 {max_diff_idx}）:")
+    print(f"  计算预测值: {y_calc_train[max_diff_idx]:.8f}")
+    print(f"  模型预测值: {original_y_train[max_diff_idx]:.8f}")
+    print(f"  绝对差异: {diff_abs[max_diff_idx]:.8f}")
+    print(f"  相对差异: {diff_abs[max_diff_idx] / abs(original_y_train[max_diff_idx]):.2%}")
+
+    # 检查几个随机样本
+    print(f"\n随机检查几个样本:")
+    np.random.seed(42)
+    sample_indices = np.random.choice(len(y_calc_train), min(5, len(y_calc_train)), replace=False)
+
+    for idx in sample_indices:
+        calc_val = y_calc_train[idx]
+        model_val = original_y_train[idx]
+        abs_diff = abs(calc_val - model_val)
+        rel_diff = abs_diff / abs(model_val) if model_val != 0 else float('inf')
+
+        print(
+            f"  样本 {idx}: 计算={calc_val:.6f}, 模型={model_val:.6f}, 绝对差异={abs_diff:.6f}, 相对差异={rel_diff:.2%}")
+
+# ==========================================
+# 结论
+# ==========================================
+print("\n" + "=" * 60)
+print("验证结论")
+print("=" * 60)
+
+if y_calc_train is not None and len(y_calc_train) == len(original_y_train):
+    mse = np.mean((y_calc_train - original_y_train) ** 2)
+
+    if mse < 1e-6:
+        print("✅ 验证成功！")
+        print("提取的权重矩阵 W 是正确的。")
+        print("可以安全地使用这些权重进行后续分析。")
+    else:
+        print("❌ 验证失败！")
+        print(f"MSE = {mse:.8f} 太大，权重提取可能有问题。")
+        print("\n建议：")
+        print("1. 检查GNNWR论文中的确切预测公式")
+        print("2. 查看GNNWR源代码中model(distances)的返回值")
+        print("3. 可能需要调整公式：")
+        print("   - y = Σ(model_output * features)  # 假设model_output已是W×β")
+        print("   - y = Σ(model_output) + Σ(β×X)    # 加法形式")
+        print("   - y = f(Σ(W×β×X))                 # 有激活函数")
+
+        # 提供调试建议
+        print("\n调试建议：")
+        print("1. 检查第一批数据的详细计算")
+        print("2. 查看model_output的值是否合理")
+        print("3. 尝试不同的公式组合")
+else:
+    print("⚠️ 验证无法完成（样本数不匹配）")
