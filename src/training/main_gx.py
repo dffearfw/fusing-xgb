@@ -2,16 +2,23 @@ import logging
 import sys
 import os
 import argparse
-import pandas as pd
 
+import numpy as np
+import pandas as pd
 
 # 添加当前目录到路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-# 现在可以直接导入
-from swe_trainer import SWEXGBoostTrainer, train_swe_model
+# 导入训练器
+try:
+    from gnnw_xgboost_trainer import GNNW_XGBoostTrainer, train_gnnw_xgboost_model, compare_models
+    from swe_trainer import SWEXGBoostTrainer, train_swe_model
+except ImportError as e:
+    print(f"导入模块失败: {e}")
+    print("请确保 gnnw_xgboost_trainer.py 和 swe_trainer.py 在当前目录")
+    sys.exit(1)
 
 # 配置日志
 logging.basicConfig(
@@ -59,14 +66,16 @@ def build_model_parameters(args):
 
 
 def main():
-    """主函数 - 命令行接口 - 修复版本：删除重复训练"""
+    """主函数 - 命令行接口 - 支持GNNW-XGBoost融合"""
     parser = argparse.ArgumentParser(
-        description='SWE XGBoost模型训练',
+        description='SWE XGBoost/GNNW-XGBoost模型训练',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
   python main.py -d data.csv
   python main.py -d data.csv -o ./results --trees 100 --lr 0.1
+  python main.py -d data.csv --use-gnnwr              # 使用GNNWR权重增强
+  python main.py -d data.csv --compare-models        # 对比纯XGBoost和GNNW-XGBoost
         """
     )
 
@@ -85,16 +94,23 @@ def main():
     parser.add_argument('--colsample', type=float, default=0.5,
                         help='特征采样比例 (默认: 0.5)')
 
+    # GNNWR相关参数
+    parser.add_argument('--use-gnnwr', action='store_true',
+                        help='使用GNNWR权重增强XGBoost')
+    parser.add_argument('--gnnwr-epochs', type=int, default=5,
+                        help='GNNWR训练轮数 (默认: 5)')
+    parser.add_argument('--compare-models', action='store_true',
+                        help='对比纯XGBoost和GNNW-XGBoost性能')
+    parser.add_argument('--no-gnnwr', action='store_true',
+                        help='强制不使用GNNWR（用于对比实验）')
+
+    # 其他参数
     parser.add_argument('--cluster-mode', action='store_true',
-                       help='使用聚类集成模式')
+                        help='使用聚类集成模式')
     parser.add_argument('--n-clusters', type=int, default=4,
-                       help='聚类数量 (默认: 4)')
+                        help='聚类数量 (默认: 4)')
     parser.add_argument('--use-rf', action='store_true',
                         help='在聚类集成中使用随机森林代替XGBoost')
-    parser.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto',
-                        help='训练设备: auto(自动选择), cuda(GPU), cpu(CPU)')
-    parser.add_argument('--num-workers', type=int, default=None,
-                        help='数据加载工作进程数 (默认: 自动设置)')
     parser.add_argument('--optimize', choices=['rf', 'xgb', 'gnnwr', 'all'],
                         help='使用Optuna优化指定模型的超参数')
     parser.add_argument('--n-trials', type=int, default=50,
@@ -108,6 +124,12 @@ def main():
         logger.info("🚀 启动SWE模型训练程序")
         logger.info(f"输入文件: {args.data}")
         logger.info(f"输出目录: {args.output or '自动生成'}")
+        logger.info(f"使用GNNWR权重增强: {args.use_gnnwr}")
+
+        # 检查参数一致性
+        if args.no_gnnwr and args.use_gnnwr:
+            logger.warning("--no-gnnwr和--use-gnnwr同时指定，将禁用GNNWR")
+            args.use_gnnwr = False
 
         # 1. 加载数据
         logger.info("📥 加载数据...")
@@ -118,13 +140,22 @@ def main():
             return 1
 
         logger.info(f"数据加载成功: {len(df)} 行, {len(df.columns)} 列")
-        logger.info(f"数据列: {list(df.columns)}")
+
+        # 检查GNNWR所需的关键特征列是否存在
+        if args.use_gnnwr or args.compare_models:
+            gnnwr_required_cols = ['longitude', 'latitude', 'elevation']
+            missing_cols = [col for col in gnnwr_required_cols if col not in df.columns]
+            if missing_cols:
+                logger.warning(f"GNNWR需要但数据中缺少的列: {missing_cols}")
+                logger.warning("GNNWR可能无法正常工作，建议检查数据")
+                if args.use_gnnwr:
+                    response = input("继续使用GNNWR吗？(y/n): ").strip().lower()
+                    if response != 'y':
+                        logger.info("禁用GNNWR，使用纯XGBoost")
+                        args.use_gnnwr = False
 
         # 构建模型参数
         params = build_model_parameters(args)
-        logger.info(f"模型参数: n_estimators={params['n_estimators']}, "
-                    f"learning_rate={params['learning_rate']}, "
-                    f"max_depth={params['max_depth']}")
 
         if args.cluster_mode:
             # 使用聚类集成模式
@@ -132,40 +163,87 @@ def main():
             logger.info(f"聚类数量: {args.n_clusters}")
             logger.info(f"使用{'随机森林' if args.use_rf else 'XGBoost'}作为基础模型")
 
-            results = train_swe_cluster_ensemble(
-                data_df=df,
-                output_dir=args.output,
-                n_clusters=args.n_clusters,
-                params=build_model_parameters(args),
-                use_rf=args.use_rf,
-                device=args.device
+            # 这里需要导入聚类集成函数
+            try:
+                from cluster import train_swe_cluster_ensemble
+                results = train_swe_cluster_ensemble(
+                    data_df=df,
+                    output_dir=args.output,
+                    n_clusters=args.n_clusters,
+                    params=build_model_parameters(args),
+                    use_rf=args.use_rf
+                )
+            except ImportError:
+                logger.error("聚类集成模块未找到，请确保cluster.py在目录中")
+                return 1
+
+        elif args.compare_models:
+            # 对比实验模式
+            logger.info("🔬 启动模型对比实验：纯XGBoost vs GNNW-XGBoost")
+
+            if args.output is None:
+                timestamp = pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')
+                args.output = f"./model_comparison_{timestamp}"
+
+            comparison_results = compare_models(df, args.output)
+
+            # 显示对比结果
+            print_comparison_summary(comparison_results)
+
+            return 0
+
+        elif args.use_gnnwr:
+            # GNNW-XGBoost模式
+            logger.info("🎯 使用GNNW-XGBoost融合模式")
+            logger.info(f"GNNWR训练轮数: {args.gnnwr_epochs}")
+
+            # 配置GNNWR参数
+            gnnwr_params = {
+                'max_epoch': args.gnnwr_epochs
+            }
+
+            # 创建训练器
+            trainer = GNNW_XGBoostTrainer(
+                params=params,
+                gnnwr_params=gnnwr_params,
+                use_gnnwr=True
             )
+
+            # 运行完整分析
+            results = trainer.run_complete_analysis(df, args.output)
+
+        elif args.no_gnnwr:
+            # 强制纯XGBoost模式
+            logger.info("🎯 使用纯XGBoost模式（强制禁用GNNWR）")
+            results = train_swe_model(df, args.output, params)
+
         else:
-            # 使用原有模式（保持XGBoost不变）
-            from swe_trainer import train_swe_model
+            # 默认纯XGBoost模式
             logger.info("🎯 使用标准XGBoost模式")
-            results = train_swe_model(
-                data_df=df,
-                output_dir=args.output,
-                params=params
-            )
+            results = train_swe_model(df, args.output, params)
 
-        # 在主函数中添加优化逻辑
+        # 超参数优化
         if args.optimize:
-            from optuna_optimizer import optimize_swe_model
-            logger.info(f"开始超参数优化: {args.optimize}, 试验次数: {args.n_trials}")
+            try:
+                from optuna_optimizer import optimize_swe_model
+                logger.info(f"开始超参数优化: {args.optimize}, 试验次数: {args.n_trials}")
 
-            if args.optimize == 'all':
-                for model_type in ['rf', 'gnnwr']:
-                    best_params = optimize_swe_model(df, model_type, args.n_trials)
-                    logger.info(f"{model_type} 最佳参数: {best_params}")
-            else:
-                best_params = optimize_swe_model(df, args.optimize, args.n_trials)
-                logger.info(f"最佳参数: {best_params}")
+                if args.optimize == 'all':
+                    for model_type in ['rf', 'gnnwr']:
+                        best_params = optimize_swe_model(df, model_type, args.n_trials)
+                        logger.info(f"{model_type} 最佳参数: {best_params}")
+                else:
+                    best_params = optimize_swe_model(df, args.optimize, args.n_trials)
+                    logger.info(f"最佳参数: {best_params}")
+            except ImportError:
+                logger.warning("Optuna优化模块未找到，跳过优化")
 
         if args.pure_gnnwr:
-            from cluster import train_pure_gnnwr_analysis
-            results = train_pure_gnnwr_analysis(df)
+            try:
+                from cluster import train_pure_gnnwr_analysis
+                results = train_pure_gnnwr_analysis(df)
+            except ImportError:
+                logger.warning("纯净版GNNWR分析模块未找到")
 
         logger.info("✅ 模型训练完成！")
 
@@ -179,6 +257,73 @@ def main():
         import traceback
         logger.error(f"详细错误: {traceback.format_exc()}")
         return 1
+
+
+def print_comparison_summary(comparison_results):
+    """打印模型对比结果摘要"""
+    print("\n" + "=" * 80)
+    print("📊 模型对比实验结果")
+    print("=" * 80)
+
+    xgb_results = comparison_results.get('xgboost', {})
+    gnnw_results = comparison_results.get('gnnw_xgboost', {})
+
+    # 站点交叉验证对比
+    if 'station_cv' in xgb_results and 'station_cv' in gnnw_results:
+        xgb_station = xgb_results['station_cv']['overall']
+        gnnw_station = gnnw_results['station_cv']['overall']
+
+        print("\n📍 站点交叉验证 (空间评估):")
+        print(f"  {'指标':<10} {'纯XGBoost':<12} {'GNNW-XGBoost':<12} {'提升':<10}")
+        print("-" * 50)
+
+        # MAE对比
+        xgb_mae = xgb_station.get('MAE', np.nan)
+        gnnw_mae = gnnw_station.get('MAE', np.nan)
+        if not np.isnan(xgb_mae) and not np.isnan(gnnw_mae):
+            mae_improve = (xgb_mae - gnnw_mae) / xgb_mae * 100
+            print(f"  {'MAE (mm)':<10} {xgb_mae:<12.3f} {gnnw_mae:<12.3f} {mae_improve:>+8.1f}%")
+
+        # R对比
+        xgb_r = xgb_station.get('R', np.nan)
+        gnnw_r = gnnw_station.get('R', np.nan)
+        if not np.isnan(xgb_r) and not np.isnan(gnnw_r):
+            r_improve = (gnnw_r - xgb_r) / abs(xgb_r) * 100
+            print(f"  {'R':<10} {xgb_r:<12.3f} {gnnw_r:<12.3f} {r_improve:>+8.1f}%")
+
+    # 年度交叉验证对比
+    if 'yearly_cv' in xgb_results and 'yearly_cv' in gnnw_results:
+        xgb_yearly = xgb_results['yearly_cv']['overall']
+        gnnw_yearly = gnnw_results['yearly_cv']['overall']
+
+        print("\n📅 年度交叉验证 (时间评估):")
+        print(f"  {'指标':<10} {'纯XGBoost':<12} {'GNNW-XGBoost':<12} {'提升':<10}")
+        print("-" * 50)
+
+        # MAE对比
+        xgb_mae = xgb_yearly.get('MAE', np.nan)
+        gnnw_mae = gnnw_yearly.get('MAE', np.nan)
+        if not np.isnan(xgb_mae) and not np.isnan(gnnw_mae):
+            mae_improve = (xgb_mae - gnnw_mae) / xgb_mae * 100
+            print(f"  {'MAE (mm)':<10} {xgb_mae:<12.3f} {gnnw_mae:<12.3f} {mae_improve:>+8.1f}%")
+
+        # R对比
+        xgb_r = xgb_yearly.get('R', np.nan)
+        gnnw_r = gnnw_yearly.get('R', np.nan)
+        if not np.isnan(xgb_r) and not np.isnan(gnnw_r):
+            r_improve = (gnnw_r - xgb_r) / abs(xgb_r) * 100
+            print(f"  {'R':<10} {xgb_r:<12.3f} {gnnw_r:<12.3f} {r_improve:>+8.1f}%")
+
+    print("\n💡 结论:")
+    if 'R' in locals() and not np.isnan(r_improve):
+        if r_improve > 0:
+            print(f"  ✅ GNNW-XGBoost相比纯XGBoost在R指标上提升了{r_improve:.1f}%")
+            print(f"  ✅ 建议使用GNNW-XGBoost进行SWE预测")
+        else:
+            print(f"  ⚠️  GNNW-XGBoost相比纯XGBoost在R指标上下降了{abs(r_improve):.1f}%")
+            print(f"  ⚠️  建议继续使用纯XGBoost进行SWE预测")
+
+    print("=" * 80)
 
 
 def load_data(file_path):
@@ -240,10 +385,18 @@ def load_data(file_path):
 
 
 def print_summary(results):
-    """打印结果摘要 - 修复版本：处理缺失的station_cv"""
+    """打印结果摘要"""
     print("\n" + "=" * 70)
     print("🎉 SWE模型训练完成摘要")
     print("=" * 70)
+
+    # 显示模型类型
+    if hasattr(results, 'use_gnnwr'):
+        model_type = "GNNW-XGBoost" if results.use_gnnwr else "纯XGBoost"
+        print(f"模型类型: {model_type}")
+    elif 'preprocessing' in results and 'use_gnnwr' in results['preprocessing']:
+        model_type = "GNNW-XGBoost" if results['preprocessing']['use_gnnwr'] else "纯XGBoost"
+        print(f"模型类型: {model_type}")
 
     # 站点交叉验证结果（如果存在）
     if 'station_cv' in results:
@@ -321,6 +474,25 @@ def interactive_mode():
         print(f"  日期范围: {df['date'].min()} 到 {df['date'].max()}")
         print(f"  SWE统计: 均值={df['swe'].mean():.2f}mm, 标准差={df['swe'].std():.2f}mm")
 
+        # 询问是否使用GNNWR
+        use_gnnwr = input("\n是否使用GNNWR权重增强？(y/n): ").strip().lower()
+        use_gnnwr = use_gnnwr == 'y'
+
+        if use_gnnwr:
+            print("🔧 将使用GNNW-XGBoost融合模型")
+            # 检查必要列
+            required_cols = ['longitude', 'latitude', 'elevation']
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            if missing_cols:
+                print(f"⚠️  缺少GNNWR需要的列: {missing_cols}")
+                print("GNNWR可能无法正常工作")
+                proceed = input("继续吗？(y/n): ").strip().lower()
+                if proceed != 'y':
+                    use_gnnwr = False
+                    print("切换为纯XGBoost模式")
+        else:
+            print("🔧 将使用纯XGBoost模型")
+
         # 选择输出目录
         output_dir = input("\n请输入输出目录 (回车使用默认): ").strip()
         if not output_dir:
@@ -333,6 +505,11 @@ def interactive_mode():
         trees = input(f"树的数量 [默认: 60]: ").strip()
         lr = input(f"学习率 [默认: 0.17]: ").strip()
         depth = input(f"最大深度 [默认: 5]: ").strip()
+
+        # 如果是GNNWR模式，询问训练轮数
+        if use_gnnwr:
+            gnnwr_epochs = input(f"GNNWR训练轮数 [默认: 5]: ").strip()
+            gnnwr_epochs = int(gnnwr_epochs) if gnnwr_epochs else 5
 
         # 构建参数字典
         params = {}
@@ -347,6 +524,9 @@ def interactive_mode():
         print(f"\n🔍 训练配置:")
         print(f"  数据文件: {data_file}")
         print(f"  输出目录: {output_dir or '自动生成'}")
+        print(f"  模型类型: {'GNNW-XGBoost' if use_gnnwr else '纯XGBoost'}")
+        if use_gnnwr:
+            print(f"  GNNWR训练轮数: {gnnwr_epochs}")
         print(f"  树的数量: {params.get('n_estimators', 60)}")
         print(f"  学习率: {params.get('learning_rate', 0.17)}")
         print(f"  最大深度: {params.get('max_depth', 5)}")
@@ -358,7 +538,19 @@ def interactive_mode():
 
         # 训练模型
         print("\n🚀 开始训练...")
-        results = train_swe_model(df, output_dir, params)
+
+        if use_gnnwr:
+            # GNNW-XGBoost训练
+            gnnwr_params = {'max_epoch': gnnwr_epochs}
+            trainer = GNNW_XGBoostTrainer(
+                params=params,
+                gnnwr_params=gnnwr_params,
+                use_gnnwr=True
+            )
+            results = trainer.run_complete_analysis(df, output_dir)
+        else:
+            # 纯XGBoost训练
+            results = train_swe_model(df, output_dir, params)
 
         # 显示结果
         print_summary(results)
@@ -378,7 +570,8 @@ def check_dependencies():
         'numpy': 'np',
         'xgboost': 'xgb',
         'scikit-learn': 'sklearn',
-        'scipy': 'scipy'
+        'scipy': 'scipy',
+        'torch': 'torch'
     }
 
     missing_packages = []
@@ -405,7 +598,7 @@ def check_dependencies():
 def show_help():
     """显示帮助信息"""
     print("""
-SWE XGBoost模型训练工具
+SWE XGBoost/GNNW-XGBoost模型训练工具
 
 使用方法:
 
@@ -414,6 +607,12 @@ SWE XGBoost模型训练工具
 
 2. 交互模式:
    python main.py
+
+主要选项:
+   --use-gnnwr: 使用GNNWR权重增强XGBoost (GNNW-XGBoost融合)
+   --compare-models: 对比纯XGBoost和GNNW-XGBoost性能
+   --gnnwr-epochs: GNNWR训练轮数 (默认: 5)
+   --no-gnnwr: 强制禁用GNNWR，使用纯XGBoost
 
 支持的数据格式:
    • CSV文件 (.csv)
@@ -425,6 +624,11 @@ SWE XGBoost模型训练工具
    • date: 日期
    • swe: 雪水当量值
 
+GNNWR额外需要:
+   • longitude: 经度
+   • latitude: 纬度
+   • elevation: 高程
+
 输出结果:
    • 训练好的模型文件 (.pkl)
    • 交叉验证预测结果 (.csv)
@@ -432,15 +636,18 @@ SWE XGBoost模型训练工具
    • 详细评估报告 (.json, .txt)
 
 示例:
+   python main.py -d data.csv                       # 纯XGBoost
+   python main.py -d data.csv --use-gnnwr           # GNNW-XGBoost
+   python main.py -d data.csv --compare-models      # 对比实验
    python main.py -d data.csv -o ./results --trees 100 --lr 0.1
     """)
 
 
 if __name__ == "__main__":
     # 显示欢迎信息
-    print("=" * 60)
-    print("❄️  SWE XGBoost模型训练工具")
-    print("=" * 60)
+    print("=" * 70)
+    print("❄️  SWE XGBoost/GNNW-XGBoost模型训练工具")
+    print("=" * 70)
 
     # 检查依赖
     if not check_dependencies():
