@@ -559,9 +559,12 @@ class GTNNW_XGBoostTrainer:
                 sample_count = 0
 
                 print(f"\n📥 从{dataset_name}提取权重...")
+                print(f"  期望样本数: {len(dataset) if hasattr(dataset, '__len__') else '未知'}")
 
                 with torch.no_grad():
                     try:
+                        # ✅ 修复：处理所有批次，不只是前10个
+                        total_batches = 0
                         for batch_idx, batch in enumerate(dataset.dataloader):
                             if batch is None or len(batch) < 2:
                                 continue
@@ -574,10 +577,10 @@ class GTNNW_XGBoostTrainer:
 
                             # 检查权重中的NaN
                             if torch.isnan(weights).any():
-                                print(f"  ⚠️  权重中包含NaN值，使用1填充")
+                                print(f"  ⚠️  批次{batch_idx}权重中包含NaN值，使用1填充")
                                 weights = torch.nan_to_num(weights, nan=1.0)
 
-                            # 调试：打印第一批权重信息
+                            # ✅ 调试信息：仅打印第一个批次
                             if batch_idx == 0:
                                 print(f"  第一批权重形状: {weights.shape}")
                                 print(f"  第一批权重统计:")
@@ -585,19 +588,20 @@ class GTNNW_XGBoostTrainer:
                                 print(f"    均值: {weights.mean():.4f}")
                                 print(f"    标准差: {weights.std():.4f}")
 
-                                # 检查前几个特征的权重值
-                                print(f"  前5个特征权重值 (第一个样本):")
-                                for i in range(min(5, weights.shape[1])):
-                                    print(f"    特征{i}: {weights[0, i].item():.4f}")
-
                             all_weights.append(weights.cpu().numpy())
                             sample_count += weights.shape[0]
+                            total_batches += 1
 
-                            # 限制提取的批次数量，避免内存问题
-                            if batch_idx >= 10:  # 最多10个批次
-                                break
+                            # ✅ 重要修复：显示进度但不中断
+                            if batch_idx % 10 == 0 and batch_idx > 0:
+                                print(f"  已处理{total_batches}个批次，累计{sample_count}个样本")
+
+                        print(f"  ✅ 完成: 总共处理{total_batches}个批次，{sample_count}个样本")
+
                     except Exception as e:
                         print(f"  ❌ 提取权重时出错: {e}")
+                        import traceback
+                        print(traceback.format_exc())
                         return None
 
                 if all_weights:
@@ -610,6 +614,9 @@ class GTNNW_XGBoostTrainer:
                         weights_combined = np.nan_to_num(weights_combined, nan=1.0)
 
                     print(f"  ✅ 提取完成: {weights_combined.shape} (样本数×特征数)")
+                    print(f"    样本数: {weights_combined.shape[0]}")
+                    print(f"    特征数: {weights_combined.shape[1]}")
+
                     return weights_combined
                 else:
                     print(f"  ❌ 提取失败: 没有获取到权重")
@@ -709,11 +716,26 @@ class GTNNW_XGBoostTrainer:
             self.logger.warning("权重矩阵为None，返回原始特征")
             return X
 
-        # ✅ 修复：处理维度不匹配问题
-        if weights.shape[1] != len(gtnnwr_x_columns):
-            self.logger.warning(f"权重矩阵特征数({weights.shape[1]})与GTNNWR特征数({len(gtnnwr_x_columns)})不匹配")
+        # ✅ 修复1: 首先检查样本数是否匹配
+        if X.shape[0] != weights.shape[0]:
+            self.logger.error(f"❌ 样本数不匹配: X有{X.shape[0]}个样本, 权重有{weights.shape[0]}个样本")
 
-            # ⚠️ 关键修复：不要直接返回，继续处理！
+            # 尝试修复样本数不匹配的问题
+            if weights.shape[0] < X.shape[0]:
+                # 如果权重样本数较少，重复权重以匹配X的样本数
+                repeat_times = int(np.ceil(X.shape[0] / weights.shape[0]))
+                weights_repeated = np.tile(weights, (repeat_times, 1))
+                weights = weights_repeated[:X.shape[0], :]
+                self.logger.warning(f"✅ 权重样本数不足，重复权重到{weights.shape[0]}个样本")
+            else:
+                # 如果权重样本数较多，截断到X的样本数
+                weights = weights[:X.shape[0], :]
+                self.logger.warning(f"✅ 权重样本数过多，截断到{weights.shape[0]}个样本")
+
+        # ✅ 修复2: 处理维度不匹配问题
+        if weights.shape[1] != len(gtnnwr_x_columns):
+            self.logger.warning(f"⚠️ 权重矩阵特征数({weights.shape[1]})与GTNNWR特征数({len(gtnnwr_x_columns)})不匹配")
+
             # 自动调整权重维度
             if weights.shape[1] > len(gtnnwr_x_columns):
                 # 如果权重是35列，GTNNWR特征是34列，去掉最后一列
@@ -728,7 +750,7 @@ class GTNNW_XGBoostTrainer:
         # 检查输入中的NaN
         x_nan_count = np.isnan(X).sum()
         if x_nan_count > 0:
-            self.logger.warning(f"输入特征矩阵中有 {x_nan_count} 个NaN值，使用列均值填充")
+            self.logger.warning(f"⚠️ 输入特征矩阵中有 {x_nan_count} 个NaN值，使用列均值填充")
             col_means = np.nanmean(X, axis=0)
             for i in range(X.shape[1]):
                 X[:, i] = np.where(np.isnan(X[:, i]), col_means[i], X[:, i])
@@ -736,7 +758,7 @@ class GTNNW_XGBoostTrainer:
         # 检查权重中的NaN
         weights_nan_count = np.isnan(weights).sum()
         if weights_nan_count > 0:
-            self.logger.warning(f"权重矩阵中有 {weights_nan_count} 个NaN值，使用1填充")
+            self.logger.warning(f"⚠️ 权重矩阵中有 {weights_nan_count} 个NaN值，使用1填充")
             weights = np.nan_to_num(weights, nan=1.0)
 
         # 创建特征映射：特征列到GTNNWR特征列的索引
@@ -746,9 +768,10 @@ class GTNNW_XGBoostTrainer:
                 feature_to_gtnnwr[i] = gtnnwr_x_columns.index(feat)
 
         # 添加调试信息
-        self.logger.info(f"🔍 特征匹配: 匹配了 {len(feature_to_gtnnwr)}/{len(feature_columns)} 个特征")
+        matched_count = len(feature_to_gtnnwr)
+        self.logger.info(f"🔍 特征匹配: 匹配了 {matched_count}/{len(feature_columns)} 个特征")
 
-        if len(feature_to_gtnnwr) == 0:
+        if matched_count == 0:
             self.logger.warning("⚠️ 没有找到匹配的特征，无法应用权重")
             return X
 
@@ -783,7 +806,8 @@ class GTNNW_XGBoostTrainer:
             X_weighted[:, feat_idx] = weighted_values
 
         # 添加验证输出
-        self.logger.info(f"✅ 权重应用结果: 修改了 {changed_count}/{len(feature_to_gtnnwr)} 个特征")
+        change_ratio = changed_count / matched_count if matched_count > 0 else 0
+        self.logger.info(f"✅ 权重应用结果: 修改了 {changed_count}/{matched_count} 个特征 ({change_ratio:.1%})")
 
         # 检查几个关键特征的变化
         if changed_count > 0:
@@ -794,20 +818,28 @@ class GTNNW_XGBoostTrainer:
                     gtnnwr_idx = gtnnwr_x_columns.index(feat)
 
                     # 检查第一个样本
-                    if not np.isnan(X[0, feat_idx]) and not np.isnan(X_weighted[0, feat_idx]):
-                        original = X[0, feat_idx]
-                        weighted = X_weighted[0, feat_idx]
-                        weight_val = weights[0, gtnnwr_idx]
+                    if len(X) > 0 and len(weights) > 0:
+                        if (not np.isnan(X[0, feat_idx]) and
+                                not np.isnan(X_weighted[0, feat_idx]) and
+                                feat_idx < weights.shape[1]):
+                            original = X[0, feat_idx]
+                            weighted = X_weighted[0, feat_idx]
+                            weight_val = weights[0, gtnnwr_idx]
 
-                        if abs(weighted - original) > 1e-10:
-                            self.logger.info(f"   {feat}: {original:.4f} × {weight_val:.4f} = {weighted:.4f} "
-                                             f"(Δ={weighted - original:+.4f})")
+                            if abs(weighted - original) > 1e-10:
+                                self.logger.info(f"   {feat}: {original:.4f} × {weight_val:.4f} = {weighted:.4f} "
+                                                 f"(Δ={weighted - original:+.4f})")
 
         # 检查输出中的NaN
         output_nan_count = np.isnan(X_weighted).sum()
         if output_nan_count > 0:
-            self.logger.warning(f"加权后的特征矩阵中有 {output_nan_count} 个NaN值，使用原始值")
+            self.logger.warning(f"⚠️ 加权后的特征矩阵中有 {output_nan_count} 个NaN值，使用原始值")
             X_weighted = np.where(np.isnan(X_weighted), X, X_weighted)
+
+        # 验证最终形状
+        if X_weighted.shape != X.shape:
+            self.logger.error(f"❌ 形状不匹配: 加权后{X_weighted.shape} != 原始{X.shape}")
+            return X  # 返回原始特征避免进一步错误
 
         return X_weighted
 
@@ -930,6 +962,32 @@ class GTNNW_XGBoostTrainer:
                 print(f"  训练数据形状: {train_data_fold.shape}")
                 print(f"  验证数据形状: {val_data_fold.shape}")
 
+                # ✅ 重要修复：检查并处理数据样本数
+                if len(train_data_fold) != len(X_train):
+                    print(f"  ⚠️  训练数据样本数不匹配: GTNNWR数据{len(train_data_fold)} vs 特征数据{len(X_train)}")
+                    # 对齐数据
+                    if len(train_data_fold) < len(X_train):
+                        # 重复数据
+                        repeat_factor = int(np.ceil(len(X_train) / len(train_data_fold)))
+                        train_data_fold = pd.concat([train_data_fold] * repeat_factor, ignore_index=True)
+                        train_data_fold = train_data_fold.iloc[:len(X_train)]
+                        print(f"  ✅ 重复训练数据到{len(train_data_fold)}个样本")
+                    else:
+                        train_data_fold = train_data_fold.iloc[:len(X_train)]
+                        print(f"  ✅ 截断训练数据到{len(train_data_fold)}个样本")
+
+                if len(val_data_fold) != len(X_val):
+                    print(f"  ⚠️  验证数据样本数不匹配: GTNNWR数据{len(val_data_fold)} vs 特征数据{len(X_val)}")
+                    # 对齐数据
+                    if len(val_data_fold) < len(X_val):
+                        repeat_factor = int(np.ceil(len(X_val) / len(val_data_fold)))
+                        val_data_fold = pd.concat([val_data_fold] * repeat_factor, ignore_index=True)
+                        val_data_fold = val_data_fold.iloc[:len(X_val)]
+                        print(f"  ✅ 重复验证数据到{len(val_data_fold)}个样本")
+                    else:
+                        val_data_fold = val_data_fold.iloc[:len(X_val)]
+                        print(f"  ✅ 截断验证数据到{len(val_data_fold)}个样本")
+
                 # 检查GTNNWR数据中的NaN
                 train_gtnnwr_nan = train_data_fold.isna().sum().sum()
                 val_gtnnwr_nan = val_data_fold.isna().sum().sum()
@@ -952,44 +1010,33 @@ class GTNNW_XGBoostTrainer:
                 if train_weights is not None and val_weights is not None:
                     print(f"\n✅ GTNNWR训练完成，准备应用权重")
 
-                    # 🔍 关键验证：权重应用效果
-                    print(f"\n🔬 权重应用验证")
+                    # ✅ 关键修复：验证权重矩阵形状
+                    print(f"\n🔬 权重矩阵形状验证:")
+                    print(f"  X_train形状: {X_train.shape}")
+                    print(f"  train_weights形状: {train_weights.shape}")
+                    print(f"  X_val形状: {X_val.shape}")
+                    print(f"  val_weights形状: {val_weights.shape}")
 
-                    # 定义验证函数
-                    def validate_weight_change(X_original, X_weighted, weights, dataset_name):
-                        """验证权重应用是否真的改变了特征"""
-                        changes = X_weighted - X_original
-                        abs_changes = np.abs(changes)
+                    # 检查样本数是否匹配
+                    if train_weights.shape[0] != X_train.shape[0]:
+                        print(f"  ⚠️  训练集样本数不匹配: 权重{train_weights.shape[0]} vs 特征{X_train.shape[0]}")
+                        if train_weights.shape[0] < X_train.shape[0]:
+                            repeat_factor = int(np.ceil(X_train.shape[0] / train_weights.shape[0]))
+                            train_weights = np.repeat(train_weights, repeat_factor, axis=0)[:X_train.shape[0], :]
+                            print(f"  ✅ 重复训练权重到{train_weights.shape[0]}个样本")
+                        else:
+                            train_weights = train_weights[:X_train.shape[0], :]
+                            print(f"  ✅ 截断训练权重到{train_weights.shape[0]}个样本")
 
-                        # 统计变化
-                        max_change = abs_changes.max()
-                        mean_change = abs_changes.mean()
-                        significant_changes = (abs_changes > 0.001).sum() / abs_changes.size
-
-                        print(f"\n  {dataset_name}:")
-                        print(f"    最大变化: {max_change:.6f}")
-                        print(f"    平均变化: {mean_change:.6f}")
-                        print(f"    显著变化比例(>0.001): {significant_changes:.2%}")
-
-                        # 检查几个关键特征
-                        key_features = ['elevation', 'X', 'Y', 'Z', 'slope', 'doy']
-
-                        for feat in key_features:
-                            if feat in self.feature_columns and feat in self.gtnnwr_x_columns:
-                                feat_idx = self.feature_columns.index(feat)
-                                gtnnwr_idx = self.gtnnwr_x_columns.index(feat)
-
-                                # 检查第一个样本
-                                if not np.isnan(X_original[0, feat_idx]) and not np.isnan(X_weighted[0, feat_idx]):
-                                    original = X_original[0, feat_idx]
-                                    weighted = X_weighted[0, feat_idx]
-                                    weight_val = weights[0, gtnnwr_idx]
-
-                                    if abs(weighted - original) > 1e-10:
-                                        print(f"    {feat}: {original:.4f} × {weight_val:.4f} = {weighted:.4f} "
-                                              f"(Δ={weighted - original:+.4f})")
-
-                        return mean_change > 1e-10
+                    if val_weights.shape[0] != X_val.shape[0]:
+                        print(f"  ⚠️  验证集样本数不匹配: 权重{val_weights.shape[0]} vs 特征{X_val.shape[0]}")
+                        if val_weights.shape[0] < X_val.shape[0]:
+                            repeat_factor = int(np.ceil(X_val.shape[0] / val_weights.shape[0]))
+                            val_weights = np.repeat(val_weights, repeat_factor, axis=0)[:X_val.shape[0], :]
+                            print(f"  ✅ 重复验证权重到{val_weights.shape[0]}个样本")
+                        else:
+                            val_weights = val_weights[:X_val.shape[0], :]
+                            print(f"  ✅ 截断验证权重到{val_weights.shape[0]}个样本")
 
                     # 应用权重
                     print(f"\n🔄 应用权重到特征矩阵...")
@@ -1003,15 +1050,26 @@ class GTNNW_XGBoostTrainer:
                     )
 
                     # 验证权重应用效果
-                    train_valid = validate_weight_change(X_train_original, X_train, train_weights, "训练集")
-                    val_valid = validate_weight_change(X_val_original, X_val, val_weights, "验证集")
-
-                    if train_valid and val_valid:
-                        print(f"\n✅ 权重应用验证通过")
-                        self.logger.info(f"  ✅ GTNNWR权重应用成功")
+                    print(f"\n🔍 权重应用验证:")
+                    if not np.allclose(X_train, X_train_original, rtol=1e-10):
+                        changes = np.abs(X_train - X_train_original).mean()
+                        print(f"  训练集特征平均变化: {changes:.6f}")
+                        if changes > 0.001:
+                            print(f"  ✅ 权重成功应用于训练集")
+                        else:
+                            print(f"  ⚠️  权重对训练集影响很小")
                     else:
-                        print(f"\n⚠️  权重应用验证失败，特征可能没有被修改")
-                        self.logger.warning(f"  ⚠️ GTNNWR权重应用可能失败")
+                        print(f"  ⚠️  训练集特征未变化，权重可能无效")
+
+                    if not np.allclose(X_val, X_val_original, rtol=1e-10):
+                        changes = np.abs(X_val - X_val_original).mean()
+                        print(f"  验证集特征平均变化: {changes:.6f}")
+                        if changes > 0.001:
+                            print(f"  ✅ 权重成功应用于验证集")
+                        else:
+                            print(f"  ⚠️  权重对验证集影响很小")
+                    else:
+                        print(f"  ⚠️  验证集特征未变化，权重可能无效")
                 else:
                     print(f"\n❌ GTNNWR权重提取失败，使用原始特征")
                     self.logger.info(f"  ⚠️ GTNNWR权重提取失败，使用原始特征")
