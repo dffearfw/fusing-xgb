@@ -44,7 +44,7 @@ class GTNNW_XGBoostTrainer:
 
     # GTNNWR参数
     DEFAULT_GTNNWR_PARAMS = {
-        'graph_layers': [[3], [512, 256, 64]],  # GTNNWR特有的图卷积层结构
+        'dense_layers': [[3], [512, 256, 64]],  # 修改：将 graph_layers 改为 dense_layers
         'drop_out': 0.4,
         'optimizer': "Adadelta",
         'optimizer_params': {
@@ -52,7 +52,7 @@ class GTNNW_XGBoostTrainer:
             "scheduler_milestones": [1000, 2000, 3000, 4000],
             "scheduler_gamma": 0.8,
         },
-        'max_epoch': 3000,  # 交叉验证中减少训练轮数
+        'max_epoch': 3000,
         'early_stop': 1000,
         'print_frequency': 100
     }
@@ -454,7 +454,7 @@ class GTNNW_XGBoostTrainer:
             print(f"  数据集划分: 训练集{len(train_data)}样本, 验证集比例{valid_ratio:.2%}, 测试集比例{test_ratio:.2%}")
 
             try:
-                # 尝试使用init_dataset_split
+                # 尝试使用init_dataset_split，添加temp_column参数
                 train_set, val_set, test_set = datasets.init_dataset_split(
                     train_data=train_data,
                     val_data=val_data,
@@ -462,9 +462,10 @@ class GTNNW_XGBoostTrainer:
                     x_column=self.gtnnwr_x_columns,
                     y_column=self.gtnnwr_y_column,
                     spatial_column=self.gtnnwr_spatial_columns,
+                    temp_column=self.gtnnwr_temp_columns,  # 添加时间列参数
                     batch_size=min(1024, len(train_data)),
                     shuffle=False,
-                    use_model="gtnnwr"
+                    use_model="gtnnwr"  # 使用gtnnwr模型
                 )
                 print(f"✅ 使用init_dataset_split初始化成功")
             except Exception as split_error:
@@ -483,7 +484,7 @@ class GTNNW_XGBoostTrainer:
                         x_column=self.gtnnwr_x_columns,
                         y_column=self.gtnnwr_y_column,
                         spatial_column=self.gtnnwr_spatial_columns,
-                        temp_column=self.gtnnwr_temp_columns,
+                        temp_column=self.gtnnwr_temp_columns,  # 添加时间列参数
                         id_column=[self.gtnnwr_id_column],
                         use_model="gtnnwr",
                         sample_seed=42,
@@ -515,7 +516,7 @@ class GTNNW_XGBoostTrainer:
                     train_dataset=train_set,
                     valid_dataset=val_set,
                     test_dataset=train_set,  # 使用训练集作为测试集占位
-                    graph_layers=self.gtnnwr_params['graph_layers'],
+                    dense_layers=self.gtnnwr_params['graph_layers'],  # 修改：使用dense_layers参数名
                     drop_out=self.gtnnwr_params['drop_out'],
                     optimizer=self.gtnnwr_params['optimizer'],
                     optimizer_params=self.gtnnwr_params['optimizer_params'],
