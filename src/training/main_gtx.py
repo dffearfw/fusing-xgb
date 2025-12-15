@@ -13,7 +13,7 @@ if current_dir not in sys.path:
 
 # 导入训练器
 try:
-    from gtnnw_xgboost_trainer import GTNNW_XGBoostTrainer, train_gtnnw_xgboost_model, compare_models
+    from gtnnw_xgboost_trianer import GTNNW_XGBoostTrainer, train_gtnnw_xgboost_model, compare_models
     from swe_trainer import SWEXGBoostTrainer, train_swe_model
 except ImportError as e:
     print(f"导入模块失败: {e}")
