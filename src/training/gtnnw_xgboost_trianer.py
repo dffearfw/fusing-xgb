@@ -601,6 +601,13 @@ class GTNNW_XGBoostTrainer:
                 print(f"  使用dense_layers: {dense_layers_param}")
                 print(f"  输入维度: {actual_input_dim}")
                 print(f"  是否使用特征马氏距离: {self.use_feature_mahalanobis}")
+                print(f"原始 simple_distance: {train_set.simple_distance}")
+                print(f"使用特征马氏距离: {train_set.use_feature_mahalanobis}")
+
+                # 方法1: 设置 simple_distance=False
+                train_set.simple_distance = False
+                val_set.simple_distance = False
+
 
                 # 创建GTNNWR
                 gtnnwr = models.GTNNWR(
