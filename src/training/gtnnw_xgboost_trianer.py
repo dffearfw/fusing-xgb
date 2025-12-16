@@ -12,50 +12,131 @@ import torch
 from gnnwr import models, datasets
 from torch import nn
 
-# ⭐⭐⭐ 猴子补丁修复STPNN ⭐⭐⭐
+print("=" * 80)
+print("应用GTNNWR完整修复补丁")
+print("=" * 80)
+
+# 1. 修复STPNN的forward方法
 original_STPNN_forward = gnnwr.networks.STPNN.forward
 
 
-def patched_STPNN_forward(self, x):
+def fixed_STPNN_forward(self, x):
+    """
+    修复STPNN的forward方法，解决维度和设备问题
+    """
+    # 记录调试信息
+    print(f"\n[STPNN Forward] 输入形状: {x.shape}, 设备: {x.device}")
+
     x = x.to(torch.float32)
     batch = x.shape[0]
     height = x.shape[1]
-
-    # 检查并修复维度
     actual_input_dim = x.shape[2]
 
-    # 检查第一层权重
-    first_layer = self.fc[0]
-    if hasattr(first_layer, 'layer'):
-        weight_shape = first_layer.layer.weight.shape
+    # 检查第一层
+    if hasattr(self, 'fc') and len(self.fc) > 0:
+        first_module = self.fc[0]
+        if hasattr(first_module, 'layer'):
+            layer = first_module.layer
+            weight_shape = layer.weight.shape
 
-        # 如果权重维度不匹配，修正它
-        if weight_shape[1] != actual_input_dim:
-            print(f"⚠️ 自动修复STPNN维度: {weight_shape[1]} -> {actual_input_dim}")
+            print(f"[STPNN Forward] 第一层权重形状: {weight_shape}, 设备: {layer.weight.device}")
+            print(f"[STPNN Forward] self.insize: {getattr(self, 'insize', 'N/A')}")
+            print(f"[STPNN Forward] self.dense_layer: {getattr(self, 'dense_layer', 'N/A')}")
 
-            # 创建新层
-            new_layer = nn.Linear(actual_input_dim, weight_shape[0])
-            nn.init.kaiming_uniform_(new_layer.weight, a=0, mode='fan_in')
-            if new_layer.bias is not None:
-                new_layer.bias.data.fill_(0)
+            # 如果维度不匹配，修复
+            if weight_shape[1] != actual_input_dim:
+                print(f"⚠️ [STPNN Forward] 维度不匹配！修复 {weight_shape[1]} -> {actual_input_dim}")
 
-            # 替换
-            first_layer.layer = new_layer
-            self.insize = actual_input_dim
-            if self.dense_layer and len(self.dense_layer) > 0:
-                self.dense_layer[0] = actual_input_dim
+                # 获取设备
+                device = layer.weight.device
 
-    # 展平并继续
+                # 创建新层
+                new_layer = nn.Linear(actual_input_dim, weight_shape[0]).to(device)
+
+                # 初始化权重
+                nn.init.kaiming_uniform_(new_layer.weight, a=0, mode='fan_in')
+                if new_layer.bias is not None:
+                    new_layer.bias.data.fill_(0)
+
+                # 替换
+                first_module.layer = new_layer
+
+                # 更新属性
+                self.insize = actual_input_dim
+                if hasattr(self, 'dense_layer') and self.dense_layer and len(self.dense_layer) > 0:
+                    self.dense_layer[0] = actual_input_dim
+
+                print(f"✅ [STPNN Forward] 修复完成")
+
+    # 继续原有逻辑
     x = torch.reshape(x, shape=(batch * height, x.shape[2]))
     output = self.fc(x)
     output = torch.reshape(output, shape=(batch, height * self.outsize))
+
     return output
 
 
-# 应用补丁
-gnnwr.networks.STPNN.forward = patched_STPNN_forward
+gnnwr.networks.STPNN.forward = fixed_STPNN_forward
 
-print("✅ STPNN猴子补丁已应用")
+# 2. 修复GTNNWR的__init__方法（确保insize计算正确）
+original_GTNNWR_init = gnnwr.models.GTNNWR.__init__
+
+
+def fixed_GTNNWR_init(self, train_dataset, valid_dataset, test_dataset,
+                      dense_layers=None, **kwargs):
+    """
+    修复GTNNWR的初始化，确保insize计算正确
+    """
+    print(f"\n[GTNNWR Init] train_dataset.simple_distance: {train_dataset.simple_distance}")
+    print(f"[GTNNWR Init] train_dataset.distances.shape: {train_dataset.distances.shape}")
+
+    # 强制使用正确的insize计算
+    if train_dataset.simple_distance:
+        # 检查是否有马氏距离特征
+        sample = train_dataset[0]
+        if hasattr(sample, '__len__') and len(sample) > 0:
+            spatial_data = sample[0]
+            actual_dim = spatial_data.shape[-1] if hasattr(spatial_data, 'shape') else 2
+        else:
+            actual_dim = 2
+
+        print(f"[GTNNWR Init] 检测到实际输入维度: {actual_dim}")
+
+        # 手动设置insize
+        if dense_layers and len(dense_layers) > 0 and len(dense_layers[0]) > 0:
+            if dense_layers[0][0] != actual_dim:
+                print(f"⚠️ [GTNNWR Init] 修正dense_layers: {dense_layers[0][0]} -> {actual_dim}")
+                dense_layers[0][0] = actual_dim
+
+    # 调用原始初始化
+    return original_GTNNWR_init(self, train_dataset, valid_dataset, test_dataset,
+                                dense_layers, **kwargs)
+
+
+gnnwr.models.GTNNWR.__init__ = fixed_GTNNWR_init
+
+
+# 3. 添加设备同步钩子
+def add_device_sync_hook(model):
+    """确保所有层都在同一设备上"""
+
+    def device_hook(module, input):
+        if input[0] is not None:
+            device = input[0].device
+            # 检查模块是否在正确设备上
+            for param in module.parameters():
+                if param.device != device:
+                    print(f"⚠️ 设备不一致: {type(module).__name__} 的权重在 {param.device}，输入在 {device}")
+                    param.data = param.data.to(device)
+
+    for name, module in model.named_modules():
+        if len(list(module.parameters())) > 0:  # 有参数的模块
+            module.register_forward_pre_hook(device_hook)
+
+    return model
+
+
+print("✅ 所有修复补丁已应用")
 
 class GTNNW_XGBoostTrainer:
     """GTNNW-XGBoost训练器 - 集成GTNNWR权重矩阵与XGBoost"""
