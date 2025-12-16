@@ -354,6 +354,7 @@ class GTNNW_XGBoostTrainer:
 
     def _train_gtnnwr_for_fold(self, train_data, val_data):
         """为单个折叠训练GTNNWR模型并提取权重"""
+        """为单个折叠训练GTNNWR模型并提取权重"""
         self.logger.debug("为当前折叠训练GTNNWR模型...")
 
         print("\n" + "=" * 80)
@@ -424,6 +425,7 @@ class GTNNW_XGBoostTrainer:
 
             try:
                 # 使用init_dataset_split，传入特征马氏距离参数
+                # 这里我们传入参数，但不检查返回对象的属性
                 train_set, val_set, test_set = datasets.init_dataset_split(
                     train_data=train_data,
                     val_data=val_data,
@@ -435,7 +437,7 @@ class GTNNW_XGBoostTrainer:
                     batch_size=min(1024, len(train_data)),
                     shuffle=False,
                     use_model="gtnnwr",
-                    # 新增参数
+                    # 新增参数 - 传递给baseDataset的构造函数
                     use_feature_mahalanobis=self.use_feature_mahalanobis,
                     feature_columns_for_distance=feature_columns_for_distance
                 )
@@ -453,16 +455,6 @@ class GTNNW_XGBoostTrainer:
                     for i in range(min(3, len(train_set.distances[0]))):
                         print(f"    参考点{i}: {train_set.distances[0][i]}")
 
-                # 检查是否还有其他距离相关的属性
-                for attr in dir(train_set):
-                    if 'distance' in attr.lower() and not attr.startswith('__'):
-                        try:
-                            value = getattr(train_set, attr)
-                            if hasattr(value, 'shape'):
-                                print(f"  {attr}形状: {value.shape}")
-                        except:
-                            pass
-
                 # 检查是否有temporal维度
                 if hasattr(train_set, 'temporal') and train_set.temporal is not None:
                     print(f"  train_set.temporal形状: {train_set.temporal.shape}")
@@ -476,44 +468,21 @@ class GTNNW_XGBoostTrainer:
                 # 检查simple_distance
                 print(f"  train_set.simple_distance: {train_set.simple_distance}")
 
-                # 检查__getitem__返回什么
-                print(f"\n🔍 检查数据加载器输出...")
-                try:
-                    # 检查一个样本
-                    if len(train_set) > 0:
-                        sample = train_set[0]
-                        print(f"  train_set[0]返回类型: {type(sample)}")
-                        if isinstance(sample, tuple):
-                            print(f"  元组长度: {len(sample)}")
-                            for i, item in enumerate(sample):
-                                if hasattr(item, 'shape'):
-                                    print(f"  元素[{i}]形状: {item.shape}")
-                                elif isinstance(item, (int, float)):
-                                    print(f"  元素[{i}]: {item}")
-                                else:
-                                    print(f"  元素[{i}]类型: {type(item)}")
-
-                    # 检查dataloader的第一个批次
-                    if hasattr(train_set, 'dataloader'):
-                        for batch in train_set.dataloader:
-                            print(f"\n  第一个批次信息:")
-                            print(f"    批次类型: {type(batch)}")
-                            if isinstance(batch, (list, tuple)):
-                                print(f"    批次长度: {len(batch)}")
-                                for i, item in enumerate(batch):
-                                    if hasattr(item, 'shape'):
-                                        print(f"    批次[{i}]形状: {item.shape}")
-                            break
-                except Exception as e:
-                    print(f"  检查数据加载时出错: {e}")
-
                 print(f"\n🔍 检查数据集初始化参数...")
                 print(f"  使用的use_model: {'gtnnwr'}")
                 print(f"  使用特征马氏距离: {self.use_feature_mahalanobis}")
                 if self.use_feature_mahalanobis:
                     print(f"  马氏距离特征数: {len(feature_columns_for_distance)}")
 
-                print(f"  是否使用特征马氏距离: {self.use_feature_mahalanobis}")
+                # ✅ 这里需要检查正确的属性名：is_need_feature_distance
+                # 从你的代码可以看出，baseDataset类使用的是is_need_feature_distance，而不是use_feature_mahalanobis
+                if hasattr(train_set, 'is_need_feature_distance'):
+                    print(f"  数据集是否使用特征距离: {train_set.is_need_feature_distance}")
+                else:
+                    print(f"  数据集没有is_need_feature_distance属性")
+
+                # 只打印我们自己设定的参数
+                print(f"  配置使用特征马氏距离: {self.use_feature_mahalanobis}")
                 if self.use_feature_mahalanobis:
                     print(f"  马氏距离特征数: {len(feature_columns_for_distance)}")
             except Exception as error:
@@ -602,12 +571,16 @@ class GTNNW_XGBoostTrainer:
                 print(f"  输入维度: {actual_input_dim}")
                 print(f"  是否使用特征马氏距离: {self.use_feature_mahalanobis}")
                 print(f"原始 simple_distance: {train_set.simple_distance}")
-                print(f"使用特征马氏距离: {train_set.use_feature_mahalanobis}")
+                # ✅ 修复：检查正确的属性名
+                if hasattr(train_set, 'is_need_feature_distance'):
+                    print(f"数据集是否使用特征距离: {train_set.is_need_feature_distance}")
+                else:
+                    print(f"数据集没有is_need_feature_distance属性")
+                print(f"配置使用特征马氏距离: {self.use_feature_mahalanobis}")
 
                 # 方法1: 设置 simple_distance=False
                 train_set.simple_distance = False
                 val_set.simple_distance = False
-
 
                 # 创建GTNNWR
                 gtnnwr = models.GTNNWR(
