@@ -21,7 +21,7 @@ except FileNotFoundError:
     print("错误：找不到文件 'lu_onehot.xlsx'。请检查文件路径。")
     sys.exit(1)
 
-# 2. 创建一个唯一的站点标识符
+# 2. 创建一个唯一的站点标识符D
 data['station_id'] = data['X'].astype(str) + '_' + data['Y'].astype(str)
 
 # 3. 确保有id列（如果没有则创建）

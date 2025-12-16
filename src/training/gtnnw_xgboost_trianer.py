@@ -4,11 +4,58 @@ import json
 import os
 from venv import logger
 
+import gnnwr
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 from gnnwr import models, datasets
+from torch import nn
+
+# ⭐⭐⭐ 猴子补丁修复STPNN ⭐⭐⭐
+original_STPNN_forward = gnnwr.networks.STPNN.forward
+
+
+def patched_STPNN_forward(self, x):
+    x = x.to(torch.float32)
+    batch = x.shape[0]
+    height = x.shape[1]
+
+    # 检查并修复维度
+    actual_input_dim = x.shape[2]
+
+    # 检查第一层权重
+    first_layer = self.fc[0]
+    if hasattr(first_layer, 'layer'):
+        weight_shape = first_layer.layer.weight.shape
+
+        # 如果权重维度不匹配，修正它
+        if weight_shape[1] != actual_input_dim:
+            print(f"⚠️ 自动修复STPNN维度: {weight_shape[1]} -> {actual_input_dim}")
+
+            # 创建新层
+            new_layer = nn.Linear(actual_input_dim, weight_shape[0])
+            nn.init.kaiming_uniform_(new_layer.weight, a=0, mode='fan_in')
+            if new_layer.bias is not None:
+                new_layer.bias.data.fill_(0)
+
+            # 替换
+            first_layer.layer = new_layer
+            self.insize = actual_input_dim
+            if self.dense_layer and len(self.dense_layer) > 0:
+                self.dense_layer[0] = actual_input_dim
+
+    # 展平并继续
+    x = torch.reshape(x, shape=(batch * height, x.shape[2]))
+    output = self.fc(x)
+    output = torch.reshape(output, shape=(batch, height * self.outsize))
+    return output
+
+
+# 应用补丁
+gnnwr.networks.STPNN.forward = patched_STPNN_forward
+
+print("✅ STPNN猴子补丁已应用")
 
 class GTNNW_XGBoostTrainer:
     """GTNNW-XGBoost训练器 - 集成GTNNWR权重矩阵与XGBoost"""
