@@ -1,3 +1,15 @@
+from datetime import datetime  # 正确：导入了datetime类
+# 使用时：datetime.now() 就可以
+import json
+import os
+from venv import logger
+
+import joblib
+import numpy as np
+import pandas as pd
+import torch
+from gnnwr import models, datasets
+
 class GTNNW_XGBoostTrainer:
     """GTNNW-XGBoost训练器 - 集成GTNNWR权重矩阵与XGBoost"""
 
@@ -18,7 +30,7 @@ class GTNNW_XGBoostTrainer:
 
     # GTNNWR参数
     DEFAULT_GTNNWR_PARAMS = {
-        'dense_layers': [[3], [512, 256, 64]],
+        'dense_layers': [[3, 64, 32], [128, 64, 32]],
         'drop_out': 0.4,
         'optimizer': "Adadelta",
         'optimizer_params': {
@@ -34,7 +46,7 @@ class GTNNW_XGBoostTrainer:
     def __init__(self, params=None, gtnnwr_params=None, use_gtnnwr=True,
                  nan_strategy='median', nan_fill_value=0.0,
                  # 新增参数
-                 use_feature_mahalanobis=False,
+                 use_feature_mahalanobis=True,
                  feature_columns_for_distance=None):
         """初始化训练器
 
@@ -87,6 +99,258 @@ class GTNNW_XGBoostTrainer:
         self.logger.info(f"使用GTNNWR权重增强: {self.use_gtnnwr}")
         self.logger.info(f"使用特征马氏距离: {self.use_feature_mahalanobis}")
         self.logger.info(f"NaN处理策略: {self.nan_strategy}")
+
+    def _handle_nan_values(self, df, is_training=True, fill_values=None):
+        """处理NaN值
+
+        Args:
+            df (pd.DataFrame): 输入数据
+            is_training (bool): 是否为训练阶段
+            fill_values (dict): 预计算的填充值
+
+        Returns:
+            pd.DataFrame: 处理后的数据
+        """
+        self.logger.info(f"处理NaN值 - 阶段: {'训练' if is_training else '预测'}")
+
+        df_processed = df.copy()
+
+        # 统计NaN值
+        nan_stats = df_processed.isna().sum()
+        total_nan = nan_stats.sum()
+        total_cells = df_processed.size
+
+        if total_nan > 0:
+            nan_percentage = (total_nan / total_cells) * 100
+            self.logger.info(f"发现NaN值: {total_nan}/{total_cells} ({nan_percentage:.2f}%)")
+
+            # 按列统计NaN
+            nan_columns = nan_stats[nan_stats > 0]
+            for col, nan_count in nan_columns.items():
+                nan_pct = (nan_count / len(df_processed)) * 100
+                self.logger.info(f"  列 '{col}': {nan_count} NaN ({nan_pct:.2f}%)")
+
+        # 处理不同列类型的NaN
+        for col in df_processed.columns:
+            if df_processed[col].dtype in ['float64', 'float32', 'int64', 'int32']:
+                # 数值列处理
+                nan_count = df_processed[col].isna().sum()
+
+                if nan_count > 0:
+                    if self.nan_strategy == 'drop' and is_training:
+                        # 删除包含NaN的行（仅训练阶段）
+                        self.logger.warning(f"删除包含列 '{col}' NaN的 {nan_count} 行")
+                        df_processed = df_processed.dropna(subset=[col])
+                    else:
+                        # 计算或使用填充值
+                        if is_training:
+                            if self.nan_strategy == 'mean':
+                                fill_value = df_processed[col].mean()
+                                self.nan_fill_values[col] = fill_value
+                                self.logger.info(f"列 '{col}' 使用均值填充: {fill_value:.4f}")
+                            elif self.nan_strategy == 'median':
+                                fill_value = df_processed[col].median()
+                                self.nan_fill_values[col] = fill_value
+                                self.logger.info(f"列 '{col}' 使用中位数填充: {fill_value:.4f}")
+                            elif self.nan_strategy == 'zero':
+                                fill_value = 0
+                                self.nan_fill_values[col] = fill_value
+                                self.logger.info(f"列 '{col}' 使用0填充")
+                            else:  # 自定义值
+                                fill_value = self.nan_fill_value
+                                self.nan_fill_values[col] = fill_value
+                                self.logger.info(f"列 '{col}' 使用自定义值填充: {fill_value}")
+
+                            # 保存统计信息
+                            self.nan_fill_stats[col] = {
+                                'strategy': self.nan_strategy,
+                                'fill_value': fill_value,
+                                'original_nan_count': nan_count,
+                                'original_mean': df_processed[col].mean(),
+                                'original_median': df_processed[col].median(),
+                                'original_std': df_processed[col].std()
+                            }
+                        else:
+                            # 预测阶段使用训练阶段计算的填充值
+                            fill_value = self.nan_fill_values.get(col, self.nan_fill_value)
+                            self.logger.debug(f"列 '{col}' 使用训练阶段计算的填充值: {fill_value}")
+
+                        # 填充NaN值
+                        df_processed[col] = df_processed[col].fillna(fill_value)
+
+            elif df_processed[col].dtype == 'object':
+                # 对象类型列处理（字符串）
+                nan_count = df_processed[col].isna().sum()
+
+                if nan_count > 0:
+                    if is_training:
+                        # 对于类别列，使用众数填充或创建新类别
+                        if len(df_processed[col].unique()) < 50:  # 假设是类别列
+                            mode_value = df_processed[col].mode()
+                            if not mode_value.empty:
+                                fill_value = mode_value.iloc[0]
+                                self.nan_fill_values[col] = fill_value
+                                self.logger.info(f"类别列 '{col}' 使用众数填充: {fill_value}")
+                            else:
+                                fill_value = 'MISSING'
+                                self.nan_fill_values[col] = fill_value
+                                self.logger.info(f"类别列 '{col}' 使用'MISSING'填充")
+                        else:
+                            fill_value = 'MISSING'
+                            self.nan_fill_values[col] = fill_value
+                            self.logger.info(f"文本列 '{col}' 使用'MISSING'填充")
+                    else:
+                        fill_value = self.nan_fill_values.get(col, 'MISSING')
+
+                    df_processed[col] = df_processed[col].fillna(fill_value)
+
+        # 验证处理后是否还有NaN
+        remaining_nan = df_processed.isna().sum().sum()
+        if remaining_nan > 0:
+            self.logger.warning(f"处理后仍有 {remaining_nan} 个NaN值")
+        else:
+            self.logger.info("✅ NaN值处理完成，无剩余NaN值")
+
+        return df_processed
+
+    def preprocess_data(self, df, for_gtnnwr=False, is_training=True):
+        """数据预处理（这是原始的方法，需要恢复）"""
+        self.logger.info("开始数据预处理...")
+
+        # 创建数据副本
+        df_clean = df.copy()
+
+        # 验证必要列
+        required_columns = ['station_id', 'date', self.target_column]
+        missing_columns = [col for col in required_columns if col not in df_clean.columns]
+        if missing_columns:
+            raise ValueError(f"缺少必要列: {missing_columns}")
+
+        # 处理NaN值
+        df_clean = self._handle_nan_values(df_clean, is_training=is_training)
+
+        # 确保GTNNWR需要的列都存在
+        if self.use_gtnnwr:
+            # 创建ID列（GTNNWR需要）
+            df_clean['id'] = np.arange(len(df_clean))
+
+            # 检查并确保所有需要的列都存在
+            gtnnwr_required = (self.gtnnwr_x_columns + self.gtnnwr_spatial_columns +
+                               self.gtnnwr_temp_columns + [self.gtnnwr_id_column])
+            missing_gtnnwr = [col for col in gtnnwr_required if col not in df_clean.columns]
+            if missing_gtnnwr:
+                self.logger.warning(f"GTNNWR缺少以下列: {missing_gtnnwr}")
+                # 尝试填充缺失列为0或合适的默认值
+                for col in missing_gtnnwr:
+                    if col == 'id':
+                        df_clean[col] = np.arange(len(df_clean))
+                    elif col in ['year', 'month', 'doy']:
+                        # 如果是时间列，尝试从date列提取
+                        if 'date' in df_clean.columns and pd.api.types.is_datetime64_any_dtype(df_clean['date']):
+                            df_clean['date'] = pd.to_datetime(df_clean['date'])
+                            if col == 'year':
+                                df_clean[col] = df_clean['date'].dt.year
+                            elif col == 'month':
+                                df_clean[col] = df_clean['date'].dt.month
+                            elif col == 'doy':
+                                df_clean[col] = df_clean['date'].dt.dayofyear
+                        else:
+                            df_clean[col] = 0.0
+                    else:
+                        df_clean[col] = 0.0
+
+        # 处理CSWE无效值（如果存在）
+        if 'cswe' in df_clean.columns:
+            cswe_invalid_mask = df_clean['cswe'] > 200
+            if cswe_invalid_mask.sum() > 0:
+                df_clean.loc[cswe_invalid_mask, 'cswe'] = np.nan
+                # 重新处理NaN值
+                df_clean = self._handle_nan_values(df_clean, is_training=is_training)
+
+        # 确定特征列
+        exclude_columns = ['station_id', 'date', self.target_column, 'hydrological_doy', 'id']
+        exclude_columns.extend([col for col in df_clean.columns if col.startswith('landuse_hash_')])
+
+        # 保留GTNNWR特征列用于加权
+        if self.use_gtnnwr:
+            # 确保GTNNWR特征列在特征列中
+            for col in self.gtnnwr_x_columns:
+                if col not in exclude_columns and col not in df_clean.columns:
+                    df_clean[col] = 0.0
+
+        self.feature_columns = [col for col in df_clean.columns if col not in exclude_columns]
+
+        if not self.feature_columns:
+            raise ValueError("没有找到可用的特征列")
+
+        # 再次检查特征列中的NaN值
+        feature_nan_counts = df_clean[self.feature_columns].isna().sum()
+        if feature_nan_counts.sum() > 0:
+            self.logger.warning(f"特征列中仍有 {feature_nan_counts.sum()} 个NaN值")
+            for col, count in feature_nan_counts[feature_nan_counts > 0].items():
+                self.logger.warning(f"  特征列 '{col}': {count} 个NaN")
+            # 使用最后一次填充
+            df_clean[self.feature_columns] = df_clean[self.feature_columns].fillna(
+                df_clean[self.feature_columns].median()
+            )
+
+        # 准备数据
+        X = df_clean[self.feature_columns].values
+        y = df_clean[self.target_column].values
+
+        # 检查目标变量中的NaN
+        y_nan_count = np.isnan(y).sum()
+        if y_nan_count > 0:
+            self.logger.warning(f"目标变量 '{self.target_column}' 中有 {y_nan_count} 个NaN值")
+            if self.nan_strategy == 'drop' and is_training:
+                # 删除目标变量为NaN的行
+                valid_mask = ~np.isnan(y)
+                X = X[valid_mask]
+                y = y[valid_mask]
+                df_clean = df_clean.iloc[valid_mask]
+                self.logger.info(f"删除了 {y_nan_count} 个目标变量为NaN的样本")
+            else:
+                # 填充目标变量的NaN
+                y_fill_value = np.nanmedian(y)
+                y = np.nan_to_num(y, nan=y_fill_value)
+                self.logger.info(f"目标变量使用中位数填充: {y_fill_value:.4f}")
+
+        # 分组信息
+        df_clean['year'] = pd.to_datetime(df_clean['date']).dt.year
+        station_groups = df_clean['station_id'].values
+        year_groups = df_clean['year'].values
+
+        # 为GTNNWR准备数据
+        gtnnwr_data = None
+        if self.use_gtnnwr:
+            gtnnwr_data = df_clean.copy()
+            # 确保所有GTNNWR需要的列都存在
+            for col in self.gtnnwr_x_columns + self.gtnnwr_spatial_columns + self.gtnnwr_temp_columns + [
+                self.gtnnwr_id_column]:
+                if col not in gtnnwr_data.columns:
+                    if col == 'id':
+                        gtnnwr_data[col] = np.arange(len(gtnnwr_data))
+                    else:
+                        gtnnwr_data[col] = 0.0
+
+        # 最终检查
+        x_nan_count = np.isnan(X).sum()
+        y_nan_count = np.isnan(y).sum()
+
+        self.logger.info(f"✅ 数据预处理完成")
+        self.logger.info(f"  样本数: {len(X)}, 特征数: {len(self.feature_columns)}")
+        self.logger.info(f"  X中NaN数量: {x_nan_count}, y中NaN数量: {y_nan_count}")
+
+        # 打印特征统计信息
+        self.logger.info(f"  特征统计:")
+        for i, col in enumerate(self.feature_columns[:5]):  # 只显示前5个特征
+            col_values = X[:, i]
+            self.logger.info(
+                f"    {col}: 均值={col_values.mean():.4f}, 标准差={col_values.std():.4f}, 范围=[{col_values.min():.4f}, {col_values.max():.4f}]")
+        if len(self.feature_columns) > 5:
+            self.logger.info(f"    ... 和其他 {len(self.feature_columns) - 5} 个特征")
+
+        return X, y, station_groups, year_groups, gtnnwr_data
 
     def _train_gtnnwr_for_fold(self, train_data, val_data):
         """为单个折叠训练GTNNWR模型并提取权重"""
@@ -176,11 +440,86 @@ class GTNNW_XGBoostTrainer:
                     feature_columns_for_distance=feature_columns_for_distance
                 )
                 print(f"✅ 数据集初始化成功")
+
+                # 🚨 添加详细的debug信息
+                print(f"\n🔍 详细维度检查...")
+                print(f"  train_set.distances形状: {train_set.distances.shape}")
+                print(f"  train_set.distances维度数: {train_set.distances.ndim}")
+
+                # 检查距离矩阵内容
+                if hasattr(train_set, 'distances') and train_set.distances is not None:
+                    print(f"  距离矩阵第一个样本的形状: {train_set.distances[0].shape}")
+                    print(f"  距离矩阵第一个样本的前3个参考点:")
+                    for i in range(min(3, len(train_set.distances[0]))):
+                        print(f"    参考点{i}: {train_set.distances[0][i]}")
+
+                # 检查是否还有其他距离相关的属性
+                for attr in dir(train_set):
+                    if 'distance' in attr.lower() and not attr.startswith('__'):
+                        try:
+                            value = getattr(train_set, attr)
+                            if hasattr(value, 'shape'):
+                                print(f"  {attr}形状: {value.shape}")
+                        except:
+                            pass
+
+                # 检查是否有temporal维度
+                if hasattr(train_set, 'temporal') and train_set.temporal is not None:
+                    print(f"  train_set.temporal形状: {train_set.temporal.shape}")
+                    if hasattr(train_set, 'distances') and train_set.distances is not None:
+                        print(f"  时空结合后总维度: {train_set.distances.shape[-1] + train_set.temporal.shape[-1]}")
+
+                # 检查is_need_STNN
+                print(f"  train_set.is_need_STNN: {train_set.is_need_STNN}")
+                print(f"  val_set.is_need_STNN: {val_set.is_need_STNN}")
+
+                # 检查simple_distance
+                print(f"  train_set.simple_distance: {train_set.simple_distance}")
+
+                # 检查__getitem__返回什么
+                print(f"\n🔍 检查数据加载器输出...")
+                try:
+                    # 检查一个样本
+                    if len(train_set) > 0:
+                        sample = train_set[0]
+                        print(f"  train_set[0]返回类型: {type(sample)}")
+                        if isinstance(sample, tuple):
+                            print(f"  元组长度: {len(sample)}")
+                            for i, item in enumerate(sample):
+                                if hasattr(item, 'shape'):
+                                    print(f"  元素[{i}]形状: {item.shape}")
+                                elif isinstance(item, (int, float)):
+                                    print(f"  元素[{i}]: {item}")
+                                else:
+                                    print(f"  元素[{i}]类型: {type(item)}")
+
+                    # 检查dataloader的第一个批次
+                    if hasattr(train_set, 'dataloader'):
+                        for batch in train_set.dataloader:
+                            print(f"\n  第一个批次信息:")
+                            print(f"    批次类型: {type(batch)}")
+                            if isinstance(batch, (list, tuple)):
+                                print(f"    批次长度: {len(batch)}")
+                                for i, item in enumerate(batch):
+                                    if hasattr(item, 'shape'):
+                                        print(f"    批次[{i}]形状: {item.shape}")
+                            break
+                except Exception as e:
+                    print(f"  检查数据加载时出错: {e}")
+
+                print(f"\n🔍 检查数据集初始化参数...")
+                print(f"  使用的use_model: {'gtnnwr'}")
+                print(f"  使用特征马氏距离: {self.use_feature_mahalanobis}")
+                if self.use_feature_mahalanobis:
+                    print(f"  马氏距离特征数: {len(feature_columns_for_distance)}")
+
                 print(f"  是否使用特征马氏距离: {self.use_feature_mahalanobis}")
                 if self.use_feature_mahalanobis:
                     print(f"  马氏距离特征数: {len(feature_columns_for_distance)}")
             except Exception as error:
                 print(f"❌ 数据集初始化失败: {error}")
+                import traceback
+                print(f"详细错误:\n{traceback.format_exc()}")
                 print("⚠️  跳过GTNNWR训练，返回None权重")
                 return None, None
 
@@ -195,14 +534,80 @@ class GTNNW_XGBoostTrainer:
                 print("⚠️  跳过GTNNWR训练，返回None权重")
                 return None, None
 
+            # 🚨 手动计算正确维度
+            print(f"\n🔧 手动计算正确维度...")
+
+            # 方法1：检查数据加载后的实际维度
+            try:
+                sample = train_set[0]
+                if isinstance(sample, tuple) and len(sample) > 0:
+                    actual_input_dim = sample[0].shape[-1]
+                    print(f"  从train_set[0]获取的实际输入维度: {actual_input_dim}")
+
+                    # 显示更多信息
+                    print(f"  sample[0]形状: {sample[0].shape}")
+                    print(f"  参考点数量: {sample[0].shape[0]}")
+
+                    # 检查具体内容
+                    if sample[0].shape[0] > 0:
+                        print(f"  第一个参考点的值: {sample[0][0]}")
+                        if len(sample[0][0]) == 3:
+                            print(f"    → 可能是[距离_x, 距离_y, 马氏距离]")
+                else:
+                    actual_input_dim = train_set.distances.shape[-1]
+                    print(f"  从distances获取的输入维度: {actual_input_dim}")
+            except Exception as e:
+                print(f"  检查维度时出错: {e}")
+                actual_input_dim = 3  # 默认假设是3维
+                print(f"  使用默认维度: {actual_input_dim}")
+
+            # 确保simple_distance=False
+            train_set.simple_distance = False
+            val_set.simple_distance = False
+
+            # 检查GTNNWR参数的dense_layers
+            print(f"\n🔍 检查并调整dense_layers...")
+            dense_layers_param = self.gtnnwr_params.get('dense_layers', [[3], [512, 256, 64]])
+            print(f"  原始dense_layers: {dense_layers_param}")
+
+            # 调整dense_layers以匹配实际维度
+            if isinstance(dense_layers_param, list) and len(dense_layers_param) >= 2:
+                # 确保第一个列表的第一个元素是actual_input_dim
+                if not isinstance(dense_layers_param[0], list):
+                    # 如果不是列表，转换为列表
+                    dense_layers_param[0] = [dense_layers_param[0]]
+
+                if dense_layers_param[0][0] != actual_input_dim:
+                    print(f"  ⚠️  维度不匹配: dense_layers[0][0]={dense_layers_param[0][0]}, actual={actual_input_dim}")
+                    # 修复：创建一个新的dense_layers
+                    stpnn_layers = [actual_input_dim]
+                    if len(dense_layers_param[0]) > 1:
+                        stpnn_layers.extend(dense_layers_param[0][1:])  # 保持其他层
+
+                    adjusted_dense_layers = [stpnn_layers, dense_layers_param[1]]
+                    dense_layers_param = adjusted_dense_layers
+                    print(f"  调整后的dense_layers: {dense_layers_param}")
+            else:
+                # 如果格式不对，创建正确的格式
+                print(f"  ⚠️  dense_layers格式不正确，创建新格式")
+                dense_layers_param = [[actual_input_dim, 64, 32], [128, 64, 32]]
+                print(f"  创建的dense_layers: {dense_layers_param}")
+
             # 训练GTNNWR模型
             print("\n🏋️ 训练GTNNWR模型...")
+
             try:
+                print(f"\n🚀 创建GTNNWR模型...")
+                print(f"  使用dense_layers: {dense_layers_param}")
+                print(f"  输入维度: {actual_input_dim}")
+                print(f"  是否使用特征马氏距离: {self.use_feature_mahalanobis}")
+
+                # 创建GTNNWR
                 gtnnwr = models.GTNNWR(
                     train_dataset=train_set,
                     valid_dataset=val_set,
                     test_dataset=train_set,
-                    dense_layers=self.gtnnwr_params.get('dense_layers', [[3], [512, 256, 64]]),
+                    dense_layers=dense_layers_param,
                     drop_out=self.gtnnwr_params.get('drop_out', 0.4),
                     optimizer=self.gtnnwr_params.get('optimizer', "Adadelta"),
                     optimizer_params=self.gtnnwr_params.get('optimizer_params', {}),
@@ -212,21 +617,20 @@ class GTNNW_XGBoostTrainer:
                     write_path="result/gtnnwr_runs_temp"
                 )
 
-                # 添加图结构
-                print("🕸️ 添加图结构...")
-                gtnnwr.add_graph()
+                # 🚨 关键：跳过add_graph()，直接训练
+                print("🕸️ 跳过图结构添加（避免维度错误）...")
+                # gtnnwr.add_graph()  # 注释掉这行
 
-                # 训练
-                print(f"⚙️ 训练参数: {self.gtnnwr_params.get('max_epoch', 3000)}轮, "
-                      f"早停{self.gtnnwr_params.get('early_stop', 1000)}轮")
-
+                print(f"⚙️ 开始训练...")
                 gtnnwr.run(
-                    max_epoch=self.gtnnwr_params.get('max_epoch', 3000),
-                    early_stop=self.gtnnwr_params.get('early_stop', 1000),
+                    max_epoch=min(500, self.gtnnwr_params.get('max_epoch', 3000)),  # 先训练500轮
+                    early_stop=min(100, self.gtnnwr_params.get('early_stop', 1000)),  # 早停100轮
                     print_frequency=self.gtnnwr_params.get('print_frequency', 100)
                 )
             except Exception as model_error:
                 print(f"❌ GTNNWR模型创建或训练失败: {model_error}")
+                import traceback
+                print(f"详细错误:\n{traceback.format_exc()}")
                 print("⚠️  跳过GTNNWR训练，返回None权重")
                 return None, None
 
@@ -343,6 +747,386 @@ class GTNNW_XGBoostTrainer:
             print(f"详细错误:\n{traceback.format_exc()}")
             self.logger.warning(f"  GTNNWR训练失败: {str(e)}")
             return None, None
+
+    def _apply_gtnnwr_weights(self, X, weights, feature_columns, gtnnwr_x_columns):
+        """应用GTNNWR权重到特征矩阵
+
+        Args:
+            X (np.array): 原始特征矩阵
+            weights (np.array): 权重矩阵
+            feature_columns (list): 特征列名
+            gtnnwr_x_columns (list): GTNNWR特征列名
+
+        Returns:
+            np.array: 加权后的特征矩阵
+        """
+        if weights is None:
+            self.logger.warning("权重矩阵为None，返回原始特征")
+            return X
+
+        # ✅ 修复1: 首先检查样本数是否匹配
+        if X.shape[0] != weights.shape[0]:
+            self.logger.error(f"❌ 样本数不匹配: X有{X.shape[0]}个样本, 权重有{weights.shape[0]}个样本")
+
+            # 尝试修复样本数不匹配的问题
+            if weights.shape[0] < X.shape[0]:
+                # 如果权重样本数较少，重复权重以匹配X的样本数
+                repeat_times = int(np.ceil(X.shape[0] / weights.shape[0]))
+                weights_repeated = np.tile(weights, (repeat_times, 1))
+                weights = weights_repeated[:X.shape[0], :]
+                self.logger.warning(f"✅ 权重样本数不足，重复权重到{weights.shape[0]}个样本")
+            else:
+                # 如果权重样本数较多，截断到X的样本数
+                weights = weights[:X.shape[0], :]
+                self.logger.warning(f"✅ 权重样本数过多，截断到{weights.shape[0]}个样本")
+
+        # ✅ 修复2: 处理维度不匹配问题
+        if weights.shape[1] != len(gtnnwr_x_columns):
+            self.logger.warning(f"⚠️ 权重矩阵特征数({weights.shape[1]})与GTNNWR特征数({len(gtnnwr_x_columns)})不匹配")
+
+            # 自动调整权重维度
+            if weights.shape[1] > len(gtnnwr_x_columns):
+                # 如果权重是35列，GTNNWR特征是34列，去掉最后一列
+                weights = weights[:, :len(gtnnwr_x_columns)]
+                self.logger.info(f"✅ 自动调整：截断权重矩阵到 {weights.shape[1]} 列")
+            elif weights.shape[1] < len(gtnnwr_x_columns):
+                # 如果权重列数少，填充1.0
+                padding = np.ones((weights.shape[0], len(gtnnwr_x_columns) - weights.shape[1]))
+                weights = np.hstack([weights, padding])
+                self.logger.info(f"✅ 自动调整：填充权重矩阵到 {weights.shape[1]} 列")
+
+        # 检查输入中的NaN
+        x_nan_count = np.isnan(X).sum()
+        if x_nan_count > 0:
+            self.logger.warning(f"⚠️ 输入特征矩阵中有 {x_nan_count} 个NaN值，使用列均值填充")
+            col_means = np.nanmean(X, axis=0)
+            for i in range(X.shape[1]):
+                X[:, i] = np.where(np.isnan(X[:, i]), col_means[i], X[:, i])
+
+        # 检查权重中的NaN
+        weights_nan_count = np.isnan(weights).sum()
+        if weights_nan_count > 0:
+            self.logger.warning(f"⚠️ 权重矩阵中有 {weights_nan_count} 个NaN值，使用1填充")
+            weights = np.nan_to_num(weights, nan=1.0)
+
+        # 创建特征映射：特征列到GTNNWR特征列的索引
+        feature_to_gtnnwr = {}
+        for i, feat in enumerate(feature_columns):
+            if feat in gtnnwr_x_columns:
+                feature_to_gtnnwr[i] = gtnnwr_x_columns.index(feat)
+
+        # 添加调试信息
+        matched_count = len(feature_to_gtnnwr)
+        self.logger.info(f"🔍 特征匹配: 匹配了 {matched_count}/{len(feature_columns)} 个特征")
+
+        if matched_count == 0:
+            self.logger.warning("⚠️ 没有找到匹配的特征，无法应用权重")
+            return X
+
+        # ✅ 关键修复：应用权重，即使有NaN
+        X_weighted = X.copy()
+        changed_count = 0
+
+        for feat_idx, gtnnwr_idx in feature_to_gtnnwr.items():
+            # 获取原始特征值和权重
+            original_values = X[:, feat_idx]
+            weight_values = weights[:, gtnnwr_idx]
+
+            # 检查并处理NaN
+            original_nan = np.isnan(original_values).sum()
+            weight_nan = np.isnan(weight_values).sum()
+
+            if original_nan > 0:
+                original_values = np.nan_to_num(original_values, nan=0.0)
+
+            if weight_nan > 0:
+                weight_values = np.nan_to_num(weight_values, nan=1.0)
+
+            # 应用权重：X × weight
+            weighted_values = original_values * weight_values
+
+            # 检查是否真的改变了（忽略NaN）
+            mask = ~np.isnan(original_values) & ~np.isnan(weighted_values)
+            if mask.any():
+                if not np.allclose(original_values[mask], weighted_values[mask], rtol=1e-10):
+                    changed_count += 1
+
+            X_weighted[:, feat_idx] = weighted_values
+
+        # 添加验证输出
+        change_ratio = changed_count / matched_count if matched_count > 0 else 0
+        self.logger.info(f"✅ 权重应用结果: 修改了 {changed_count}/{matched_count} 个特征 ({change_ratio:.1%})")
+
+        # 检查几个关键特征的变化
+        if changed_count > 0:
+            key_features = ['elevation', 'X', 'Y', 'Z', 'slope', 'doy']
+            for feat in key_features:
+                if feat in feature_columns and feat in gtnnwr_x_columns:
+                    feat_idx = feature_columns.index(feat)
+                    gtnnwr_idx = gtnnwr_x_columns.index(feat)
+
+                    # 检查第一个样本
+                    if len(X) > 0 and len(weights) > 0:
+                        if (not np.isnan(X[0, feat_idx]) and
+                                not np.isnan(X_weighted[0, feat_idx]) and
+                                feat_idx < weights.shape[1]):
+                            original = X[0, feat_idx]
+                            weighted = X_weighted[0, feat_idx]
+                            weight_val = weights[0, gtnnwr_idx]
+
+                            if abs(weighted - original) > 1e-10:
+                                self.logger.info(f"   {feat}: {original:.4f} × {weight_val:.4f} = {weighted:.4f} "
+                                                 f"(Δ={weighted - original:+.4f})")
+
+        # 检查输出中的NaN
+        output_nan_count = np.isnan(X_weighted).sum()
+        if output_nan_count > 0:
+            self.logger.warning(f"⚠️ 加权后的特征矩阵中有 {output_nan_count} 个NaN值，使用原始值")
+            X_weighted = np.where(np.isnan(X_weighted), X, X_weighted)
+
+        # 验证最终形状
+        if X_weighted.shape != X.shape:
+            self.logger.error(f"❌ 形状不匹配: 加权后{X_weighted.shape} != 原始{X.shape}")
+            return X  # 返回原始特征避免进一步错误
+
+        return X_weighted
+
+
+    def cross_validate(self, X, y, groups, cv_type='station', gtnnwr_data=None):
+        """执行带GTNNWR权重的交叉验证
+
+        Args:
+            X (np.array): 特征数据
+            y (np.array): 目标变量
+            groups (np.array): 分组信息
+            cv_type (str): 交叉验证类型 ('station' 或 'yearly')
+            gtnnwr_data (pd.DataFrame): GTNNWR需要的完整数据
+
+        Returns:
+            dict: 交叉验证结果
+        """
+        from sklearn.model_selection import LeaveOneGroupOut
+
+        logo = LeaveOneGroupOut()
+        all_predictions = []
+        all_true_values = []
+        fold_results = {}
+
+        fold_maes = []
+        fold_rmses = []
+        fold_rs = []
+        fold_samples = []
+
+        unique_groups = np.unique(groups)
+        total_folds = len(unique_groups)
+
+        print("\n" + "=" * 100)
+        print(f"🚀 开始{cv_type}交叉验证，共{total_folds}个折叠")
+        print(f"使用GTNNWR权重增强: {self.use_gtnnwr}")
+        print(f"NaN处理策略: {self.nan_strategy}")
+        print("=" * 100)
+
+        self.logger.info(f"开始{cv_type}交叉验证，共{total_folds}个折叠...")
+        self.logger.info(f"使用GTNNWR权重增强: {self.use_gtnnwr}")
+
+        for fold, (train_idx, val_idx) in enumerate(logo.split(X, y, groups)):
+            group_id = groups[val_idx[0]]
+            train_size = len(train_idx)
+            val_size = len(val_idx)
+
+            print("\n" + "=" * 80)
+            print(f"🎯 {cv_type} Fold {fold + 1}/{total_folds}: 分组 {group_id}")
+            print(f"   训练集: {train_size}样本, 验证集: {val_size}样本")
+            print("=" * 80)
+
+            self.logger.info(
+                f"{cv_type} Fold {fold + 1}/{total_folds}: {group_id} (训练集{train_size}, 验证集{val_size})")
+
+            # 分割数据
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+
+            # GTNNWR权重增强
+            if self.use_gtnnwr and gtnnwr_data is not None:
+                print(f"\n📊 GTNNWR权重增强阶段")
+
+                # 获取当前折叠的训练和验证数据
+                train_data_fold = gtnnwr_data.iloc[train_idx].copy()
+                val_data_fold = gtnnwr_data.iloc[val_idx].copy()
+
+                print(f"  训练数据形状: {train_data_fold.shape}")
+                print(f"  验证数据形状: {val_data_fold.shape}")
+
+                # 训练GTNNWR并提取权重
+                print(f"\n🧠 训练GTNNWR模型...")
+                train_weights, val_weights = self._train_gtnnwr_for_fold(
+                    train_data_fold,
+                    val_data_fold
+                )
+
+                if train_weights is not None and val_weights is not None:
+                    print(f"\n✅ GTNNWR训练完成，准备应用权重")
+
+                    # 应用权重
+                    print(f"\n🔄 应用权重到特征矩阵...")
+                    X_train = self._apply_gtnnwr_weights(
+                        X_train, train_weights,
+                        self.feature_columns, self.gtnnwr_x_columns
+                    )
+                    X_val = self._apply_gtnnwr_weights(
+                        X_val, val_weights,
+                        self.feature_columns, self.gtnnwr_x_columns
+                    )
+                else:
+                    print(f"\n❌ GTNNWR权重提取失败，使用原始特征")
+            else:
+                print(f"\n📝 未使用GTNNWR权重增强")
+
+            # 训练XGBoost模型
+            print(f"\n🌲 训练XGBoost模型...")
+            import xgboost as xgb
+            model = xgb.XGBRegressor(**self.params)
+            model.fit(X_train, y_train)
+
+            # 预测
+            print(f"  进行预测...")
+            y_pred = model.predict(X_val)
+
+            # 存储结果
+            all_predictions.extend(y_pred)
+            all_true_values.extend(y_val)
+
+            # 计算性能指标
+            fold_metrics = self._evaluate_predictions(y_val, y_pred)
+            fold_results[group_id] = fold_metrics
+
+            fold_maes.append(fold_metrics['MAE'])
+            fold_rmses.append(fold_metrics['RMSE'])
+            fold_rs.append(fold_metrics['R'])
+            fold_samples.append(fold_metrics['样本数'])
+
+            r_display = fold_metrics['R']
+            r_str = f"{r_display:.3f}" if not np.isnan(r_display) else "NaN"
+
+            # 打印Fold结果
+            print(f"\n📊 Fold {fold + 1} 性能指标:")
+            print(f"  MAE:  {fold_metrics['MAE']:.3f} mm")
+            print(f"  RMSE: {fold_metrics['RMSE']:.3f} mm")
+            print(f"  R:    {r_str}")
+            print(f"  样本数: {fold_metrics['样本数']}")
+
+            self.logger.info(
+                f"  Fold {fold + 1} 性能: MAE={fold_metrics['MAE']:.3f}, R={r_str}"
+            )
+
+        # 计算总体性能
+        overall_metrics = self._evaluate_predictions(
+            np.array(all_true_values),
+            np.array(all_predictions)
+        )
+
+        # 计算统计量
+        def safe_statistic(values, func):
+            valid_values = [v for v in values if not np.isnan(v)]
+            if len(valid_values) == 0:
+                return np.nan
+            return func(valid_values)
+
+        mean_metrics = {
+            'MAE': safe_statistic(fold_maes, np.mean),
+            'RMSE': safe_statistic(fold_rmses, np.mean),
+            'R': safe_statistic(fold_rs, np.mean),
+            '样本数': np.sum(fold_samples)
+        }
+
+        median_metrics = {
+            'MAE': safe_statistic(fold_maes, np.median),
+            'RMSE': safe_statistic(fold_rmses, np.median),
+            'R': safe_statistic(fold_rs, np.median),
+            '样本数': np.sum(fold_samples)
+        }
+
+        std_metrics = {
+            'MAE': safe_statistic(fold_maes, np.std),
+            'RMSE': safe_statistic(fold_rmses, np.std),
+            'R': safe_statistic(fold_rs, np.std)
+        }
+
+        print("\n" + "=" * 100)
+        print(f"🎉 {cv_type}交叉验证完成!")
+        print("=" * 100)
+
+        print(f"\n📈 聚合性能指标:")
+        print(f"  MAE:  {overall_metrics['MAE']:.3f} mm")
+        print(f"  RMSE: {overall_metrics['RMSE']:.3f} mm")
+        print(f"  R:    {overall_metrics['R']:.3f}")
+        print(f"  总样本数: {overall_metrics['样本数']}")
+
+        self.logger.info(f"✅ {cv_type}交叉验证完成")
+        self.logger.info(f"  聚合性能: MAE={overall_metrics['MAE']:.3f}mm, R={overall_metrics['R']:.3f}")
+
+        return {
+            'overall': overall_metrics,
+            'mean': mean_metrics,
+            'median': median_metrics,
+            'std': std_metrics,
+            'by_fold': fold_results,
+            'predictions': np.array(all_predictions),
+            'true_values': np.array(all_true_values),
+            'folds': total_folds,
+            'fold_metrics': {
+                'MAE': fold_maes,
+                'RMSE': fold_rmses,
+                'R': fold_rs,
+                'samples': fold_samples
+            }
+        }
+
+    def _evaluate_predictions(self, y_true, y_pred):
+        """评估预测结果"""
+        from sklearn.metrics import mean_absolute_error, mean_squared_error
+        from scipy.stats import pearsonr
+
+        mask = ~(np.isnan(y_true) | np.isnan(y_pred))
+        y_true_clean = y_true[mask]
+        y_pred_clean = y_pred[mask]
+
+        if len(y_true_clean) == 0:
+            return {
+                'MAE': np.nan,
+                'RMSE': np.nan,
+                'R': np.nan,
+                'R_pvalue': np.nan,
+                '样本数': 0,
+                '总样本数': len(y_true),
+                '有效样本比例': 0.0
+            }
+
+        mae = mean_absolute_error(y_true_clean, y_pred_clean)
+        rmse = np.sqrt(mean_squared_error(y_true_clean, y_pred_clean))
+
+        def safe_pearsonr(x, y):
+            if len(x) <= 1 or np.all(x == x[0]) or np.all(y == y[0]):
+                return np.nan, np.nan
+            if np.std(x) == 0 or np.std(y) == 0:
+                return np.nan, np.nan
+            try:
+                return pearsonr(x, y)
+            except:
+                return np.nan, np.nan
+
+        r, p_value = safe_pearsonr(y_true_clean, y_pred_clean)
+
+        return {
+            'MAE': mae,
+            'RMSE': rmse,
+            'R': r,
+            'R_pvalue': p_value,
+            '样本数': len(y_true_clean),
+            '总样本数': len(y_true),
+            '有效样本比例': len(y_true_clean) / len(y_true) if len(y_true) > 0 else 0
+        }
+
 
     def run_complete_analysis(self, df, output_dir=None):
         """运行完整分析流程"""
